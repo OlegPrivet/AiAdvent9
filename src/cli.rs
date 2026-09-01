@@ -1,11 +1,11 @@
 use clap::Parser;
 
-/// Задайте вопрос AI-сервису NeuralDeep.
+/// Интерактивный CLI-клиент AI-сервиса NeuralDeep.
 #[derive(Debug, Parser)]
 #[command(name = "agi", version, about)]
 pub(crate) struct Cli {
-    /// Вопрос для AI-сервиса.
-    pub(crate) question: String,
+    /// Необязательный первый вопрос после запуска.
+    pub(crate) question: Option<String>,
 }
 
 #[cfg(test)]
@@ -17,12 +17,14 @@ mod tests {
         let cli = Cli::try_parse_from(["agi", "Объясни ownership в Rust"])
             .expect("question should be accepted");
 
-        assert_eq!(cli.question, "Объясни ownership в Rust");
+        assert_eq!(cli.question.as_deref(), Some("Объясни ownership в Rust"));
     }
 
     #[test]
-    fn rejects_missing_question() {
-        assert!(Cli::try_parse_from(["agi"]).is_err());
+    fn starts_without_question() {
+        let cli = Cli::try_parse_from(["agi"]).expect("interactive mode should be accepted");
+
+        assert_eq!(cli.question, None);
     }
 
     #[test]
