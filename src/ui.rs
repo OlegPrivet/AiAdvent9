@@ -9,6 +9,8 @@ use syntect::util::{LinesWithEndings, as_24_bit_terminal_escaped};
 use termimad::MadSkin;
 use unicode_width::UnicodeWidthChar;
 
+use crate::chat::{Chat, MessageRole};
+
 const LIVE_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
 const RESET_STYLE: &str = "\x1b[0m";
 
@@ -46,6 +48,34 @@ impl TerminalUi {
             wrote_plain: false,
             last_render: Instant::now(),
         }
+    }
+
+    pub(crate) fn print_chat<W: Write>(&self, output: &mut W, chat: &Chat) -> io::Result<()> {
+        writeln!(output, "\nЧат: {} [{}]", chat.title(), chat.id())?;
+
+        for message in chat.messages() {
+            let label = match message.role {
+                MessageRole::User => "Вы",
+                MessageRole::Assistant => "AI",
+            };
+            writeln!(output, "\n{label}:")?;
+            let safe_content = sanitize_terminal_text(&message.content);
+            let rendered = if message.role == MessageRole::Assistant {
+                self.renderer
+                    .as_ref()
+                    .map(|renderer| renderer.render(&safe_content))
+                    .unwrap_or(safe_content)
+            } else {
+                safe_content
+            };
+            output.write_all(rendered.as_bytes())?;
+            if !rendered.ends_with('\n') {
+                writeln!(output)?;
+            }
+        }
+
+        writeln!(output)?;
+        output.flush()
     }
 }
 
@@ -398,5 +428,22 @@ mod tests {
     #[test]
     fn measures_text_without_ansi_sequences() {
         assert_eq!(visible_width("\x1b[38;2;1;2;3mлось\x1b[0m"), 4);
+    }
+
+    #[test]
+    fn prints_restored_chat_transcript() {
+        let ui = TerminalUi::plain();
+        let mut chat = Chat::new();
+        chat.record_exchange("Вопрос".to_owned(), "**Ответ**".to_owned());
+        let mut output = Vec::new();
+
+        ui.print_chat(&mut output, &chat)
+            .expect("transcript should render");
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+
+        assert!(output.contains("Чат: Вопрос"));
+        assert!(output.contains("Вы:\nВопрос"));
+        assert!(output.contains("AI:\n**Ответ**"));
+        assert!(!output.contains('\u{1b}'));
     }
 }

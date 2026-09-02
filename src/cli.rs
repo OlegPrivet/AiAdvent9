@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub(crate) enum EditMode {
@@ -19,6 +20,10 @@ pub(crate) struct Cli {
     /// Режим редактирования строки ввода.
     #[arg(long, value_enum, default_value_t)]
     pub(crate) edit_mode: EditMode,
+
+    /// Восстановить сохранённый чат по полному UUID.
+    #[arg(long, value_name = "ID")]
+    pub(crate) restore: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -32,6 +37,7 @@ mod tests {
 
         assert_eq!(cli.question.as_deref(), Some("Объясни ownership в Rust"));
         assert_eq!(cli.edit_mode, EditMode::Emacs);
+        assert_eq!(cli.restore, None);
     }
 
     #[test]
@@ -40,6 +46,7 @@ mod tests {
 
         assert_eq!(cli.question, None);
         assert_eq!(cli.edit_mode, EditMode::Emacs);
+        assert_eq!(cli.restore, None);
     }
 
     #[test]
@@ -48,6 +55,16 @@ mod tests {
             .expect("Vim mode should be accepted");
 
         assert_eq!(cli.edit_mode, EditMode::Vim);
+    }
+
+    #[test]
+    fn parses_restore_id_with_initial_question() {
+        let id = Uuid::new_v4();
+        let cli = Cli::try_parse_from(["agi", "--restore", &id.to_string(), "Продолжи обсуждение"])
+            .expect("restore arguments should be accepted");
+
+        assert_eq!(cli.restore, Some(id));
+        assert_eq!(cli.question.as_deref(), Some("Продолжи обсуждение"));
     }
 
     #[test]

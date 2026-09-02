@@ -5,9 +5,11 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+dialoguer = { version = "0.12", default-features = false }
 indicatif = "0.18"
 reedline = { version = "0.51", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
@@ -15,3 +17,4 @@ termimad = "0.35"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
 unicode-width = "0.2"
+uuid = { version = "1.26", features = ["serde", "v4"] }

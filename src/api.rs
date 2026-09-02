@@ -5,17 +5,13 @@ use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use uuid::Uuid;
 
+use crate::chat::ChatMessage;
 use crate::settings::Settings;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const TEMPERATURE: f32 = 0.1;
-const BASE_SYSTEM_INSTRUCTION: &str = r#"Ты точный и аккуратный ассистент.
-- Отвечай на языке пользователя. Если вопрос задан по-русски, весь содержательный текст должен быть только на русском языке.
-- Молча исправляй очевидные опечатки в вопросе.
-- Не выдумывай термины, названия и факты. Если не уверен, прямо укажи на неопределённость.
-- В справочных ответах избегай ненужных точных чисел, превосходных сравнений и редких названий, если не уверен в них.
-- Сначала дай прямой ответ, затем только относящиеся к вопросу детали."#;
 
 fn structured_response_format() -> Value {
     json!({
@@ -49,26 +45,6 @@ fn structured_response_format() -> Value {
             }
         }
     })
-}
-
-fn build_system_instruction(settings: &Settings) -> String {
-    let mut instruction = format!(
-        "{BASE_SYSTEM_INSTRUCTION}\n\nСформируй законченный ответ объёмом не более {} токенов. Если лимит мал, сократи детали, но обязательно заверши мысль.",
-        settings.max_tokens()
-    );
-
-    if settings.response_format_enabled() {
-        instruction.push_str(
-            "\n\nStructured Output: заполни каждое поле содержательно. Значения полей должны быть на языке пользователя.",
-        );
-    }
-
-    if let Some(completion_instruction) = settings.system_instruction() {
-        instruction.push_str("\n\n");
-        instruction.push_str(&completion_instruction);
-    }
-
-    instruction
 }
 
 #[derive(Debug)]
@@ -128,10 +104,14 @@ impl NeuralDeepClient {
     #[cfg(test)]
     pub(crate) async fn ask(
         &self,
+        history: &[ChatMessage],
+        chat_id: Uuid,
         question: &str,
         settings: &Settings,
     ) -> Result<ApiAnswer, ApiError> {
-        let response = self.send_request(question, settings, false).await?;
+        let response = self
+            .send_request(history, chat_id, question, settings, false)
+            .await?;
         let response = response
             .json::<ChatResponse>()
             .await
@@ -151,6 +131,8 @@ impl NeuralDeepClient {
 
     pub(crate) async fn ask_streaming<F>(
         &self,
+        history: &[ChatMessage],
+        chat_id: Uuid,
         question: &str,
         settings: &Settings,
         mut on_delta: F,
@@ -158,7 +140,9 @@ impl NeuralDeepClient {
     where
         F: FnMut(&str) -> io::Result<()>,
     {
-        let mut response = self.send_request(question, settings, true).await?;
+        let mut response = self
+            .send_request(history, chat_id, question, settings, true)
+            .await?;
         let mut decoder = SseDecoder::default();
         let mut content = String::new();
         let mut finish_reason = None;
@@ -193,21 +177,29 @@ impl NeuralDeepClient {
 
     async fn send_request(
         &self,
+        history: &[ChatMessage],
+        chat_id: Uuid,
         question: &str,
         settings: &Settings,
         stream: bool,
     ) -> Result<Response, ApiError> {
-        let system_instruction = build_system_instruction(settings);
-        let messages = vec![
-            RequestMessage {
+        let system_instruction = settings.effective_system_prompt();
+        let mut messages = Vec::with_capacity(history.len() + 2);
+        if let Some(system_instruction) = system_instruction.as_deref() {
+            messages.push(RequestMessage {
                 role: "system",
-                content: &system_instruction,
-            },
-            RequestMessage {
-                role: "user",
-                content: question,
-            },
-        ];
+                content: system_instruction,
+            });
+        }
+        messages.extend(history.iter().map(|message| RequestMessage {
+            role: message.role.as_api_str(),
+            content: &message.content,
+        }));
+        messages.push(RequestMessage {
+            role: "user",
+            content: question,
+        });
+        let user = chat_id.to_string();
 
         let request = ChatRequest {
             model: &self.model,
@@ -218,6 +210,7 @@ impl NeuralDeepClient {
                 .then(structured_response_format),
             stop: settings.stop_sequence(),
             temperature: TEMPERATURE,
+            user: &user,
             chat_template_kwargs: ChatTemplateKwargs {
                 enable_thinking: false,
             },
@@ -308,6 +301,7 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<&'a str>,
     temperature: f32,
+    user: &'a str,
     chat_template_kwargs: ChatTemplateKwargs,
     stream: bool,
 }
@@ -319,7 +313,7 @@ struct ChatTemplateKwargs {
 
 #[derive(Debug, Serialize)]
 struct RequestMessage<'a> {
-    role: &'static str,
+    role: &'a str,
     content: &'a str,
 }
 
@@ -458,13 +452,14 @@ mod tests {
         let (base_url, request_rx, server) = spawn_server(200, response_body);
         let client = test_client(base_url);
         let mut settings = Settings::default();
-        let mut settings_input = BufferedInput::new(Cursor::new("1\nда\n2\n750\n3\n1\n<END>\n0\n"));
+        let mut settings_input =
+            BufferedInput::new(Cursor::new("1\n1\n2\n750\n3\n2\n<END>\nesc\n"));
         settings
             .configure(&mut settings_input, &mut Vec::new())
             .expect("settings should be configured");
 
         let answer = client
-            .ask("Что такое ownership?", &settings)
+            .ask(&[], Uuid::nil(), "Что такое ownership?", &settings)
             .await
             .expect("request should succeed");
         let request = request_rx.recv().expect("request should be captured");
@@ -497,16 +492,9 @@ mod tests {
             .1;
         let body: Value = serde_json::from_str(body).expect("body should be valid JSON");
         assert_eq!(body["model"], "qwen3.8-27b-noreason");
-        assert_eq!(body["messages"].as_array().map(Vec::len), Some(2));
-        assert_eq!(body["messages"][0]["role"], "system");
-        assert!(
-            body["messages"][0]["content"]
-                .as_str()
-                .expect("system instruction should be text")
-                .contains("только на русском языке")
-        );
-        assert_eq!(body["messages"][1]["role"], "user");
-        assert_eq!(body["messages"][1]["content"], "Что такое ownership?");
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "Что такое ownership?");
         assert_eq!(body["max_tokens"], 750);
         assert_eq!(body["temperature"], 0.1);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
@@ -525,6 +513,7 @@ mod tests {
             1
         );
         assert_eq!(body["stop"], "<END>");
+        assert_eq!(body["user"], Uuid::nil().to_string());
         assert_eq!(body["stream"], false);
     }
 
@@ -541,7 +530,7 @@ mod tests {
         let mut streamed = String::new();
 
         let answer = test_client(base_url)
-            .ask_streaming("test", &settings, |delta| {
+            .ask_streaming(&[], Uuid::nil(), "test", &settings, |delta| {
                 streamed.push_str(delta);
                 Ok(())
             })
@@ -562,6 +551,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sends_full_chat_history_custom_prompt_and_session_id() {
+        let response_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Продолжение\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, request_rx, server) = spawn_server(200, response_body);
+        let client = test_client(base_url);
+        let chat_id = Uuid::new_v4();
+        let history = vec![
+            ChatMessage {
+                role: crate::chat::MessageRole::User,
+                content: "Первый вопрос".to_owned(),
+            },
+            ChatMessage {
+                role: crate::chat::MessageRole::Assistant,
+                content: "Первый ответ".to_owned(),
+            },
+        ];
+        let mut settings = Settings::default();
+        let mut settings_input =
+            BufferedInput::new(Cursor::new("4\n1\nТолько мой системный prompt\nesc\n"));
+        settings
+            .configure(&mut settings_input, &mut Vec::new())
+            .expect("custom prompt should be configured");
+
+        client
+            .ask_streaming(&history, chat_id, "Следующий вопрос", &settings, |_| Ok(()))
+            .await
+            .expect("stream should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        server.join().expect("mock server should stop");
+        let body = request
+            .split_once("\r\n\r\n")
+            .expect("request should contain a body")
+            .1;
+        let body: Value = serde_json::from_str(body).expect("body should be valid JSON");
+
+        assert_eq!(body["user"], chat_id.to_string());
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(4));
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(
+            body["messages"][0]["content"],
+            "Только мой системный prompt"
+        );
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "Первый вопрос");
+        assert_eq!(body["messages"][2]["role"], "assistant");
+        assert_eq!(body["messages"][2]["content"], "Первый ответ");
+        assert_eq!(body["messages"][3]["role"], "user");
+        assert_eq!(body["messages"][3]["content"], "Следующий вопрос");
+    }
+
+    #[tokio::test]
+    async fn omits_system_prompt_from_request_by_default() {
+        let response_body =
+            r#"{"choices":[{"message":{"content":"Ответ"},"finish_reason":"stop"}]}"#;
+        let (base_url, request_rx, server) = spawn_server(200, response_body);
+        let settings = Settings::default();
+
+        test_client(base_url)
+            .ask(&[], Uuid::nil(), "Вопрос без системного prompt", &settings)
+            .await
+            .expect("request should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        server.join().expect("mock server should stop");
+        let body = request
+            .split_once("\r\n\r\n")
+            .expect("request should contain a body")
+            .1;
+        let body: Value = serde_json::from_str(body).expect("body should be valid JSON");
+
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(
+            body["messages"][0]["content"],
+            "Вопрос без системного prompt"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_malformed_or_incomplete_sse() {
         let cases = [
             ("data: not-json\n\ndata: [DONE]\n\n", "malformed"),
@@ -575,7 +644,7 @@ mod tests {
             let (base_url, _request_rx, server) = spawn_server(200, response_body);
             let settings = Settings::default();
             let error = test_client(base_url)
-                .ask_streaming("test", &settings, |_| Ok(()))
+                .ask_streaming(&[], Uuid::nil(), "test", &settings, |_| Ok(()))
                 .await
                 .expect_err("invalid SSE should fail");
             server.join().expect("mock server should stop");
@@ -614,7 +683,7 @@ mod tests {
         for (status, response_body, expected_message) in cases {
             let (base_url, _request_rx, server) = spawn_server(status, response_body);
             let error = test_client(base_url)
-                .ask("test", &settings)
+                .ask(&[], Uuid::nil(), "test", &settings)
                 .await
                 .expect_err("request should fail");
             server.join().expect("mock server should stop");
@@ -638,7 +707,7 @@ mod tests {
         let settings = Settings::default();
 
         let error = test_client(base_url)
-            .ask("test", &settings)
+            .ask(&[], Uuid::nil(), "test", &settings)
             .await
             .expect_err("invalid JSON should fail");
         server.join().expect("mock server should stop");
@@ -657,7 +726,7 @@ mod tests {
             let settings = Settings::default();
 
             let error = test_client(base_url)
-                .ask("test", &settings)
+                .ask(&[], Uuid::nil(), "test", &settings)
                 .await
                 .expect_err("missing content should fail");
             server.join().expect("mock server should stop");
@@ -673,7 +742,7 @@ mod tests {
         let settings = Settings::default();
 
         let answer = test_client(base_url)
-            .ask("test", &settings)
+            .ask(&[], Uuid::nil(), "test", &settings)
             .await
             .expect("partial content should be returned");
         server.join().expect("mock server should stop");

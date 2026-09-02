@@ -7,18 +7,22 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::io::BufRead;
 
+use dialoguer::Select;
 use reedline::{
-    EditMode as ReedlineEditMode, Emacs, FileBackedHistory, Prompt, PromptEditMode,
-    PromptHistorySearch, PromptHistorySearchStatus, PromptViMode, Reedline, Signal, Vi,
+    EditMode as ReedlineEditMode, Emacs, FileBackedHistory, Highlighter, Prompt, PromptEditMode,
+    PromptHistorySearch, PromptHistorySearchStatus, PromptViMode, Reedline, Signal, StyledText, Vi,
 };
 
 use crate::cli::EditMode;
 
 const HISTORY_CAPACITY: usize = 1_000;
 const MAIN_PROMPT: &str = "agi";
+const COLLAPSED_TEXT_LINE_THRESHOLD: usize = 20;
 
 pub(crate) trait LineInput {
     fn read_line(&mut self, prompt: &str) -> io::Result<Option<String>>;
+
+    fn select(&mut self, prompt: &str, items: &[String]) -> io::Result<Option<usize>>;
 }
 
 pub(crate) struct TerminalInput {
@@ -39,9 +43,27 @@ impl TerminalInput {
         };
         let editor = Reedline::create()
             .with_history(Box::new(history))
-            .with_edit_mode(edit_mode);
+            .with_edit_mode(edit_mode)
+            .with_highlighter(Box::new(MultilineInputHighlighter))
+            .use_bracketed_paste(true);
 
         Ok(Self { editor })
+    }
+}
+
+struct MultilineInputHighlighter;
+
+impl Highlighter for MultilineInputHighlighter {
+    fn highlight(&self, line: &str, cursor: usize) -> StyledText {
+        let line_count = line.lines().count();
+        let display = if cursor == line.len() && line_count > COLLAPSED_TEXT_LINE_THRESHOLD {
+            format!("[Текст +{line_count} строк]")
+        } else {
+            line.to_owned()
+        };
+        let mut styled = StyledText::new();
+        styled.push((Default::default(), display));
+        styled
     }
 }
 
@@ -50,12 +72,33 @@ impl LineInput for TerminalInput {
         let prompt = InputPrompt::new(prompt);
 
         match self.editor.read_line(&prompt)? {
-            Signal::Success(line) => Ok(Some(line.trim().to_owned())),
+            Signal::Success(line) => Ok(Some(normalize_submitted_line(line))),
             Signal::CtrlC => Ok(Some(String::new())),
             Signal::CtrlD => Ok(None),
             Signal::HostCommand(_) | Signal::ExternalBreak(_) => Ok(Some(String::new())),
             _ => Ok(Some(String::new())),
         }
+    }
+
+    fn select(&mut self, prompt: &str, items: &[String]) -> io::Result<Option<usize>> {
+        if items.is_empty() {
+            return Ok(None);
+        }
+
+        Select::new()
+            .with_prompt(prompt)
+            .items(items)
+            .default(0)
+            .interact_opt()
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+}
+
+fn normalize_submitted_line(line: String) -> String {
+    if line.contains('\n') || line.contains('\r') {
+        line
+    } else {
+        line.trim().to_owned()
     }
 }
 
@@ -162,6 +205,22 @@ impl<R: BufRead> LineInput for BufferedInput<R> {
     fn read_line(&mut self, _prompt: &str) -> io::Result<Option<String>> {
         read_buffered_line(&mut self.inner)
     }
+
+    fn select(&mut self, _prompt: &str, items: &[String]) -> io::Result<Option<usize>> {
+        let Some(value) = read_buffered_line(&mut self.inner)? else {
+            return Ok(None);
+        };
+        if value.is_empty() || value.eq_ignore_ascii_case("esc") {
+            return Ok(None);
+        }
+
+        let selection = value
+            .parse::<usize>()
+            .ok()
+            .and_then(|value| value.checked_sub(1))
+            .filter(|value| *value < items.len());
+        Ok(selection)
+    }
 }
 
 #[cfg(test)]
@@ -229,5 +288,49 @@ mod tests {
             path,
             Some(PathBuf::from("/home/user/.local/state/agi/history.txt"))
         );
+    }
+
+    #[test]
+    fn test_input_selects_one_based_items_and_cancels_with_esc() {
+        let mut input = BufferedInput::new(Cursor::new("2\nesc\n"));
+        let items = vec!["первый".to_owned(), "второй".to_owned()];
+
+        assert_eq!(input.select("Выбор", &items).unwrap(), Some(1));
+        assert_eq!(input.select("Выбор", &items).unwrap(), None);
+    }
+
+    #[test]
+    fn collapses_only_long_multiline_input_at_the_end_of_the_buffer() {
+        let highlighter = MultilineInputHighlighter;
+        let twenty_lines = (1..=20)
+            .map(|line| format!("строка {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let twenty_one_lines = format!("{twenty_lines}\nстрока 21");
+
+        assert_eq!(
+            highlighter
+                .highlight(&twenty_lines, twenty_lines.len())
+                .raw_string(),
+            twenty_lines
+        );
+        assert_eq!(
+            highlighter
+                .highlight(&twenty_one_lines, twenty_one_lines.len())
+                .raw_string(),
+            "[Текст +21 строк]"
+        );
+        assert_eq!(
+            highlighter.highlight(&twenty_one_lines, 0).raw_string(),
+            twenty_one_lines
+        );
+    }
+
+    #[test]
+    fn preserves_whitespace_in_multiline_input() {
+        let input = "\n    fn main() {\n        println!(\"hello\");\n    }\n".to_owned();
+
+        assert_eq!(normalize_submitted_line(input.clone()), input);
+        assert_eq!(normalize_submitted_line("  вопрос  ".to_owned()), "вопрос");
     }
 }
