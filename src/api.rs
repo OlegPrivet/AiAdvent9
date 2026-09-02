@@ -1,6 +1,7 @@
+use std::io;
 use std::time::Duration;
 
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -92,8 +93,15 @@ pub(crate) enum ApiError {
     Request(reqwest::Error),
     #[error("AI-сервис вернул HTTP {status}: {message}")]
     Http { status: StatusCode, message: String },
+    #[cfg(test)]
     #[error("не удалось разобрать ответ AI-сервиса: {0}")]
     InvalidJson(reqwest::Error),
+    #[error("не удалось разобрать фрагмент потокового ответа: {0}")]
+    InvalidStream(serde_json::Error),
+    #[error("потоковый ответ завершился без маркера [DONE]")]
+    IncompleteStream,
+    #[error("не удалось вывести потоковый ответ: {0}")]
+    Output(io::Error),
     #[error("Structured Output не соответствует ожидаемой JSON Schema: {0}")]
     InvalidStructuredOutput(serde_json::Error),
     #[error(
@@ -117,11 +125,78 @@ impl NeuralDeepClient {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn ask(
         &self,
         question: &str,
         settings: &Settings,
     ) -> Result<ApiAnswer, ApiError> {
+        let response = self.send_request(question, settings, false).await?;
+        let response = response
+            .json::<ChatResponse>()
+            .await
+            .map_err(ApiError::InvalidJson)?;
+        let choice = response
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| missing_content(None))?;
+
+        finish_answer(
+            choice.message.content.unwrap_or_default(),
+            choice.finish_reason,
+            settings,
+        )
+    }
+
+    pub(crate) async fn ask_streaming<F>(
+        &self,
+        question: &str,
+        settings: &Settings,
+        mut on_delta: F,
+    ) -> Result<ApiAnswer, ApiError>
+    where
+        F: FnMut(&str) -> io::Result<()>,
+    {
+        let mut response = self.send_request(question, settings, true).await?;
+        let mut decoder = SseDecoder::default();
+        let mut content = String::new();
+        let mut finish_reason = None;
+        let mut done = false;
+
+        'response: while let Some(chunk) = response.chunk().await.map_err(ApiError::Request)? {
+            for data in decoder.push(&chunk) {
+                if data == b"[DONE]" {
+                    done = true;
+                    break 'response;
+                }
+                consume_stream_chunk(&data, &mut content, &mut finish_reason, &mut on_delta)?;
+            }
+        }
+
+        if !done {
+            for data in decoder.finish() {
+                if data == b"[DONE]" {
+                    done = true;
+                    break;
+                }
+                consume_stream_chunk(&data, &mut content, &mut finish_reason, &mut on_delta)?;
+            }
+        }
+
+        if !done {
+            return Err(ApiError::IncompleteStream);
+        }
+
+        finish_answer(content, finish_reason, settings)
+    }
+
+    async fn send_request(
+        &self,
+        question: &str,
+        settings: &Settings,
+        stream: bool,
+    ) -> Result<Response, ApiError> {
         let system_instruction = build_system_instruction(settings);
         let messages = vec![
             RequestMessage {
@@ -146,7 +221,7 @@ impl NeuralDeepClient {
             chat_template_kwargs: ChatTemplateKwargs {
                 enable_thinking: false,
             },
-            stream: false,
+            stream,
         };
 
         let response = self
@@ -167,40 +242,59 @@ impl NeuralDeepClient {
             });
         }
 
-        let response = response
-            .json::<ChatResponse>()
-            .await
-            .map_err(ApiError::InvalidJson)?;
-        let choice =
-            response
-                .choices
-                .into_iter()
-                .next()
-                .ok_or_else(|| ApiError::MissingContent {
-                    finish_reason: "не указан".to_owned(),
-                })?;
-        let finish_reason = choice.finish_reason;
-        let content = choice
-            .message
-            .content
-            .map(|content| content.trim().to_owned())
-            .filter(|content| !content.is_empty())
-            .ok_or_else(|| ApiError::MissingContent {
-                finish_reason: finish_reason
-                    .clone()
-                    .unwrap_or_else(|| "не указан".to_owned()),
-            })?;
-        let content = if settings.response_format_enabled() {
-            let structured = serde_json::from_str::<StructuredAnswer>(&content)
-                .map_err(ApiError::InvalidStructuredOutput)?;
-            serde_json::to_string_pretty(&structured)
-                .expect("serializing a structured answer should not fail")
-        } else {
-            content
-        };
-        let truncated = matches!(finish_reason.as_deref(), Some("length" | "max_tokens"));
+        Ok(response)
+    }
+}
 
-        Ok(ApiAnswer { content, truncated })
+fn consume_stream_chunk<F>(
+    data: &[u8],
+    content: &mut String,
+    finish_reason: &mut Option<String>,
+    on_delta: &mut F,
+) -> Result<(), ApiError>
+where
+    F: FnMut(&str) -> io::Result<()>,
+{
+    let chunk = serde_json::from_slice::<StreamChunk>(data).map_err(ApiError::InvalidStream)?;
+
+    for choice in chunk.choices {
+        if let Some(reason) = choice.finish_reason {
+            *finish_reason = Some(reason);
+        }
+        if let Some(delta) = choice.delta.content.filter(|value| !value.is_empty()) {
+            on_delta(&delta).map_err(ApiError::Output)?;
+            content.push_str(&delta);
+        }
+    }
+
+    Ok(())
+}
+
+fn finish_answer(
+    content: String,
+    finish_reason: Option<String>,
+    settings: &Settings,
+) -> Result<ApiAnswer, ApiError> {
+    let content = content.trim().to_owned();
+    if content.is_empty() {
+        return Err(missing_content(finish_reason));
+    }
+
+    let content = if settings.response_format_enabled() {
+        let structured = serde_json::from_str::<StructuredAnswer>(&content)
+            .map_err(ApiError::InvalidStructuredOutput)?;
+        serde_json::to_string_pretty(&structured).map_err(ApiError::InvalidStructuredOutput)?
+    } else {
+        content
+    };
+    let truncated = matches!(finish_reason.as_deref(), Some("length" | "max_tokens"));
+
+    Ok(ApiAnswer { content, truncated })
+}
+
+fn missing_content(finish_reason: Option<String>) -> ApiError {
+    ApiError::MissingContent {
+        finish_reason: finish_reason.unwrap_or_else(|| "не указан".to_owned()),
     }
 }
 
@@ -229,20 +323,83 @@ struct RequestMessage<'a> {
     content: &'a str,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
     finish_reason: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
     content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamDelta {
+    content: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct SseDecoder {
+    pending: Vec<u8>,
+}
+
+impl SseDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        self.pending.extend_from_slice(bytes);
+        self.take_complete_lines(false)
+    }
+
+    fn finish(&mut self) -> Vec<Vec<u8>> {
+        self.take_complete_lines(true)
+    }
+
+    fn take_complete_lines(&mut self, include_remainder: bool) -> Vec<Vec<u8>> {
+        let mut data_lines = Vec::new();
+
+        while let Some(line_end) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line = self.pending.drain(..=line_end).collect::<Vec<_>>();
+            if let Some(data) = parse_sse_data_line(&line) {
+                data_lines.push(data);
+            }
+        }
+
+        if include_remainder && !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            if let Some(data) = parse_sse_data_line(&line) {
+                data_lines.push(data);
+            }
+        }
+
+        data_lines
+    }
+}
+
+fn parse_sse_data_line(line: &[u8]) -> Option<Vec<u8>> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let data = line.strip_prefix(b"data:")?;
+    Some(data.strip_prefix(b" ").unwrap_or(data).to_vec())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -369,6 +526,76 @@ mod tests {
         );
         assert_eq!(body["stop"], "<END>");
         assert_eq!(body["stream"], false);
+    }
+
+    #[tokio::test]
+    async fn streams_sse_deltas_and_returns_complete_answer() {
+        let response_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Привет, \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"мир!\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":null},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, request_rx, server) = spawn_server(200, response_body);
+        let settings = Settings::default();
+        let mut streamed = String::new();
+
+        let answer = test_client(base_url)
+            .ask_streaming("test", &settings, |delta| {
+                streamed.push_str(delta);
+                Ok(())
+            })
+            .await
+            .expect("stream should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        server.join().expect("mock server should stop");
+
+        assert_eq!(streamed, "Привет, мир!");
+        assert_eq!(answer.content, "Привет, мир!");
+        assert!(!answer.truncated);
+        let body = request
+            .split_once("\r\n\r\n")
+            .expect("request should contain a body")
+            .1;
+        let body: Value = serde_json::from_str(body).expect("body should be valid JSON");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_or_incomplete_sse() {
+        let cases = [
+            ("data: not-json\n\ndata: [DONE]\n\n", "malformed"),
+            (
+                "data: {\"choices\":[{\"delta\":{\"content\":\"часть\"},\"finish_reason\":null}]}\n\n",
+                "incomplete",
+            ),
+        ];
+
+        for (response_body, expected) in cases {
+            let (base_url, _request_rx, server) = spawn_server(200, response_body);
+            let settings = Settings::default();
+            let error = test_client(base_url)
+                .ask_streaming("test", &settings, |_| Ok(()))
+                .await
+                .expect_err("invalid SSE should fail");
+            server.join().expect("mock server should stop");
+
+            match expected {
+                "malformed" => assert!(matches!(error, ApiError::InvalidStream(_))),
+                "incomplete" => assert!(matches!(error, ApiError::IncompleteStream)),
+                _ => panic!("unknown test case"),
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_sse_lines_split_across_network_chunks() {
+        let mut decoder = SseDecoder::default();
+
+        assert!(decoder.push(b"data: {\"choices\":").is_empty());
+        let lines = decoder.push(b"[]}\r\ndata: [DO");
+        assert_eq!(lines, [br#"{"choices":[]}"#.to_vec()]);
+        assert_eq!(decoder.push(b"NE]\r\n"), [b"[DONE]".to_vec()]);
     }
 
     #[tokio::test]

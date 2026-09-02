@@ -3,9 +3,10 @@ use std::io::{self, Write};
 use crate::api::NeuralDeepClient;
 use crate::input::LineInput;
 use crate::settings::Settings;
+use crate::ui::TerminalUi;
 
 const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
-const MAIN_PROMPT: &str = "> ";
+const MAIN_PROMPT: &str = "agi";
 
 pub(crate) async fn run<I: LineInput, W: Write>(
     client: &NeuralDeepClient,
@@ -13,12 +14,13 @@ pub(crate) async fn run<I: LineInput, W: Write>(
     initial_question: Option<String>,
     input: &mut I,
     output: &mut W,
+    ui: &TerminalUi,
 ) -> io::Result<()> {
     writeln!(output, "agi — интерактивный клиент NeuralDeep")?;
     writeln!(output, "Введите вопрос или /help для списка команд.\n")?;
 
     if let Some(question) = initial_question {
-        ask(client, settings, &question, output).await?;
+        ask(client, settings, &question, output, ui).await?;
     }
 
     loop {
@@ -40,7 +42,7 @@ pub(crate) async fn run<I: LineInput, W: Write>(
             value if value.starts_with('/') => {
                 writeln!(output, "Неизвестная команда: {value}. Используйте /help.")?;
             }
-            question => ask(client, settings, question, output).await?,
+            question => ask(client, settings, question, output, ui).await?,
         }
     }
 }
@@ -55,19 +57,35 @@ async fn ask<W: Write>(
     settings: &Settings,
     question: &str,
     output: &mut W,
+    ui: &TerminalUi,
 ) -> io::Result<()> {
-    match client.ask(question, settings).await {
+    let mut live_answer = ui.begin_answer(output);
+    let render_deltas = !settings.response_format_enabled();
+    let result = client
+        .ask_streaming(question, settings, |delta| {
+            if render_deltas {
+                live_answer.push(delta)
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+
+    match result {
         Ok(answer) => {
-            writeln!(output, "\n{}", answer.content)?;
+            live_answer.finish(&answer.content)?;
             if answer.truncated {
                 writeln!(
                     output,
-                    "\n[Ответ обрезан лимитом max_tokens. Увеличьте пункт 2 в /settings или задайте более узкий вопрос.]"
+                    "[Ответ обрезан лимитом max_tokens. Увеличьте пункт 2 в /settings или задайте более узкий вопрос.]\n"
                 )?;
             }
-            writeln!(output)
+            Ok(())
         }
-        Err(error) => writeln!(output, "\nОшибка запроса: {error}\n"),
+        Err(error) => {
+            live_answer.abort()?;
+            writeln!(output, "Ошибка запроса: {error}\n")
+        }
     }
 }
 
@@ -130,7 +148,14 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     )?;
     writeln!(output, "  /clear, /очистить        очистить окно терминала")?;
     writeln!(output, "  /help, /помощь          показать эту справку")?;
-    writeln!(output, "  /exit, /выход           завершить работу")
+    writeln!(output, "  /exit, /выход           завершить работу")?;
+    writeln!(output, "\nРедактор строки:")?;
+    writeln!(output, "  ↑/↓                     история запросов")?;
+    writeln!(output, "  Ctrl+R                  поиск по истории")?;
+    writeln!(
+        output,
+        "  agi --edit-mode vim     запустить с Vim-клавишами"
+    )
 }
 
 #[cfg(test)]
@@ -139,6 +164,7 @@ mod tests {
 
     use super::*;
     use crate::input::BufferedInput;
+    use crate::ui::TerminalUi;
 
     #[tokio::test]
     async fn handles_local_commands_without_api_requests() {
@@ -153,8 +179,9 @@ mod tests {
             "/help\n/settings\n2\n900\n0\n/unknown\n/exit\n",
         ));
         let mut output = Vec::new();
+        let ui = TerminalUi::plain();
 
-        run(&client, &mut settings, None, &mut input, &mut output)
+        run(&client, &mut settings, None, &mut input, &mut output, &ui)
             .await
             .expect("REPL should exit successfully");
 
@@ -175,8 +202,9 @@ mod tests {
         let mut settings = Settings::default();
         let mut input = BufferedInput::new(Cursor::new("/clear\n/help\n/exit\n"));
         let mut output = Vec::new();
+        let ui = TerminalUi::plain();
 
-        run(&client, &mut settings, None, &mut input, &mut output)
+        run(&client, &mut settings, None, &mut input, &mut output, &ui)
             .await
             .expect("REPL should continue after clearing");
 
@@ -196,8 +224,9 @@ mod tests {
         let mut settings = Settings::default();
         let mut input = BufferedInput::new(Cursor::new("/ыуе/settings\n0\n/ыуеештп\n0\n/учше\n"));
         let mut output = Vec::new();
+        let ui = TerminalUi::plain();
 
-        run(&client, &mut settings, None, &mut input, &mut output)
+        run(&client, &mut settings, None, &mut input, &mut output, &ui)
             .await
             .expect("Russian-layout commands should work");
 
@@ -221,8 +250,9 @@ mod tests {
             b'/', 0xff, b'\n', b'/', b'e', b'x', b'i', b't', b'\n',
         ]));
         let mut output = Vec::new();
+        let ui = TerminalUi::plain();
 
-        run(&client, &mut settings, None, &mut input, &mut output)
+        run(&client, &mut settings, None, &mut input, &mut output, &ui)
             .await
             .expect("invalid UTF-8 should not terminate the REPL");
 

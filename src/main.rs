@@ -4,6 +4,7 @@ mod config;
 mod input;
 mod repl;
 mod settings;
+mod ui;
 
 use std::error::Error;
 use std::io;
@@ -15,6 +16,7 @@ use cli::Cli;
 use config::Config;
 use input::TerminalInput;
 use settings::Settings;
+use ui::TerminalUi;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -33,7 +35,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let client = NeuralDeepClient::new(config.api_key, config.base_url, config.model)?;
     let mut settings = Settings::default();
 
-    let mut input = TerminalInput::new()?;
+    let mut input = TerminalInput::new(cli.edit_mode)?;
+    let ui = TerminalUi::detect();
     let mut output = io::stdout();
     repl::run(
         &client,
@@ -41,6 +44,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         cli.question,
         &mut input,
         &mut output,
+        &ui,
     )
     .await?;
 
