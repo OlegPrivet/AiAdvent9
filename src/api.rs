@@ -11,7 +11,6 @@ use crate::chat::ChatMessage;
 use crate::settings::Settings;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const TEMPERATURE: f32 = 0.1;
 
 fn structured_response_format() -> Value {
     json!({
@@ -209,7 +208,7 @@ impl NeuralDeepClient {
                 .response_format_enabled()
                 .then(structured_response_format),
             stop: settings.stop_sequence(),
-            temperature: TEMPERATURE,
+            temperature: settings.temperature(),
             user: &user,
             chat_template_kwargs: ChatTemplateKwargs {
                 enable_thinking: false,
@@ -453,7 +452,7 @@ mod tests {
         let client = test_client(base_url);
         let mut settings = Settings::default();
         let mut settings_input =
-            BufferedInput::new(Cursor::new("1\n1\n2\n750\n3\n2\n<END>\nesc\n"));
+            BufferedInput::new(Cursor::new("1\n1\n2\n750\n3\n0,75\n4\n2\n<END>\nesc\n"));
         settings
             .configure(&mut settings_input, &mut Vec::new())
             .expect("settings should be configured");
@@ -496,7 +495,7 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "Что такое ownership?");
         assert_eq!(body["max_tokens"], 750);
-        assert_eq!(body["temperature"], 0.1);
+        assert_eq!(body["temperature"], 0.75);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
@@ -571,7 +570,7 @@ mod tests {
         ];
         let mut settings = Settings::default();
         let mut settings_input =
-            BufferedInput::new(Cursor::new("4\n1\nТолько мой системный prompt\nesc\n"));
+            BufferedInput::new(Cursor::new("5\n1\nТолько мой системный prompt\nesc\n"));
         settings
             .configure(&mut settings_input, &mut Vec::new())
             .expect("custom prompt should be configured");
@@ -628,6 +627,7 @@ mod tests {
             body["messages"][0]["content"],
             "Вопрос без системного prompt"
         );
+        assert_eq!(body["temperature"], 0.1);
     }
 
     #[tokio::test]

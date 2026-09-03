@@ -705,8 +705,9 @@ mod tests {
         let store = ChatStore::for_tests(directory.0.clone()).expect("store should open");
         let mut chat = Chat::new();
         let id = chat.id();
-        let mut settings_input =
-            BufferedInput::new(Cursor::new("4\n1\nОтвечай как редактор\n2\n900\nesc\n"));
+        let mut settings_input = BufferedInput::new(Cursor::new(
+            "5\n1\nОтвечай как редактор\n2\n900\n3\n1.25\nesc\n",
+        ));
         chat.settings_mut()
             .configure(&mut settings_input, &mut Vec::new())
             .expect("settings should change");
@@ -727,6 +728,7 @@ mod tests {
             Some("Отвечай как редактор")
         );
         assert_eq!(restored.settings().max_tokens(), 900);
+        assert_eq!(restored.settings().temperature(), 1.25);
         assert!(restored.is_persisted());
         assert!(!restored.is_dirty());
         assert!(directory.0.join(DATABASE_FILE_NAME).is_file());
