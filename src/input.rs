@@ -55,9 +55,11 @@ struct MultilineInputHighlighter;
 
 impl Highlighter for MultilineInputHighlighter {
     fn highlight(&self, line: &str, cursor: usize) -> StyledText {
-        let line_count = line.lines().count();
+        let line_count = line.split('\n').count();
         let display = if cursor == line.len() && line_count > COLLAPSED_TEXT_LINE_THRESHOLD {
-            format!("[Текст +{line_count} строк]")
+            let (collapsed, current_line) = line.rsplit_once('\n').unwrap_or((line, ""));
+            let collapsed_line_count = collapsed.split('\n').count();
+            format!("[Текст +{collapsed_line_count} строк]\n{current_line}")
         } else {
             line.to_owned()
         };
@@ -318,11 +320,19 @@ mod tests {
             highlighter
                 .highlight(&twenty_one_lines, twenty_one_lines.len())
                 .raw_string(),
-            "[Текст +21 строк]"
+            "[Текст +20 строк]\nстрока 21"
         );
         assert_eq!(
             highlighter.highlight(&twenty_one_lines, 0).raw_string(),
             twenty_one_lines
+        );
+
+        let continued = format!("{twenty_one_lines}\n");
+        assert_eq!(
+            highlighter
+                .highlight(&continued, continued.len())
+                .raw_string(),
+            "[Текст +21 строк]\n"
         );
     }
 

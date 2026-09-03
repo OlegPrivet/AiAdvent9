@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Write};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use syntect::easy::HighlightLines;
@@ -7,11 +7,9 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{LinesWithEndings, as_24_bit_terminal_escaped};
 use termimad::MadSkin;
-use unicode_width::UnicodeWidthChar;
 
 use crate::chat::{Chat, MessageRole};
 
-const LIVE_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
 const RESET_STYLE: &str = "\x1b[0m";
 
 pub(crate) struct TerminalUi {
@@ -38,15 +36,23 @@ impl TerminalUi {
         }
     }
 
+    #[cfg(test)]
+    fn rendered_for_test() -> Self {
+        Self {
+            interactive: false,
+            renderer: Some(MarkdownRenderer::new()),
+        }
+    }
+
     pub(crate) fn begin_answer<'a, W: Write>(&'a self, output: &'a mut W) -> LiveAnswer<'a, W> {
         LiveAnswer {
             output,
             renderer: self.renderer.as_ref(),
             status: RequestStatus::new(self.interactive),
             source: String::new(),
-            rendered_rows: 0,
+            pending_markdown: String::new(),
             wrote_plain: false,
-            last_render: Instant::now(),
+            wrote_rendered: false,
         }
     }
 
@@ -84,9 +90,9 @@ pub(crate) struct LiveAnswer<'a, W: Write> {
     renderer: Option<&'a MarkdownRenderer>,
     status: RequestStatus,
     source: String,
-    rendered_rows: usize,
+    pending_markdown: String,
     wrote_plain: bool,
-    last_render: Instant,
+    wrote_rendered: bool,
 }
 
 impl<W: Write> LiveAnswer<'_, W> {
@@ -96,14 +102,13 @@ impl<W: Write> LiveAnswer<'_, W> {
             return Ok(());
         }
 
-        self.status.clear();
         self.source.push_str(&delta);
 
         if self.renderer.is_some() {
-            if self.rendered_rows == 0 || self.last_render.elapsed() >= LIVE_REFRESH_INTERVAL {
-                self.render_current()?;
-            }
+            self.pending_markdown.push_str(&delta);
+            self.render_complete_markdown_blocks()?;
         } else {
+            self.status.clear();
             self.output.write_all(delta.as_bytes())?;
             self.output.flush()?;
             self.wrote_plain = true;
@@ -117,9 +122,13 @@ impl<W: Write> LiveAnswer<'_, W> {
         let answer = sanitize_terminal_text(answer);
 
         if self.renderer.is_some() {
-            self.source = answer;
-            self.render_current()?;
-            writeln!(self.output)?;
+            if self.source.is_empty() {
+                self.pending_markdown = answer;
+            }
+            self.render_pending_markdown()?;
+            if self.wrote_rendered {
+                writeln!(self.output)?;
+            }
         } else if self.wrote_plain {
             if !self.source.ends_with('\n') {
                 writeln!(self.output)?;
@@ -136,8 +145,8 @@ impl<W: Write> LiveAnswer<'_, W> {
     pub(crate) fn abort(mut self) -> io::Result<()> {
         self.status.clear();
 
-        if self.renderer.is_some() && !self.source.is_empty() {
-            self.render_current()?;
+        if self.renderer.is_some() && (!self.pending_markdown.is_empty() || self.wrote_rendered) {
+            self.render_pending_markdown()?;
             writeln!(self.output)?;
         } else if self.wrote_plain && !self.source.ends_with('\n') {
             writeln!(self.output)?;
@@ -146,24 +155,39 @@ impl<W: Write> LiveAnswer<'_, W> {
         self.output.flush()
     }
 
-    fn render_current(&mut self) -> io::Result<()> {
+    fn render_complete_markdown_blocks(&mut self) -> io::Result<()> {
+        let complete_len = complete_markdown_prefix_len(&self.pending_markdown);
+        if complete_len == 0 {
+            return Ok(());
+        }
+
+        let pending = self.pending_markdown.split_off(complete_len);
+        let complete = std::mem::replace(&mut self.pending_markdown, pending);
+        self.write_markdown(&complete)
+    }
+
+    fn render_pending_markdown(&mut self) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.pending_markdown);
+        self.write_markdown(&pending)
+    }
+
+    fn write_markdown(&mut self, markdown: &str) -> io::Result<()> {
         let Some(renderer) = self.renderer else {
             return Ok(());
         };
-        let rendered = renderer.render(&self.source);
-
-        if self.rendered_rows > 0 {
-            write!(self.output, "\x1b[{}F\x1b[J", self.rendered_rows)?;
+        if markdown.is_empty() {
+            return Ok(());
         }
+
+        self.status.clear();
+        let rendered = renderer.render(markdown);
         self.output.write_all(rendered.as_bytes())?;
         if !rendered.ends_with('\n') {
             writeln!(self.output)?;
         }
         self.output.flush()?;
 
-        let width = usize::from(termimad::terminal_size().0.max(1));
-        self.rendered_rows = rendered_rows(&rendered, width);
-        self.last_render = Instant::now();
+        self.wrote_rendered = true;
         Ok(())
     }
 }
@@ -267,6 +291,11 @@ impl MarkdownRenderer {
     }
 
     fn push_code(&self, rendered: &mut String, code: &str, language: &str) {
+        if is_markdown_language(language) {
+            push_rendered_segment(rendered, &self.render(code));
+            return;
+        }
+
         let syntax = self
             .syntaxes
             .find_syntax_by_token(language)
@@ -295,6 +324,13 @@ impl MarkdownRenderer {
         }
         push_rendered_segment(rendered, &highlighted);
     }
+}
+
+fn is_markdown_language(language: &str) -> bool {
+    matches!(
+        language.to_ascii_lowercase().as_str(),
+        "md" | "markdown" | "mdown" | "mkd"
+    )
 }
 
 #[derive(Debug)]
@@ -358,38 +394,30 @@ fn sanitize_terminal_text(text: &str) -> String {
         .collect()
 }
 
-fn rendered_rows(rendered: &str, terminal_width: usize) -> usize {
-    rendered
-        .split_terminator('\n')
-        .map(|line| {
-            let width = visible_width(line);
-            width.max(1).div_ceil(terminal_width)
-        })
-        .sum::<usize>()
-        .max(1)
-}
+fn complete_markdown_prefix_len(markdown: &str) -> usize {
+    let mut fence: Option<CodeFence> = None;
+    let mut offset = 0;
+    let mut complete = 0;
 
-fn visible_width(line: &str) -> usize {
-    let mut width = 0;
-    let mut escape = false;
-    let mut control_sequence = false;
+    for line in markdown.split_inclusive('\n') {
+        if !line.ends_with('\n') {
+            break;
+        }
+        offset += line.len();
 
-    for character in line.chars() {
-        if escape {
-            if !control_sequence && character == '[' {
-                control_sequence = true;
-            } else if !control_sequence || ('@'..='~').contains(&character) {
-                escape = false;
-                control_sequence = false;
+        if let Some(active_fence) = &fence {
+            if active_fence.closes(line) {
+                fence = None;
+                complete = offset;
             }
-        } else if character == '\u{1b}' {
-            escape = true;
-        } else {
-            width += UnicodeWidthChar::width(character).unwrap_or(0);
+        } else if let Some(opening_fence) = CodeFence::open(line) {
+            fence = Some(opening_fence);
+        } else if line.trim().is_empty() {
+            complete = offset;
         }
     }
 
-    width
+    complete
 }
 
 #[cfg(test)]
@@ -410,6 +438,47 @@ mod tests {
     }
 
     #[test]
+    fn rendered_output_writes_each_markdown_block_once_without_repainting() {
+        let ui = TerminalUi::rendered_for_test();
+        let mut output = Vec::new();
+        let mut answer = ui.begin_answer(&mut output);
+
+        answer
+            .push("# Заголо")
+            .expect("partial heading should buffer");
+        answer
+            .push("вок\n\nПервый **абзац**.\n\nПоследний ")
+            .expect("complete blocks should render");
+        answer
+            .push("абзац.")
+            .expect("partial final block should buffer");
+        answer
+            .finish("# Заголовок\n\nПервый **абзац**.\n\nПоследний абзац.")
+            .expect("answer should finish");
+
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        assert_eq!(output.matches("Заголовок").count(), 1);
+        assert_eq!(output.matches("Первый").count(), 1);
+        assert_eq!(output.matches("Последний").count(), 1);
+        assert!(!output.contains("# Заголовок"));
+        assert!(!output.contains("**абзац**"));
+        assert!(!output.contains("\x1b[J"));
+        assert!(!output.contains("\x1b[F"));
+    }
+
+    #[test]
+    fn streaming_waits_for_a_closing_code_fence() {
+        let open_fence = "```rust\nfn main() {\n\n";
+        assert_eq!(complete_markdown_prefix_len(open_fence), 0);
+
+        let closed_fence = "```rust\nfn main() {}\n```\n";
+        assert_eq!(
+            complete_markdown_prefix_len(closed_fence),
+            closed_fence.len()
+        );
+    }
+
+    #[test]
     fn removes_terminal_control_characters_from_model_text() {
         assert_eq!(sanitize_terminal_text("до\x1b[2Jпосле\r\n"), "до[2Jпосле\n");
     }
@@ -426,8 +495,15 @@ mod tests {
     }
 
     #[test]
-    fn measures_text_without_ansi_sequences() {
-        assert_eq!(visible_width("\x1b[38;2;1;2;3mлось\x1b[0m"), 4);
+    fn renders_fenced_markdown_as_a_document() {
+        let renderer = MarkdownRenderer::new();
+        let output = renderer.render("```markdown\n# Заголовок\n\n**Текст**\n```\n");
+
+        assert!(output.contains("Заголовок"));
+        assert!(output.contains("Текст"));
+        assert!(!output.contains("── markdown ──"));
+        assert!(!output.contains("# Заголовок"));
+        assert!(!output.contains("**Текст**"));
     }
 
     #[test]

@@ -377,6 +377,7 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(output, "\nРедактор строки:")?;
     writeln!(output, "  ↑/↓                      история запросов")?;
     writeln!(output, "  Ctrl+R                   поиск по истории")?;
+    writeln!(output, "  Shift+Enter / Alt+Enter  новая строка")?;
     writeln!(
         output,
         "  Многострочная вставка    отправка только после Enter"
