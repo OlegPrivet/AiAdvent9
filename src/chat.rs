@@ -11,10 +11,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::metrics::ResponseMetrics;
+use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 1;
+const DATABASE_SCHEMA_VERSION: i64 = 2;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -49,6 +51,8 @@ impl MessageRole {
 pub(crate) struct ChatMessage {
     pub(crate) role: MessageRole,
     pub(crate) content: String,
+    #[serde(default)]
+    pub(crate) metrics: Option<ResponseMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,19 +119,59 @@ impl Chat {
         self.dirty
     }
 
+    #[cfg(test)]
     pub(crate) fn record_exchange(&mut self, question: String, answer: String) {
+        self.record_exchange_with_metrics(question, answer, None);
+    }
+
+    pub(crate) fn record_exchange_with_metrics(
+        &mut self,
+        question: String,
+        answer: String,
+        metrics: Option<ResponseMetrics>,
+    ) {
         if self.messages.is_empty() {
             self.title = title_from_question(&question);
         }
         self.messages.push(ChatMessage {
             role: MessageRole::User,
             content: question,
+            metrics: None,
         });
         self.messages.push(ChatMessage {
             role: MessageRole::Assistant,
             content: answer,
+            metrics,
         });
         self.mark_changed();
+    }
+
+    pub(crate) fn last_response_metrics(&self) -> Option<&ResponseMetrics> {
+        self.messages
+            .iter()
+            .rev()
+            .find_map(|message| message.metrics.as_ref())
+    }
+
+    pub(crate) fn refresh_last_response_cost(&mut self, prices: &PriceCatalog) -> bool {
+        let Some(metrics) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find_map(|message| message.metrics.as_mut())
+        else {
+            return false;
+        };
+        if metrics.estimated_cost_microrubles.is_some() {
+            return false;
+        }
+        let previous = (metrics.estimated_cost_microrubles, metrics.premium);
+        metrics.refresh_cost(prices);
+        let changed = previous != (metrics.estimated_cost_microrubles, metrics.premium);
+        if changed {
+            self.mark_changed();
+        }
+        changed
     }
 
     pub(crate) fn mark_changed(&mut self) {
@@ -196,6 +240,14 @@ pub(crate) enum ChatStoreError {
     SettingsJson {
         action: &'static str,
         id: Uuid,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("не удалось {action} метрики сообщения {sequence} чата {id}: {source}")]
+    MessageMetricsJson {
+        action: &'static str,
+        id: Uuid,
+        sequence: usize,
         #[source]
         source: serde_json::Error,
     },
@@ -269,7 +321,7 @@ impl ChatStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT sequence, role, content
+                "SELECT sequence, role, content, response_metrics_json
                  FROM messages WHERE chat_id = ?1 ORDER BY sequence",
             )
             .map_err(|source| self.database_error_with_source("подготовить чтение", source))?;
@@ -279,12 +331,13 @@ impl ChatStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })
             .map_err(|source| self.database_error_with_source("прочитать сообщения", source))?;
         let mut messages = Vec::new();
         for (expected_sequence, row) in rows.enumerate() {
-            let (sequence, role, content) = row
+            let (sequence, role, content, metrics_json) = row
                 .map_err(|source| self.database_error_with_source("прочитать сообщение", source))?;
             let Some(role) = MessageRole::from_database(&role) else {
                 return Err(ChatStoreError::InvalidConversation(id));
@@ -292,7 +345,23 @@ impl ChatStore {
             if sequence != expected_sequence as i64 {
                 return Err(ChatStoreError::InvalidConversation(id));
             }
-            messages.push(ChatMessage { role, content });
+            let metrics = metrics_json
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(|source| ChatStoreError::MessageMetricsJson {
+                    action: "прочитать",
+                    id,
+                    sequence: expected_sequence,
+                    source,
+                })?;
+            if role == MessageRole::User && metrics.is_some() {
+                return Err(ChatStoreError::InvalidConversation(id));
+            }
+            messages.push(ChatMessage {
+                role,
+                content,
+                metrics,
+            });
         }
         if !valid_messages(&messages) {
             return Err(ChatStoreError::InvalidConversation(id));
@@ -499,11 +568,23 @@ fn write_chat(
     {
         let mut statement = transaction
             .prepare(
-                "INSERT INTO messages(chat_id, sequence, role, content)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO messages(
+                     chat_id, sequence, role, content, response_metrics_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .map_err(|source| database_error("подготовить сообщения", database_path, source))?;
         for (sequence, message) in chat.messages.iter().enumerate() {
+            let metrics_json = message
+                .metrics
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|source| ChatStoreError::MessageMetricsJson {
+                    action: "сохранить",
+                    id: chat.id,
+                    sequence,
+                    source,
+                })?;
             statement
                 .execute(params![
                     id,
@@ -511,6 +592,7 @@ fn write_chat(
                         .map_err(|_| ChatStoreError::InvalidConversation(chat.id))?,
                     message.role.as_api_str(),
                     message.content,
+                    metrics_json,
                 ])
                 .map_err(|source| database_error("записать сообщение", database_path, source))?;
         }
@@ -544,16 +626,25 @@ fn initialize_database(
                      sequence INTEGER NOT NULL CHECK(sequence >= 0),
                      role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
                      content TEXT NOT NULL,
+                     response_metrics_json TEXT,
                      PRIMARY KEY(chat_id, sequence)
                  );
                  CREATE TABLE IF NOT EXISTS metadata (
                      key TEXT PRIMARY KEY NOT NULL,
                      value TEXT NOT NULL
                  );
-                 PRAGMA user_version = 1;
+                 PRAGMA user_version = 2;
                  COMMIT;",
             )
             .map_err(|source| database_error("создать схему", database_path, source)),
+        1 => connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE messages ADD COLUMN response_metrics_json TEXT;
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )
+            .map_err(|source| database_error("обновить схему", database_path, source)),
         value if value == DATABASE_SCHEMA_VERSION => Ok(()),
         value => Err(ChatStoreError::UnsupportedSchema(value)),
     }
@@ -582,9 +673,11 @@ fn valid_messages(messages: &[ChatMessage]) -> bool {
     let (pairs, remainder) = messages.as_chunks::<2>();
     !pairs.is_empty()
         && remainder.is_empty()
-        && pairs
-            .iter()
-            .all(|pair| pair[0].role == MessageRole::User && pair[1].role == MessageRole::Assistant)
+        && pairs.iter().all(|pair| {
+            pair[0].role == MessageRole::User
+                && pair[0].metrics.is_none()
+                && pair[1].role == MessageRole::Assistant
+        })
 }
 
 fn title_from_question(question: &str) -> String {
@@ -684,6 +777,7 @@ mod tests {
 
     use super::*;
     use crate::input::BufferedInput;
+    use crate::metrics::TokenUsage;
 
     struct TestDirectory(PathBuf);
 
@@ -706,7 +800,7 @@ mod tests {
         let mut chat = Chat::new();
         let id = chat.id();
         let mut settings_input = BufferedInput::new(Cursor::new(
-            "5\n1\nОтвечай как редактор\n2\n900\n3\n1.25\nesc\n",
+            "1\n3\n6\n1\nОтвечай как редактор\n3\n900\n4\n1.25\nesc\n",
         ));
         chat.settings_mut()
             .configure(&mut settings_input, &mut Vec::new())
@@ -716,7 +810,23 @@ mod tests {
         assert!(!store.save(&mut chat).expect("empty chat should not fail"));
         assert!(store.list().expect("list should load").chats.is_empty());
 
-        chat.record_exchange("  Первый   вопрос  ".to_owned(), "Первый ответ".to_owned());
+        let metrics = ResponseMetrics {
+            model: "gpt-oss-120b".to_owned(),
+            elapsed_ms: 1_234,
+            usage: Some(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 25,
+                total_tokens: 125,
+                cached_prompt_tokens: 40,
+            }),
+            estimated_cost_microrubles: Some(1_020),
+            premium: Some(false),
+        };
+        chat.record_exchange_with_metrics(
+            "  Первый   вопрос  ".to_owned(),
+            "Первый ответ".to_owned(),
+            Some(metrics.clone()),
+        );
         assert!(store.save(&mut chat).expect("chat should save"));
         let restored = store.load(id).expect("chat should restore");
 
@@ -727,8 +837,10 @@ mod tests {
             restored.settings().system_prompt(),
             Some("Отвечай как редактор")
         );
+        assert_eq!(restored.settings().model(), "gpt-oss-120b");
         assert_eq!(restored.settings().max_tokens(), 900);
         assert_eq!(restored.settings().temperature(), 1.25);
+        assert_eq!(restored.last_response_metrics(), Some(&metrics));
         assert!(restored.is_persisted());
         assert!(!restored.is_dirty());
         assert!(directory.0.join(DATABASE_FILE_NAME).is_file());
@@ -808,14 +920,60 @@ mod tests {
         let connection = Connection::open(directory.0.join(DATABASE_FILE_NAME))
             .expect("fixture database should open");
         connection
-            .execute_batch("PRAGMA user_version = 2;")
+            .execute_batch("PRAGMA user_version = 3;")
             .expect("fixture version should be set");
         drop(connection);
 
         let error =
             ChatStore::for_tests(directory.0.clone()).expect_err("newer schema should be rejected");
 
-        assert!(matches!(error, ChatStoreError::UnsupportedSchema(2)));
+        assert!(matches!(error, ChatStoreError::UnsupportedSchema(3)));
+    }
+
+    #[test]
+    fn migrates_database_schema_from_v1() {
+        let directory = TestDirectory::new();
+        fs::create_dir_all(&directory.0).expect("state directory should be created");
+        let database_path = directory.0.join(DATABASE_FILE_NAME);
+        let connection = Connection::open(&database_path).expect("fixture database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE chats (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     title TEXT NOT NULL,
+                     created_at_ms INTEGER NOT NULL,
+                     updated_at_ms INTEGER NOT NULL,
+                     settings_json TEXT NOT NULL
+                 );
+                 CREATE TABLE messages (
+                     chat_id TEXT NOT NULL,
+                     sequence INTEGER NOT NULL,
+                     role TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     PRIMARY KEY(chat_id, sequence)
+                 );
+                 CREATE TABLE metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+                 PRAGMA user_version = 1;",
+            )
+            .expect("v1 fixture should be created");
+        drop(connection);
+
+        let store = ChatStore::for_tests(directory.0.clone()).expect("v1 database should migrate");
+        let version = store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("schema version should be readable");
+        let has_metrics_column = store
+            .connection
+            .prepare("PRAGMA table_info(messages)")
+            .expect("table info should prepare")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("columns should be readable")
+            .filter_map(Result::ok)
+            .any(|column| column == "response_metrics_json");
+
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        assert!(has_metrics_column);
     }
 
     #[test]

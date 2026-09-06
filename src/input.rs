@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::env;
 use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
 use std::io;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 #[cfg(test)]
@@ -18,6 +20,7 @@ use crate::cli::EditMode;
 const HISTORY_CAPACITY: usize = 1_000;
 const MAIN_PROMPT: &str = "agi";
 const COLLAPSED_TEXT_LINE_THRESHOLD: usize = 20;
+const NEWLINE_ESCAPE: &str = "<\\n>";
 
 pub(crate) trait LineInput {
     fn read_line(&mut self, prompt: &str) -> io::Result<Option<String>>;
@@ -158,8 +161,105 @@ impl Prompt for InputPrompt<'_> {
     }
 }
 
-fn history_path() -> Option<PathBuf> {
+pub(crate) fn history_path() -> Option<PathBuf> {
     history_path_from_lookup(|name| env::var_os(name))
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CommandHistory {
+    entries: Vec<String>,
+    cursor: Option<usize>,
+    draft: String,
+    path: Option<PathBuf>,
+}
+
+impl CommandHistory {
+    pub(crate) fn load() -> Self {
+        let path = history_path();
+        let entries = path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map(|content| {
+                content
+                    .lines()
+                    .map(|line| line.replace(NEWLINE_ESCAPE, "\n"))
+                    .filter(|line| !line.is_empty())
+                    .rev()
+                    .take(HISTORY_CAPACITY)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            entries,
+            cursor: None,
+            draft: String::new(),
+            path,
+        }
+    }
+
+    pub(crate) fn record(&mut self, value: &str) -> io::Result<()> {
+        if value.is_empty() || self.entries.last().is_some_and(|last| last == value) {
+            self.reset_navigation();
+            return Ok(());
+        }
+        self.entries.push(value.to_owned());
+        if self.entries.len() > HISTORY_CAPACITY {
+            self.entries.remove(0);
+        }
+        self.reset_navigation();
+
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let encoded = value.replace('\n', NEWLINE_ESCAPE);
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(file, "{encoded}")
+    }
+
+    pub(crate) fn previous(&mut self, current: &str) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let index = match self.cursor {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.draft = current.to_owned();
+                self.entries.len() - 1
+            }
+        };
+        self.cursor = Some(index);
+        self.entries.get(index).cloned()
+    }
+
+    pub(crate) fn next(&mut self) -> Option<String> {
+        let index = self.cursor?;
+        if index + 1 < self.entries.len() {
+            self.cursor = Some(index + 1);
+            self.entries.get(index + 1).cloned()
+        } else {
+            self.cursor = None;
+            Some(std::mem::take(&mut self.draft))
+        }
+    }
+
+    pub(crate) fn search_backwards(&self, query: &str) -> Option<String> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| query.is_empty() || entry.contains(query))
+            .cloned()
+    }
+
+    pub(crate) fn reset_navigation(&mut self) {
+        self.cursor = None;
+        self.draft.clear();
+    }
 }
 
 fn history_path_from_lookup<F>(mut lookup: F) -> Option<PathBuf>
@@ -342,5 +442,30 @@ mod tests {
 
         assert_eq!(normalize_submitted_line(input.clone()), input);
         assert_eq!(normalize_submitted_line("  вопрос  ".to_owned()), "вопрос");
+    }
+
+    #[test]
+    fn command_history_navigates_and_searches_submitted_prompts() {
+        let mut history = CommandHistory {
+            entries: vec!["первый вопрос".to_owned(), "второй вопрос".to_owned()],
+            cursor: None,
+            draft: String::new(),
+            path: None,
+        };
+
+        assert_eq!(
+            history.previous("черновик").as_deref(),
+            Some("второй вопрос")
+        );
+        assert_eq!(
+            history.previous("ignored").as_deref(),
+            Some("первый вопрос")
+        );
+        assert_eq!(history.next().as_deref(), Some("второй вопрос"));
+        assert_eq!(history.next().as_deref(), Some("черновик"));
+        assert_eq!(
+            history.search_backwards("первый").as_deref(),
+            Some("первый вопрос")
+        );
     }
 }

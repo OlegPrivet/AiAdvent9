@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::chat::ChatMessage;
+use crate::metrics::TokenUsage;
 use crate::settings::Settings;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -46,18 +47,19 @@ fn structured_response_format() -> Value {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct NeuralDeepClient {
     http: Client,
     api_key: String,
     base_url: String,
-    model: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ApiAnswer {
     pub(crate) content: String,
     pub(crate) truncated: bool,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Error)]
@@ -86,7 +88,7 @@ pub(crate) enum ApiError {
 }
 
 impl NeuralDeepClient {
-    pub(crate) fn new(api_key: String, base_url: String, model: String) -> Result<Self, ApiError> {
+    pub(crate) fn new(api_key: String, base_url: String) -> Result<Self, ApiError> {
         let http = Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -96,7 +98,6 @@ impl NeuralDeepClient {
             http,
             api_key,
             base_url: base_url.trim_end_matches('/').to_owned(),
-            model,
         })
     }
 
@@ -108,6 +109,7 @@ impl NeuralDeepClient {
         question: &str,
         settings: &Settings,
     ) -> Result<ApiAnswer, ApiError> {
+        let started_at = Instant::now();
         let response = self
             .send_request(history, chat_id, question, settings, false)
             .await?;
@@ -115,6 +117,7 @@ impl NeuralDeepClient {
             .json::<ChatResponse>()
             .await
             .map_err(ApiError::InvalidJson)?;
+        let usage = response.usage.map(Into::into);
         let choice = response
             .choices
             .into_iter()
@@ -125,6 +128,8 @@ impl NeuralDeepClient {
             choice.message.content.unwrap_or_default(),
             choice.finish_reason,
             settings,
+            usage,
+            elapsed_millis(started_at.elapsed()),
         )
     }
 
@@ -139,12 +144,14 @@ impl NeuralDeepClient {
     where
         F: FnMut(&str) -> io::Result<()>,
     {
+        let started_at = Instant::now();
         let mut response = self
             .send_request(history, chat_id, question, settings, true)
             .await?;
         let mut decoder = SseDecoder::default();
         let mut content = String::new();
         let mut finish_reason = None;
+        let mut usage = None;
         let mut done = false;
 
         'response: while let Some(chunk) = response.chunk().await.map_err(ApiError::Request)? {
@@ -153,7 +160,13 @@ impl NeuralDeepClient {
                     done = true;
                     break 'response;
                 }
-                consume_stream_chunk(&data, &mut content, &mut finish_reason, &mut on_delta)?;
+                consume_stream_chunk(
+                    &data,
+                    &mut content,
+                    &mut finish_reason,
+                    &mut usage,
+                    &mut on_delta,
+                )?;
             }
         }
 
@@ -163,7 +176,13 @@ impl NeuralDeepClient {
                     done = true;
                     break;
                 }
-                consume_stream_chunk(&data, &mut content, &mut finish_reason, &mut on_delta)?;
+                consume_stream_chunk(
+                    &data,
+                    &mut content,
+                    &mut finish_reason,
+                    &mut usage,
+                    &mut on_delta,
+                )?;
             }
         }
 
@@ -171,7 +190,13 @@ impl NeuralDeepClient {
             return Err(ApiError::IncompleteStream);
         }
 
-        finish_answer(content, finish_reason, settings)
+        finish_answer(
+            content,
+            finish_reason,
+            settings,
+            usage,
+            elapsed_millis(started_at.elapsed()),
+        )
     }
 
     async fn send_request(
@@ -201,7 +226,7 @@ impl NeuralDeepClient {
         let user = chat_id.to_string();
 
         let request = ChatRequest {
-            model: &self.model,
+            model: settings.model(),
             messages,
             max_tokens: settings.max_tokens(),
             response_format: settings
@@ -214,6 +239,9 @@ impl NeuralDeepClient {
                 enable_thinking: false,
             },
             stream,
+            stream_options: stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
         };
 
         let response = self
@@ -242,12 +270,16 @@ fn consume_stream_chunk<F>(
     data: &[u8],
     content: &mut String,
     finish_reason: &mut Option<String>,
+    usage: &mut Option<TokenUsage>,
     on_delta: &mut F,
 ) -> Result<(), ApiError>
 where
     F: FnMut(&str) -> io::Result<()>,
 {
     let chunk = serde_json::from_slice::<StreamChunk>(data).map_err(ApiError::InvalidStream)?;
+    if let Some(chunk_usage) = chunk.usage {
+        *usage = Some(chunk_usage.into());
+    }
 
     for choice in chunk.choices {
         if let Some(reason) = choice.finish_reason {
@@ -266,6 +298,8 @@ fn finish_answer(
     content: String,
     finish_reason: Option<String>,
     settings: &Settings,
+    usage: Option<TokenUsage>,
+    elapsed_ms: u64,
 ) -> Result<ApiAnswer, ApiError> {
     let content = content.trim().to_owned();
     if content.is_empty() {
@@ -281,7 +315,16 @@ fn finish_answer(
     };
     let truncated = matches!(finish_reason.as_deref(), Some("length" | "max_tokens"));
 
-    Ok(ApiAnswer { content, truncated })
+    Ok(ApiAnswer {
+        content,
+        truncated,
+        elapsed_ms,
+        usage,
+    })
+}
+
+fn elapsed_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn missing_content(finish_reason: Option<String>) -> ApiError {
@@ -303,6 +346,13 @@ struct ChatRequest<'a> {
     user: &'a str,
     chat_template_kwargs: ChatTemplateKwargs,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -320,6 +370,8 @@ struct RequestMessage<'a> {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<UsagePayload>,
 }
 
 #[cfg(test)]
@@ -339,6 +391,36 @@ struct ResponseMessage {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<UsagePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsagePayload {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokenDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+impl From<UsagePayload> for TokenUsage {
+    fn from(usage: UsagePayload) -> Self {
+        Self {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            cached_prompt_tokens: usage
+                .prompt_tokens_details
+                .map_or(0, |details| details.cached_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,12 +529,13 @@ mod tests {
 
     #[tokio::test]
     async fn sends_chat_request_and_returns_content() {
-        let response_body = r#"{"choices":[{"message":{"content":"{\"conclusion\":\"Лось живёт в северных лесах.\",\"details\":[\"Это крупнейший представитель семейства оленевых.\"],\"short_answer\":\"Лось — крупное млекопитающее.\"}"},"finish_reason":"stop"}]}"#;
+        let response_body = r#"{"choices":[{"message":{"content":"{\"conclusion\":\"Лось живёт в северных лесах.\",\"details\":[\"Это крупнейший представитель семейства оленевых.\"],\"short_answer\":\"Лось — крупное млекопитающее.\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":45,"total_tokens":165,"prompt_tokens_details":{"cached_tokens":20}}}"#;
         let (base_url, request_rx, server) = spawn_server(200, response_body);
         let client = test_client(base_url);
         let mut settings = Settings::default();
-        let mut settings_input =
-            BufferedInput::new(Cursor::new("1\n1\n2\n750\n3\n0,75\n4\n2\n<END>\nesc\n"));
+        let mut settings_input = BufferedInput::new(Cursor::new(
+            "1\n19\n2\n1\n3\n750\n4\n0,75\n5\n2\n<END>\nesc\n",
+        ));
         settings
             .configure(&mut settings_input, &mut Vec::new())
             .expect("settings should be configured");
@@ -465,18 +548,24 @@ mod tests {
         server.join().expect("mock server should stop");
 
         assert_eq!(
-            answer,
-            ApiAnswer {
-                content: r#"{
+            answer.content,
+            r#"{
   "short_answer": "Лось — крупное млекопитающее.",
   "details": [
     "Это крупнейший представитель семейства оленевых."
   ],
   "conclusion": "Лось живёт в северных лесах."
 }"#
-                .to_owned(),
-                truncated: false,
-            }
+        );
+        assert!(!answer.truncated);
+        assert_eq!(
+            answer.usage,
+            Some(TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 45,
+                total_tokens: 165,
+                cached_prompt_tokens: 20,
+            })
         );
         assert!(request.starts_with("POST /chat/completions HTTP/1.1\r\n"));
         assert!(
@@ -490,7 +579,7 @@ mod tests {
             .expect("request should contain a body")
             .1;
         let body: Value = serde_json::from_str(body).expect("body should be valid JSON");
-        assert_eq!(body["model"], "qwen3.8-27b-noreason");
+        assert_eq!(body["model"], "deepseek-v4-pro");
         assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "Что такое ownership?");
@@ -522,6 +611,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"Привет, \"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"мир!\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":null},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\n",
             "data: [DONE]\n\n",
         );
         let (base_url, request_rx, server) = spawn_server(200, response_body);
@@ -541,12 +631,22 @@ mod tests {
         assert_eq!(streamed, "Привет, мир!");
         assert_eq!(answer.content, "Привет, мир!");
         assert!(!answer.truncated);
+        assert_eq!(
+            answer.usage,
+            Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 4,
+                total_tokens: 14,
+                cached_prompt_tokens: 0,
+            })
+        );
         let body = request
             .split_once("\r\n\r\n")
             .expect("request should contain a body")
             .1;
         let body: Value = serde_json::from_str(body).expect("body should be valid JSON");
         assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
     #[tokio::test]
@@ -562,15 +662,17 @@ mod tests {
             ChatMessage {
                 role: crate::chat::MessageRole::User,
                 content: "Первый вопрос".to_owned(),
+                metrics: None,
             },
             ChatMessage {
                 role: crate::chat::MessageRole::Assistant,
                 content: "Первый ответ".to_owned(),
+                metrics: None,
             },
         ];
         let mut settings = Settings::default();
         let mut settings_input =
-            BufferedInput::new(Cursor::new("5\n1\nТолько мой системный prompt\nesc\n"));
+            BufferedInput::new(Cursor::new("6\n1\nТолько мой системный prompt\nesc\n"));
         settings
             .configure(&mut settings_input, &mut Vec::new())
             .expect("custom prompt should be configured");
@@ -752,12 +854,7 @@ mod tests {
     }
 
     fn test_client(base_url: String) -> NeuralDeepClient {
-        NeuralDeepClient::new(
-            "test-key".to_owned(),
-            base_url,
-            "qwen3.8-27b-noreason".to_owned(),
-        )
-        .expect("client should be built")
+        NeuralDeepClient::new("test-key".to_owned(), base_url).expect("client should be built")
     }
 
     fn spawn_server(

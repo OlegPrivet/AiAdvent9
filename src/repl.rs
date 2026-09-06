@@ -5,10 +5,17 @@ use uuid::Uuid;
 use crate::api::NeuralDeepClient;
 use crate::chat::{Chat, ChatStore};
 use crate::input::LineInput;
+use crate::metrics::ResponseMetrics;
+use crate::pricing::PriceCatalog;
 use crate::ui::TerminalUi;
 
 const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 const MAIN_PROMPT: &str = "agi";
+
+pub(crate) struct ReplDisplay<'a> {
+    pub(crate) ui: &'a TerminalUi,
+    pub(crate) prices: &'a PriceCatalog,
+}
 
 pub(crate) async fn run<I: LineInput, W: Write>(
     client: &NeuralDeepClient,
@@ -17,8 +24,9 @@ pub(crate) async fn run<I: LineInput, W: Write>(
     initial_question: Option<String>,
     input: &mut I,
     output: &mut W,
-    ui: &TerminalUi,
+    display: ReplDisplay<'_>,
 ) -> io::Result<()> {
+    let ReplDisplay { ui, prices } = display;
     writeln!(output, "agi — интерактивный клиент NeuralDeep")?;
     writeln!(output, "Введите вопрос или /help для списка команд.")?;
     if chat.is_persisted() {
@@ -31,7 +39,7 @@ pub(crate) async fn run<I: LineInput, W: Write>(
     }
 
     if let Some(question) = initial_question {
-        ask(client, store, chat, &question, output, ui).await?;
+        ask(client, store, chat, &question, output, ui, prices).await?;
     }
 
     loop {
@@ -47,7 +55,7 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                 return finish_session(store, chat, output);
             }
             if command.matches(&["/clear", "/очистить"]) {
-                clear_screen(output)?;
+                start_new_chat(store, chat, output)?;
             } else if command.matches(&["/help", "/помощь"]) {
                 print_help(output)?;
             } else if command.matches(&["/settings", "/setting", "/настройки"]) {
@@ -64,13 +72,29 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                 )?;
             }
         } else {
-            ask(client, store, chat, &line, output, ui).await?;
+            ask(client, store, chat, &line, output, ui, prices).await?;
         }
     }
 }
 
-fn clear_screen<W: Write>(output: &mut W) -> io::Result<()> {
+fn start_new_chat<W: Write>(store: &ChatStore, chat: &mut Chat, output: &mut W) -> io::Result<()> {
+    if chat.has_completed_turn()
+        && chat.is_dirty()
+        && let Err(error) = store.save(chat)
+    {
+        writeln!(
+            output,
+            "Новый чат не создан: текущий чат не удалось сохранить: {error}"
+        )?;
+        return Ok(());
+    }
+
+    *chat = Chat::new();
     write!(output, "{CLEAR_SCREEN}")?;
+    writeln!(
+        output,
+        "Новый чат. Предыдущие сообщения больше не передаются AI."
+    )?;
     output.flush()
 }
 
@@ -81,6 +105,7 @@ async fn ask<W: Write>(
     question: &str,
     output: &mut W,
     ui: &TerminalUi,
+    prices: &PriceCatalog,
 ) -> io::Result<()> {
     let mut live_answer = ui.begin_answer(output);
     let render_deltas = !chat.settings().response_format_enabled();
@@ -104,7 +129,13 @@ async fn ask<W: Write>(
         Ok(answer) => {
             live_answer.finish(&answer.content)?;
             let truncated = answer.truncated;
-            chat.record_exchange(question.to_owned(), answer.content);
+            let metrics = ResponseMetrics::new(
+                chat.settings().model(),
+                answer.elapsed_ms,
+                answer.usage,
+                prices,
+            );
+            chat.record_exchange_with_metrics(question.to_owned(), answer.content, Some(metrics));
             if let Err(error) = store.save(chat) {
                 writeln!(
                     output,
@@ -117,6 +148,7 @@ async fn ask<W: Write>(
                     "[Ответ обрезан лимитом max_tokens. Увеличьте его в /settings или задайте более узкий вопрос.]\n"
                 )?;
             }
+            ui.print_metrics(output, chat.last_response_metrics())?;
             Ok(())
         }
         Err(error) => {
@@ -278,13 +310,13 @@ fn finish_session<W: Write>(store: &ChatStore, chat: &mut Chat, output: &mut W) 
     }
 }
 
-struct ParsedCommand<'a> {
-    name: &'a str,
-    argument: Option<&'a str>,
+pub(crate) struct ParsedCommand<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) argument: Option<&'a str>,
 }
 
 impl<'a> ParsedCommand<'a> {
-    fn parse(value: &'a str) -> Option<Self> {
+    pub(crate) fn parse(value: &'a str) -> Option<Self> {
         if value.contains('\n') || value.contains('\r') {
             return None;
         }
@@ -301,7 +333,7 @@ impl<'a> ParsedCommand<'a> {
         Some(Self { name, argument })
     }
 
-    fn matches(&self, commands: &[&str]) -> bool {
+    pub(crate) fn matches(&self, commands: &[&str]) -> bool {
         is_command(self.name, commands)
     }
 }
@@ -368,7 +400,10 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
         output,
         "  /settings, /настройки   изменить настройки текущего чата"
     )?;
-    writeln!(output, "  /clear, /очистить        очистить окно терминала")?;
+    writeln!(
+        output,
+        "  /clear, /очистить        начать новый чат без предыдущего контекста"
+    )?;
     writeln!(output, "  /help, /помощь           показать эту справку")?;
     writeln!(
         output,
@@ -413,12 +448,8 @@ mod tests {
     }
 
     fn test_client() -> NeuralDeepClient {
-        NeuralDeepClient::new(
-            "test-key".to_owned(),
-            "http://127.0.0.1:1".to_owned(),
-            "test-model".to_owned(),
-        )
-        .expect("client should be built")
+        NeuralDeepClient::new("test-key".to_owned(), "http://127.0.0.1:1".to_owned())
+            .expect("client should be built")
     }
 
     fn test_store() -> (TestDirectory, ChatStore) {
@@ -432,7 +463,7 @@ mod tests {
         let (_directory, store) = test_store();
         let mut chat = Chat::new();
         let mut input = BufferedInput::new(Cursor::new(
-            "/help\n/settings\n2\n900\nesc\n/unknown\n/exit\n",
+            "/help\n/settings\n3\n900\nesc\n/unknown\n/exit\n",
         ));
         let mut output = Vec::new();
         let ui = TerminalUi::plain();
@@ -444,7 +475,10 @@ mod tests {
             None,
             &mut input,
             &mut output,
-            &ui,
+            ReplDisplay {
+                ui: &ui,
+                prices: &PriceCatalog::default(),
+            },
         )
         .await
         .expect("REPL should exit successfully");
@@ -457,9 +491,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clears_terminal_and_keeps_session_running() {
+    async fn clear_starts_a_new_chat_without_previous_context() {
         let (_directory, store) = test_store();
         let mut chat = Chat::new();
+        chat.record_exchange("Старый вопрос".to_owned(), "Старый ответ".to_owned());
+        let old_id = chat.id();
+        store.save(&mut chat).expect("old chat should save");
         let mut input = BufferedInput::new(Cursor::new("/clear\n/help\n/exit\n"));
         let mut output = Vec::new();
         let ui = TerminalUi::plain();
@@ -471,14 +508,28 @@ mod tests {
             None,
             &mut input,
             &mut output,
-            &ui,
+            ReplDisplay {
+                ui: &ui,
+                prices: &PriceCatalog::default(),
+            },
         )
         .await
         .expect("REPL should continue after clearing");
 
         let output = String::from_utf8(output).expect("output should be UTF-8");
         assert!(output.contains(CLEAR_SCREEN));
+        assert!(output.contains("Предыдущие сообщения больше не передаются AI"));
         assert!(output.contains("Доступные команды:"));
+        assert_ne!(chat.id(), old_id);
+        assert!(chat.messages().is_empty());
+        assert_eq!(
+            store
+                .load(old_id)
+                .expect("old chat should remain restorable")
+                .messages()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -496,7 +547,10 @@ mod tests {
             None,
             &mut input,
             &mut output,
-            &ui,
+            ReplDisplay {
+                ui: &ui,
+                prices: &PriceCatalog::default(),
+            },
         )
         .await
         .expect("Russian-layout commands should work");
@@ -527,7 +581,10 @@ mod tests {
             None,
             &mut input,
             &mut output,
-            &ui,
+            ReplDisplay {
+                ui: &ui,
+                prices: &PriceCatalog::default(),
+            },
         )
         .await
         .expect("chat should be selected");
@@ -558,7 +615,10 @@ mod tests {
             None,
             &mut input,
             &mut output,
-            &ui,
+            ReplDisplay {
+                ui: &ui,
+                prices: &PriceCatalog::default(),
+            },
         )
         .await
         .expect("chat should restore");
@@ -583,7 +643,10 @@ mod tests {
             None,
             &mut input,
             &mut output,
-            &ui,
+            ReplDisplay {
+                ui: &ui,
+                prices: &PriceCatalog::default(),
+            },
         )
         .await
         .expect("invalid UTF-8 should not terminate the REPL");

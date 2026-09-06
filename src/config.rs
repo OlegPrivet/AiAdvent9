@@ -4,13 +4,11 @@ use thiserror::Error;
 
 const API_KEY_ENV: &str = "NEURALDEEP_API_KEY";
 const DEFAULT_BASE_URL: &str = "https://api.neuraldeep.ru/v1";
-const DEFAULT_MODEL: &str = "qwen3.8-27b-noreason";
 
 #[derive(Debug)]
 pub(crate) struct Config {
     pub(crate) api_key: String,
     pub(crate) base_url: String,
-    pub(crate) model: String,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -36,7 +34,6 @@ impl Config {
         Ok(Self {
             api_key,
             base_url: DEFAULT_BASE_URL.to_owned(),
-            model: DEFAULT_MODEL.to_owned(),
         })
     }
 }
@@ -55,7 +52,6 @@ mod tests {
 
         assert_eq!(config.api_key, "secret-key");
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
-        assert_eq!(config.model, DEFAULT_MODEL);
     }
 
     #[test]

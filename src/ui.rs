@@ -9,6 +9,7 @@ use syntect::util::{LinesWithEndings, as_24_bit_terminal_escaped};
 use termimad::MadSkin;
 
 use crate::chat::{Chat, MessageRole};
+use crate::metrics::{ResponseMetrics, metric_lines};
 
 const RESET_STYLE: &str = "\x1b[0m";
 
@@ -80,6 +81,18 @@ impl TerminalUi {
             }
         }
 
+        writeln!(output)?;
+        output.flush()
+    }
+
+    pub(crate) fn print_metrics<W: Write>(
+        &self,
+        output: &mut W,
+        metrics: Option<&ResponseMetrics>,
+    ) -> io::Result<()> {
+        for line in metric_lines(metrics) {
+            writeln!(output, "{line}")?;
+        }
         writeln!(output)?;
         output.flush()
     }
@@ -386,7 +399,7 @@ fn push_rendered_segment(rendered: &mut String, segment: &str) {
     rendered.push_str(segment);
 }
 
-fn sanitize_terminal_text(text: &str) -> String {
+pub(crate) fn sanitize_terminal_text(text: &str) -> String {
     text.chars()
         .filter(|character| {
             matches!(character, '\n' | '\t') || (!character.is_control() && *character != '\u{7f}')

@@ -7,9 +7,64 @@ use crate::input::LineInput;
 
 const DEFAULT_MAX_TOKENS: u32 = 10000;
 const DEFAULT_TEMPERATURE: f32 = 0.1;
+const DEFAULT_MODEL: &str = "qwen3.8-27b-noreason";
 const MIN_STRUCTURED_TOKENS: u32 = 256;
 const MIN_TEMPERATURE: f32 = 0.0;
 const MAX_TEMPERATURE: f32 = 2.0;
+
+const MODEL_OPTIONS: &[ModelOption] = &[
+    ModelOption::included("gpt-oss-20b"),
+    ModelOption::outside_subscription("qwen3.7-flash"),
+    ModelOption::included("gpt-oss-120b"),
+    ModelOption::included("qwen3.6-35b-a3b"),
+    ModelOption::included("qwen3.6-35b-a3b-noreason"),
+    ModelOption::included("qwen3.6-fp8"),
+    ModelOption::included("qwen3.6-fp8-noreason"),
+    ModelOption::outside_subscription("glm-5.3-flash"),
+    ModelOption::included("gemma-4-31b"),
+    ModelOption::included("gemma-4-31b-noreason"),
+    ModelOption::included("qwen3.8-27b"),
+    ModelOption::included("qwen3.8-27b-noreason"),
+    ModelOption::outside_subscription("deepseek-v4-flash-vision-exp"),
+    ModelOption::outside_subscription("deepseek-v4-flash"),
+    ModelOption::outside_subscription("minimax-m2.5"),
+    ModelOption::outside_subscription("qwen3.7-plus"),
+    ModelOption::included("kimi-k2.6"),
+    ModelOption::outside_subscription("kimi-k2.7-code"),
+    ModelOption::outside_subscription("deepseek-v4-pro"),
+    ModelOption::outside_subscription("glm-5.2"),
+    ModelOption::outside_subscription("kimi-k3"),
+];
+
+#[derive(Clone, Copy)]
+struct ModelOption {
+    name: &'static str,
+    outside_subscription: bool,
+}
+
+impl ModelOption {
+    const fn included(name: &'static str) -> Self {
+        Self {
+            name,
+            outside_subscription: false,
+        }
+    }
+
+    const fn outside_subscription(name: &'static str) -> Self {
+        Self {
+            name,
+            outside_subscription: true,
+        }
+    }
+
+    fn label(self) -> String {
+        if self.outside_subscription {
+            format!("{} — вне подписки", self.name)
+        } else {
+            self.name.to_owned()
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +87,7 @@ impl fmt::Display for CompletionCondition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
+    model: String,
     response_format_enabled: bool,
     max_tokens: u32,
     temperature: f32,
@@ -42,6 +98,7 @@ pub(crate) struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            model: DEFAULT_MODEL.to_owned(),
             response_format_enabled: false,
             max_tokens: DEFAULT_MAX_TOKENS,
             temperature: DEFAULT_TEMPERATURE,
@@ -52,6 +109,10 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
     pub(crate) fn response_format_enabled(&self) -> bool {
         self.response_format_enabled
     }
@@ -78,7 +139,6 @@ impl Settings {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
     }
@@ -99,6 +159,135 @@ impl Settings {
         prompt
     }
 
+    pub(crate) fn menu_items(&self) -> Vec<String> {
+        vec![
+            format!("Модель: {}", self.model),
+            format!(
+                "Structured Output: {}",
+                if self.response_format_enabled {
+                    "включен"
+                } else {
+                    "выключен"
+                }
+            ),
+            format!("Максимальная длина: {} токенов", self.max_tokens),
+            format!("Температура: {}", format_temperature(self.temperature)),
+            format!("Завершение ответа: {}", self.completion_condition),
+            format!(
+                "Системный prompt: {}",
+                if self.system_prompt.is_some() {
+                    "задан"
+                } else {
+                    "не задан"
+                }
+            ),
+        ]
+    }
+
+    pub(crate) fn model_items() -> Vec<String> {
+        MODEL_OPTIONS
+            .iter()
+            .copied()
+            .map(ModelOption::label)
+            .collect()
+    }
+
+    pub(crate) fn model_index(&self) -> usize {
+        MODEL_OPTIONS
+            .iter()
+            .position(|model| model.name == self.model)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn select_model(&mut self, choice: usize) -> bool {
+        let Some(model) = MODEL_OPTIONS.get(choice) else {
+            return false;
+        };
+        if self.model == model.name {
+            return false;
+        }
+        self.model = model.name.to_owned();
+        true
+    }
+
+    pub(crate) fn set_response_format(&mut self, enabled: bool) -> Option<String> {
+        self.response_format_enabled = enabled;
+        if enabled && self.max_tokens < MIN_STRUCTURED_TOKENS {
+            self.max_tokens = MIN_STRUCTURED_TOKENS;
+            Some(format!(
+                "Для Structured Output лимит увеличен до {MIN_STRUCTURED_TOKENS} токенов."
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_max_tokens(&mut self, value: &str) -> Result<Option<String>, String> {
+        let max_tokens = value
+            .parse::<u32>()
+            .map_err(|_| "Требуется целое число больше нуля.".to_owned())?;
+        if max_tokens == 0 {
+            return Err("Требуется целое число больше нуля.".to_owned());
+        }
+        if self.response_format_enabled && max_tokens < MIN_STRUCTURED_TOKENS {
+            return Err(format!(
+                "Для Structured Output требуется минимум {MIN_STRUCTURED_TOKENS} токенов."
+            ));
+        }
+        self.max_tokens = max_tokens;
+        Ok((max_tokens < 128)
+            .then(|| "При лимите меньше 128 токенов ответ будет очень кратким.".to_owned()))
+    }
+
+    pub(crate) fn set_temperature(&mut self, value: &str) -> Result<(), String> {
+        let normalized = value.replace(',', ".");
+        let temperature = normalized
+            .parse::<f32>()
+            .map_err(|_| "Температура должна быть числом от 0.0 до 2.0.".to_owned())?;
+        if !temperature.is_finite() || !(MIN_TEMPERATURE..=MAX_TEMPERATURE).contains(&temperature) {
+            return Err("Температура должна быть числом от 0.0 до 2.0.".to_owned());
+        }
+        self.temperature = if temperature == 0.0 { 0.0 } else { temperature };
+        Ok(())
+    }
+
+    pub(crate) fn clear_completion_condition(&mut self) {
+        self.completion_condition = CompletionCondition::None;
+    }
+
+    pub(crate) fn set_stop_sequence(&mut self, value: String) -> Result<(), String> {
+        if value.is_empty() {
+            return Err("Строка остановки не должна быть пустой.".to_owned());
+        }
+        if value.chars().all(|character| character.is_ascii_digit()) {
+            return Err(
+                "Число похоже на лимит длины. Используйте «Максимальная длина».".to_owned(),
+            );
+        }
+        self.completion_condition = CompletionCondition::StopSequence(value);
+        Ok(())
+    }
+
+    pub(crate) fn set_completion_instruction(&mut self, value: String) -> Result<(), String> {
+        if value.is_empty() {
+            return Err("Инструкция не должна быть пустой.".to_owned());
+        }
+        self.completion_condition = CompletionCondition::Instruction(value);
+        Ok(())
+    }
+
+    pub(crate) fn set_system_prompt(&mut self, value: String) -> Result<(), String> {
+        if value.is_empty() {
+            return Err("Системный prompt не должен быть пустым.".to_owned());
+        }
+        self.system_prompt = Some(value);
+        Ok(())
+    }
+
+    pub(crate) fn clear_system_prompt(&mut self) {
+        self.system_prompt = None;
+    }
+
     pub(crate) fn configure<I: LineInput, W: Write>(
         &mut self,
         input: &mut I,
@@ -107,41 +296,32 @@ impl Settings {
         let original = self.clone();
 
         loop {
-            let items = vec![
-                format!(
-                    "Structured Output: {}",
-                    if self.response_format_enabled {
-                        "включен"
-                    } else {
-                        "выключен"
-                    }
-                ),
-                format!("Максимальная длина: {} токенов", self.max_tokens),
-                format!("Температура: {}", format_temperature(self.temperature)),
-                format!("Завершение ответа: {}", self.completion_condition),
-                format!(
-                    "Системный prompt: {}",
-                    if self.system_prompt.is_some() {
-                        "задан"
-                    } else {
-                        "не задан"
-                    }
-                ),
-            ];
+            let items = self.menu_items();
             let Some(choice) = input.select("Настройки текущего чата — Esc: назад", &items)?
             else {
                 return Ok(*self != original);
             };
 
             match choice {
-                0 => self.configure_response_format(input, output)?,
-                1 => self.configure_max_tokens(input, output)?,
-                2 => self.configure_temperature(input, output)?,
-                3 => self.configure_completion(input, output)?,
-                4 => self.configure_system_prompt(input, output)?,
+                0 => self.configure_model(input)?,
+                1 => self.configure_response_format(input, output)?,
+                2 => self.configure_max_tokens(input, output)?,
+                3 => self.configure_temperature(input, output)?,
+                4 => self.configure_completion(input, output)?,
+                5 => self.configure_system_prompt(input, output)?,
                 _ => {}
             }
         }
+    }
+
+    fn configure_model<I: LineInput>(&mut self, input: &mut I) -> io::Result<()> {
+        let items = Self::model_items();
+        let Some(choice) = input.select("Модель — Esc: назад", &items)? else {
+            return Ok(());
+        };
+
+        self.select_model(choice);
+        Ok(())
     }
 
     fn configure_response_format<I: LineInput, W: Write>(
@@ -402,6 +582,7 @@ mod tests {
     fn uses_safe_defaults() {
         let settings = Settings::default();
 
+        assert_eq!(settings.model(), DEFAULT_MODEL);
         assert!(!settings.response_format_enabled());
         assert_eq!(settings.max_tokens(), DEFAULT_MAX_TOKENS);
         assert_eq!(settings.temperature(), DEFAULT_TEMPERATURE);
@@ -415,7 +596,7 @@ mod tests {
     fn configures_all_chat_settings_with_menu_choices() {
         let mut settings = Settings::default();
         let mut input = BufferedInput::new(Cursor::new(
-            "1\n1\n2\n1200\n3\n0,7\n4\n2\n<END>\n5\n1\nТы редактор\nesc\n",
+            "1\n3\n2\n1\n3\n1200\n4\n0,7\n5\n2\n<END>\n6\n1\nТы редактор\nesc\n",
         ));
         let mut output = Vec::new();
 
@@ -424,6 +605,7 @@ mod tests {
             .expect("settings should be configured");
 
         assert!(changed);
+        assert_eq!(settings.model(), "gpt-oss-120b");
         assert!(settings.response_format_enabled());
         assert_eq!(settings.max_tokens(), 1200);
         assert_eq!(settings.temperature(), 0.7);
@@ -435,7 +617,7 @@ mod tests {
     #[test]
     fn builds_explicit_completion_instruction() {
         let mut settings = Settings::default();
-        let mut input = BufferedInput::new(Cursor::new("4\n3\nЗаверши словом ГОТОВО\nesc\n"));
+        let mut input = BufferedInput::new(Cursor::new("5\n3\nЗаверши словом ГОТОВО\nesc\n"));
         let mut output = Vec::new();
 
         settings
@@ -469,7 +651,7 @@ mod tests {
     #[test]
     fn rejects_numeric_stop_sequence_as_likely_token_limit() {
         let mut settings = Settings::default();
-        let mut input = BufferedInput::new(Cursor::new("4\n2\n400\nesc\n"));
+        let mut input = BufferedInput::new(Cursor::new("5\n2\n400\nesc\n"));
         let mut output = Vec::new();
 
         settings
@@ -487,7 +669,7 @@ mod tests {
     #[test]
     fn enforces_minimum_token_limit_for_structured_output() {
         let mut settings = Settings::default();
-        let mut input = BufferedInput::new(Cursor::new("2\n100\n1\n1\n2\n100\nesc\n"));
+        let mut input = BufferedInput::new(Cursor::new("3\n100\n2\n1\n3\n100\nesc\n"));
         let mut output = Vec::new();
 
         settings
@@ -504,7 +686,7 @@ mod tests {
     #[test]
     fn clears_custom_system_prompt() {
         let mut settings = Settings::default();
-        let mut input = BufferedInput::new(Cursor::new("5\n1\nОсобые правила\n5\n2\nesc\n"));
+        let mut input = BufferedInput::new(Cursor::new("6\n1\nОсобые правила\n6\n2\nesc\n"));
         let mut output = Vec::new();
 
         settings
@@ -523,7 +705,7 @@ mod tests {
     fn displays_the_exact_effective_system_prompt() {
         let mut settings = Settings::default();
         let mut input = BufferedInput::new(Cursor::new(
-            "5\n1\nМой prompt\n4\n3\nЗаверши словом Готово\n5\nesc\nesc\n",
+            "6\n1\nМой prompt\n5\n3\nЗаверши словом Готово\n6\nesc\nesc\n",
         ));
         let mut output = Vec::new();
 
@@ -587,7 +769,16 @@ mod tests {
         let settings: Settings =
             serde_json::from_str(r#"{"max_tokens":900}"#).expect("old settings should deserialize");
 
+        assert_eq!(settings.model(), DEFAULT_MODEL);
         assert_eq!(settings.max_tokens(), 900);
         assert_eq!(settings.temperature(), DEFAULT_TEMPERATURE);
+    }
+
+    #[test]
+    fn lists_all_models_and_marks_models_outside_subscription() {
+        assert_eq!(MODEL_OPTIONS.len(), 21);
+        assert_eq!(MODEL_OPTIONS[0].label(), "gpt-oss-20b");
+        assert_eq!(MODEL_OPTIONS[1].label(), "qwen3.7-flash — вне подписки");
+        assert_eq!(MODEL_OPTIONS[20].label(), "kimi-k3 — вне подписки");
     }
 }
