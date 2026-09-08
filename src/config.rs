@@ -4,6 +4,8 @@ use thiserror::Error;
 
 const API_KEY_ENV: &str = "NEURALDEEP_API_KEY";
 const DEFAULT_BASE_URL: &str = "https://api.neuraldeep.ru/v1";
+pub(crate) const DEFAULT_MODEL: &str = "qwen3.8-27b";
+pub(crate) const DEFAULT_CONTEXT_TOKENS: u32 = 200_000;
 
 #[derive(Debug)]
 pub(crate) struct Config {

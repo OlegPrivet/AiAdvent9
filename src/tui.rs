@@ -3,11 +3,13 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -17,10 +19,12 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::api::{ApiAnswer, ApiError, NeuralDeepClient};
+use crate::agent::{Agent, AgentAnswer, AgentError, AgentEvent, AgentRequest};
+use crate::agents_ui::{AgentManager, AgentPage};
 use crate::chat::{Chat, ChatStore, ChatSummary, MessageRole};
 use crate::cli::EditMode;
 use crate::input::CommandHistory;
@@ -48,6 +52,7 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     CommandOption::run("/clear", "начать новый чат без контекста", &["/очистить"]),
     CommandOption::run("/help", "показать справку", &["/помощь"]),
     CommandOption::run("/exit", "сохранить чат и выйти", &["/quit", "/выход"]),
+    CommandOption::run("/agents", "глобальный каталог агентов", &["/агенты"]),
 ];
 
 #[derive(Clone, Copy)]
@@ -101,7 +106,7 @@ pub(crate) fn is_supported() -> bool {
 }
 
 pub(crate) async fn run(
-    client: &NeuralDeepClient,
+    client: &Agent,
     store: &ChatStore,
     chat: &mut Chat,
     initial_question: Option<String>,
@@ -117,18 +122,31 @@ pub(crate) async fn run(
 
     if let Some(question) = initial_question.filter(|question| !question.trim().is_empty()) {
         let question = app.begin_question(question)?;
-        request_task = Some(spawn_request(client, app.chat, question, worker_tx.clone()));
+        request_task = Some(spawn_request(
+            client,
+            store,
+            app.chat,
+            question,
+            app.request_id,
+            worker_tx.clone(),
+        ));
     }
 
     let mut needs_draw = true;
     let exit_message = loop {
+        if let Some(Modal::Agents(agents)) = &mut app.modal
+            && agents.poll_generation()
+        {
+            needs_draw = true;
+        }
         if needs_draw || app.request_started_at.is_some() {
             session.terminal.draw(|frame| app.render(frame))?;
             needs_draw = false;
         }
 
         while let Ok(worker_event) = worker_rx.try_recv() {
-            if matches!(worker_event, WorkerEvent::Finished(_)) {
+            if matches!(&worker_event, WorkerEvent::Finished(id, _) if *id == app.request_id && app.pending_question.is_some())
+            {
                 request_task.take();
             }
             app.handle_worker_event(worker_event);
@@ -165,14 +183,25 @@ pub(crate) async fn run(
                 _ => Action::None,
             };
             match action {
+                Action::GenerateSystemPrompt => {
+                    if let Some(Modal::Agents(agents)) = &mut app.modal {
+                        agents.generate_system_prompt(client, app.chat.settings().model());
+                    }
+                }
                 Action::None => {}
                 Action::Submit(question) => {
-                    request_task =
-                        Some(spawn_request(client, app.chat, question, worker_tx.clone()));
+                    request_task = Some(spawn_request(
+                        client,
+                        store,
+                        app.chat,
+                        question,
+                        app.request_id,
+                        worker_tx.clone(),
+                    ));
                 }
                 Action::CancelRequest => {
                     if let Some(task) = request_task.take() {
-                        task.abort();
+                        task.0.abort();
                         app.cancel_request();
                     }
                 }
@@ -191,26 +220,42 @@ pub(crate) async fn run(
 }
 
 fn spawn_request(
-    client: &NeuralDeepClient,
+    client: &Agent,
+    store: &ChatStore,
     chat: &Chat,
     question: String,
+    request_id: Uuid,
     worker_tx: UnboundedSender<WorkerEvent>,
-) -> JoinHandle<()> {
+) -> RequestTask {
     let client = client.clone();
-    let history = chat.messages().to_vec();
-    let chat_id = chat.id();
-    let settings = chat.settings().clone();
-    tokio::spawn(async move {
+    let request = store
+        .agents()
+        .list()
+        .map(|agents| AgentRequest::new(chat, question, agents));
+    RequestTask(tokio::spawn(async move {
         let delta_tx = worker_tx.clone();
-        let result = client
-            .ask_streaming(&history, chat_id, &question, &settings, move |delta| {
-                delta_tx
-                    .send(WorkerEvent::Delta(delta.to_owned()))
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI закрыт"))
-            })
-            .await;
-        let _ = worker_tx.send(WorkerEvent::Finished(result));
-    })
+        let result = match request {
+            Err(error) => Err(AgentError::from(error)),
+            Ok(request) => {
+                client
+                    .respond_streaming(request, move |event| {
+                        delta_tx
+                            .send(WorkerEvent::Agent(request_id, event))
+                            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI закрыт"))
+                    })
+                    .await
+            }
+        };
+        let _ = worker_tx.send(WorkerEvent::Finished(request_id, result));
+    }))
+}
+
+struct RequestTask(JoinHandle<()>);
+
+impl Drop for RequestTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn spawn_price_refresh(worker_tx: UnboundedSender<WorkerEvent>) {
@@ -223,12 +268,13 @@ fn spawn_price_refresh(worker_tx: UnboundedSender<WorkerEvent>) {
 }
 
 enum WorkerEvent {
-    Delta(String),
-    Finished(Result<ApiAnswer, ApiError>),
+    Agent(Uuid, AgentEvent),
+    Finished(Uuid, Result<AgentAnswer, AgentError>),
     Prices(Result<PriceCatalog, String>),
 }
 
 enum Action {
+    GenerateSystemPrompt,
     None,
     Submit(String),
     CancelRequest,
@@ -242,6 +288,9 @@ enum VimMode {
 }
 
 struct App<'a> {
+    request_id: Uuid,
+    agent_events: Vec<AgentEvent>,
+    trace_question: Option<String>,
     store: &'a ChatStore,
     chat: &'a mut Chat,
     input: TextArea<'static>,
@@ -278,6 +327,9 @@ impl<'a> App<'a> {
         command_history: CommandHistory,
     ) -> Self {
         Self {
+            request_id: Uuid::nil(),
+            agent_events: Vec::new(),
+            trace_question: None,
             store,
             chat,
             input: new_textarea(
@@ -468,7 +520,19 @@ impl<'a> App<'a> {
 
     fn transcript_markdown(&self) -> String {
         let mut markdown = String::new();
-        for message in self.chat.messages().iter().skip(self.visible_from) {
+        for (index, message) in self
+            .chat
+            .messages()
+            .iter()
+            .enumerate()
+            .skip(self.visible_from)
+        {
+            if self.pending_question.is_none()
+                && self.trace_question.is_none()
+                && index + 1 == self.chat.messages().len()
+            {
+                markdown.push_str(&self.agent_trace_markdown());
+            }
             match message.role {
                 MessageRole::User => markdown.push_str("**Вы**\n\n"),
                 MessageRole::Assistant => markdown.push_str("**AI**\n\n"),
@@ -476,10 +540,21 @@ impl<'a> App<'a> {
             markdown.push_str(&sanitize_terminal_text(&message.content));
             markdown.push_str("\n\n---\n\n");
         }
+        if self.pending_question.is_none()
+            && let Some(question) = &self.trace_question
+        {
+            markdown.push_str(&format!(
+                "**Вы**\n\n{}\n\n{}",
+                sanitize_terminal_text(question),
+                self.agent_trace_markdown()
+            ));
+        }
         if let Some(question) = &self.pending_question {
             markdown.push_str("**Вы**\n\n");
             markdown.push_str(&sanitize_terminal_text(question));
-            markdown.push_str("\n\n---\n\n**AI**\n\n");
+            markdown.push_str("\n\n---\n\n");
+            markdown.push_str(&self.agent_trace_markdown());
+            markdown.push_str("**Главный агент**\n\n");
             if self.streamed_answer.is_empty() {
                 markdown.push_str("_Думаю…_");
             } else {
@@ -487,13 +562,85 @@ impl<'a> App<'a> {
             }
         }
         if markdown.is_empty() {
+            markdown.push_str(&self.agent_trace_markdown());
             markdown.push_str("_Новый чат. Он сохранится после первого ответа AI._");
         }
         markdown
     }
 
+    fn agent_trace_markdown(&self) -> String {
+        if self.agent_events.is_empty() {
+            return String::new();
+        }
+        let state = if self.pending_question.is_some() {
+            "выполняется…"
+        } else if self.transient_metrics.is_some() {
+            "запрос прерван"
+        } else {
+            "завершён"
+        };
+        let mut trace = format!("**Главный агент: {state}**\n\n");
+        for event in &self.agent_events {
+            match event {
+                AgentEvent::ChildStarted {
+                    id,
+                    name,
+                    handle,
+                    model,
+                    task,
+                } => {
+                    trace.push_str(&format!(
+                        "**{} (@{}) · {}**\n\nЗадача: {}\n\n",
+                        sanitize_terminal_text(name),
+                        handle,
+                        sanitize_terminal_text(model),
+                        sanitize_terminal_text(task)
+                    ));
+                    let result = self.agent_events.iter().rev().find(|event|matches!(event, AgentEvent::ChildCompleted{id:other,..} | AgentEvent::ChildFailed{id:other,..} if other==id));
+                    match result {
+                        Some(AgentEvent::ChildCompleted {
+                            content, truncated, ..
+                        }) => trace.push_str(&format!(
+                            "Статус: завершён{}\n\n{}\n\n",
+                            if *truncated {
+                                " (ответ обрезан)"
+                            } else {
+                                ""
+                            },
+                            sanitize_terminal_text(content)
+                        )),
+                        Some(AgentEvent::ChildFailed { error, .. }) => trace.push_str(&format!(
+                            "Статус: ошибка — {}\n\n",
+                            sanitize_terminal_text(error)
+                        )),
+                        _ => trace.push_str(if self.pending_question.is_some() {
+                            "Статус: выполняется…\n\n"
+                        } else {
+                            "Статус: прерван\n\n"
+                        }),
+                    }
+                }
+                AgentEvent::ChildFailed { id, .. }
+                    if !self.agent_events.iter().any(
+                        |event| matches!(event,AgentEvent::ChildStarted{id:other,..} if other==id),
+                    ) =>
+                {
+                    trace.push_str(&format!("{}\n\n", sanitize_terminal_text(&event.display())))
+                }
+                _ => {}
+            }
+        }
+        trace.push_str("---\n\n");
+        trace
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Action {
         if self.modal.is_some() {
+            if key.code == KeyCode::F(2)
+                && matches!(&self.modal, Some(Modal::Agents(agents)) if agents.manager.is_system_prompt())
+            {
+                return Action::GenerateSystemPrompt;
+            }
             self.handle_modal_key(key);
             return Action::None;
         }
@@ -667,6 +814,11 @@ impl<'a> App<'a> {
             self.input.insert_str(text);
         } else if let Some(Modal::Text { input, .. }) = &mut self.modal {
             input.insert_str(text);
+        } else if let Some(Modal::Agents(agents)) = &mut self.modal
+            && matches!(agents.manager.page(), AgentPage::Text { .. })
+            && agents.generation.is_none()
+        {
+            agents.input.insert_str(text);
         }
     }
 
@@ -754,6 +906,9 @@ impl<'a> App<'a> {
 
     fn begin_question(&mut self, value: String) -> io::Result<String> {
         self.command_history.record(&value)?;
+        self.request_id = Uuid::new_v4();
+        self.agent_events.clear();
+        self.trace_question = Some(value.clone());
         self.set_input("");
         self.pending_model = Some(self.chat.settings().model().to_owned());
         self.pending_question = Some(value.clone());
@@ -766,6 +921,10 @@ impl<'a> App<'a> {
     }
 
     fn handle_command(&mut self, command: ParsedCommand<'_>) {
+        if self.pending_question.is_some() {
+            self.notice = Some("Дождитесь завершения запроса или отмените его через Ctrl+C".into());
+            return;
+        }
         if command.matches(&["/exit", "/quit", "/выход"]) {
             self.exit_requested = true;
         } else if command.matches(&["/clear", "/очистить"]) {
@@ -776,6 +935,13 @@ impl<'a> App<'a> {
             self.open_settings();
         } else if command.matches(&["/chat", "/chats", "/чаты"]) {
             self.open_chats();
+        } else if command.matches(&["/agents", "/агенты"]) {
+            match AgentManager::new(&self.store.agents()) {
+                Ok(manager) => {
+                    self.modal = Some(Modal::Agents(Box::new(AgentsModal::new(manager))))
+                }
+                Err(error) => self.notice = Some(error.to_string()),
+            }
         } else if command.matches(&["/restore", "/восстановить"]) {
             match command
                 .argument
@@ -793,12 +959,23 @@ impl<'a> App<'a> {
     }
 
     fn handle_worker_event(&mut self, event: WorkerEvent) {
+        if matches!(&event, WorkerEvent::Agent(id, _) | WorkerEvent::Finished(id, _) if *id != self.request_id || self.pending_question.is_none())
+        {
+            return;
+        }
         match event {
-            WorkerEvent::Delta(delta) => {
-                self.streamed_answer.push_str(&delta);
+            WorkerEvent::Agent(_, event) => {
+                match event {
+                    AgentEvent::MainDelta(delta) => self.streamed_answer.push_str(&delta),
+                    AgentEvent::MainStarted => {
+                        self.streamed_answer.clear();
+                        self.agent_events.push(AgentEvent::MainStarted);
+                    }
+                    event => self.agent_events.push(event),
+                }
                 self.follow_tail = true;
             }
-            WorkerEvent::Finished(result) => {
+            WorkerEvent::Finished(_, result) => {
                 let question = self.pending_question.take().unwrap_or_default();
                 let model = self
                     .pending_model
@@ -811,11 +988,12 @@ impl<'a> App<'a> {
                     .unwrap_or_default();
                 match result {
                     Ok(answer) => {
+                        self.trace_question = None;
                         let truncated = answer.truncated;
-                        let metrics = ResponseMetrics::new(
-                            model,
+                        let metrics = ResponseMetrics::from_calls(
+                            &model,
                             answer.elapsed_ms,
-                            answer.usage,
+                            answer.calls,
                             &self.prices,
                         );
                         self.chat.record_exchange_with_metrics(
@@ -950,6 +1128,11 @@ impl<'a> App<'a> {
             return;
         };
         match &mut modal {
+            Modal::Agents(agents) => {
+                if agents.handle_key(key, &self.store.agents()) {
+                    return;
+                }
+            }
             Modal::Help => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     return;
@@ -983,8 +1166,7 @@ impl<'a> App<'a> {
                     return;
                 }
                 let multiline = kind.is_multiline();
-                let submit = key.code == KeyCode::Enter
-                    && (!multiline || key.modifiers.contains(KeyModifiers::CONTROL));
+                let submit = submits_text_field(key, multiline);
                 if submit {
                     let value = input.lines().join("\n");
                     let kind = *kind;
@@ -1055,6 +1237,11 @@ impl<'a> App<'a> {
                         kind: ListKind::SystemPrompt,
                     });
                 }
+                6 => self.open_text_modal(
+                    "Контекст в токенах · Enter: сохранить",
+                    TextKind::ContextTokens,
+                    self.chat.settings().context_tokens().to_string(),
+                ),
                 _ => self.open_settings(),
             },
             ListKind::Models => {
@@ -1124,6 +1311,7 @@ impl<'a> App<'a> {
 
     fn apply_text_setting(&mut self, kind: TextKind, value: String) -> Result<(), String> {
         match kind {
+            TextKind::ContextTokens => self.chat.settings_mut().set_context_tokens(value.trim()),
             TextKind::MaxTokens => self
                 .chat
                 .settings_mut()
@@ -1159,6 +1347,8 @@ impl<'a> App<'a> {
         }
 
         *self.chat = Chat::new();
+        self.agent_events.clear();
+        self.trace_question = None;
         self.visible_from = 0;
         self.history_scroll = 0;
         self.max_history_scroll = 0;
@@ -1183,6 +1373,8 @@ impl<'a> App<'a> {
         match self.store.load(id) {
             Ok(restored) => {
                 *self.chat = restored;
+                self.agent_events.clear();
+                self.trace_question = None;
                 self.visible_from = 0;
                 self.transient_metrics = None;
                 self.follow_tail = true;
@@ -1221,6 +1413,7 @@ enum ListKind {
 
 #[derive(Clone, Copy)]
 enum TextKind {
+    ContextTokens,
     MaxTokens,
     Temperature,
     StopSequence,
@@ -1234,7 +1427,233 @@ impl TextKind {
     }
 }
 
+struct AgentsModal {
+    manager: AgentManager,
+    input: TextArea<'static>,
+    selected: usize,
+    generation: Option<RequestTask>,
+    generated: Option<oneshot::Receiver<Result<String, AgentError>>>,
+}
+
+impl AgentsModal {
+    fn new(manager: AgentManager) -> Self {
+        let mut modal = Self {
+            manager,
+            input: new_textarea(vec![], "Агенты"),
+            selected: 0,
+            generation: None,
+            generated: None,
+        };
+        modal.refresh();
+        modal
+    }
+
+    fn refresh(&mut self) {
+        self.selected = 0;
+        if let AgentPage::Text { value, title, .. } = self.manager.page() {
+            self.input = new_textarea(
+                sanitize_terminal_text(&value)
+                    .split('\n')
+                    .map(str::to_owned)
+                    .collect(),
+                &title,
+            );
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, store: &crate::agent_catalog::AgentStore<'_>) -> bool {
+        if self.generation.is_some() {
+            if key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.generation = None;
+                self.generated = None;
+                self.manager.notice = Some("Генерация отменена. Введённый текст сохранён".into());
+            }
+            return false;
+        }
+        let result = if key.code == KeyCode::Esc {
+            Some(self.manager.cancel(store))
+        } else {
+            match self.manager.page() {
+                AgentPage::List { items, .. } => match key.code {
+                    KeyCode::Up => {
+                        self.selected = self.selected.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::Down => {
+                        self.selected = (self.selected + 1).min(items.len().saturating_sub(1));
+                        None
+                    }
+                    KeyCode::Enter => Some(self.manager.select(self.selected, store)),
+                    _ => None,
+                },
+                AgentPage::Read { .. } => match key.code {
+                    KeyCode::Up | KeyCode::PageUp => {
+                        self.selected = self.selected.saturating_sub(5);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::PageDown => {
+                        self.selected = self.selected.saturating_add(5).min(u16::MAX as usize);
+                        None
+                    }
+                    KeyCode::Enter => Some(self.manager.select(0, store)),
+                    _ => None,
+                },
+                AgentPage::Text { multiline, .. } => {
+                    if submits_text_field(key, multiline) {
+                        Some(
+                            self.manager
+                                .submit(self.input.lines().join("\n"), store)
+                                .map(|()| false),
+                        )
+                    } else {
+                        self.input.input(key);
+                        None
+                    }
+                }
+            }
+        };
+        match result {
+            Some(Ok(true)) => true,
+            Some(Ok(false)) => {
+                self.refresh();
+                false
+            }
+            Some(Err(error)) => {
+                self.manager.notice = Some(error.to_string());
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn generate_system_prompt(&mut self, agent: &Agent, model: &str) {
+        if self.generation.is_some() || !self.manager.is_system_prompt() {
+            return;
+        }
+        let request = self
+            .manager
+            .system_prompt_request(self.input.lines().join("\n"), model);
+        let agent = agent.clone();
+        let (tx, rx) = oneshot::channel();
+        self.generation = Some(RequestTask(tokio::spawn(async move {
+            let _ = tx.send(agent.generate_system_prompt(request).await);
+        })));
+        self.generated = Some(rx);
+        self.manager.notice =
+            Some("Запрашиваю system prompt у LLM… Esc или Ctrl+C: отменить".into());
+    }
+
+    fn poll_generation(&mut self) -> bool {
+        let Some(receiver) = &mut self.generated else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(oneshot::error::TryRecvError::Empty) => return false,
+            Err(oneshot::error::TryRecvError::Closed) => Err(AgentError::InvalidRequest(
+                "Запрос system prompt прерван".into(),
+            )),
+        };
+        self.generation = None;
+        self.generated = None;
+        match result {
+            Ok(prompt) => {
+                self.manager.preview_system_prompt(prompt);
+                self.refresh();
+            }
+            Err(error) => self.manager.notice = Some(format!("System prompt не изменён: {error}")),
+        }
+        true
+    }
+
+    fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let notice = self
+            .manager
+            .notice
+            .as_deref()
+            .map(sanitize_terminal_text)
+            .unwrap_or_default();
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(if notice.is_empty() { 0 } else { 3 }),
+                Constraint::Min(1),
+            ])
+            .split(area);
+        if !notice.is_empty() {
+            frame.render_widget(
+                Paragraph::new(notice)
+                    .style(Style::default().fg(Color::Yellow))
+                    .wrap(Wrap { trim: false }),
+                layout[0],
+            );
+        }
+        let area = layout[1];
+        match self.manager.page() {
+            AgentPage::List { title, items } => {
+                let list = List::new(
+                    items
+                        .into_iter()
+                        .map(|item| ListItem::new(sanitize_terminal_text(&item)))
+                        .collect::<Vec<_>>(),
+                )
+                .block(Block::default().borders(Borders::ALL).title(format!(
+                    " {} · Enter: выбрать · Esc: назад ",
+                    sanitize_terminal_text(&title)
+                )))
+                .highlight_symbol("› ")
+                .highlight_style(Style::default().fg(Color::Cyan));
+                let mut state = ListState::default().with_selected(Some(self.selected));
+                frame.render_stateful_widget(list, area, &mut state);
+            }
+            AgentPage::Text {
+                title, multiline, ..
+            } => {
+                self.input.set_block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(
+                            " {title} · {}: далее · Esc: отмена ",
+                            if multiline { "Ctrl+Enter/F4" } else { "Enter" }
+                        ))
+                        .title_bottom(if self.manager.is_system_prompt() {
+                            " F2: создать system prompt через LLM "
+                        } else {
+                            ""
+                        }),
+                );
+                frame.render_widget(&self.input, area);
+            }
+            AgentPage::Read { title, content } => {
+                let text = Text::from(sanitize_terminal_text(&content));
+                let max_scroll = wrapped_text_height(&text, area.width.saturating_sub(2))
+                    .saturating_sub(area.height.saturating_sub(2) as usize);
+                self.selected = self.selected.min(max_scroll).min(u16::MAX as usize);
+                frame.render_widget(
+                    Paragraph::new(text)
+                        .wrap(Wrap { trim: false })
+                        .scroll((self.selected as u16, 0))
+                        .block(Block::default().borders(Borders::ALL).title(format!(
+                            " {} · Enter: действия · ↑/↓: прокрутка · Esc: назад ",
+                            sanitize_terminal_text(&title)
+                        ))),
+                    area,
+                );
+            }
+        }
+    }
+}
+
+fn submits_text_field(key: KeyEvent, multiline: bool) -> bool {
+    key.code == KeyCode::F(4)
+        || (key.code == KeyCode::Enter
+            && (!multiline || key.modifiers.contains(KeyModifiers::CONTROL)))
+}
+
 enum Modal {
+    Agents(Box<AgentsModal>),
     Help,
     List {
         title: String,
@@ -1253,11 +1672,13 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
     let area = centered_rect(80, 75, frame.area());
     frame.render_widget(Clear, area);
     match modal {
+        Modal::Agents(agents) => agents.render(frame, area),
         Modal::Help => {
             let help = [
                 "/chat, /чаты             выбрать сохранённый чат",
                 "/restore <UUID>          восстановить чат",
                 "/settings, /настройки   настройки текущего чата",
+                "/agents, /агенты       глобальный каталог агентов · вызов @handle",
                 "/clear, /очистить        начать новый чат без старого контекста",
                 "/exit, /выход            завершить работу",
                 "",
@@ -1367,6 +1788,7 @@ fn one_line(value: &str) -> String {
 
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    enhanced_keyboard: bool,
 }
 
 impl TerminalSession {
@@ -1377,10 +1799,32 @@ impl TerminalSession {
             let _ = disable_raw_mode();
             return Err(error);
         }
+        let enhanced_keyboard = supports_keyboard_enhancement().unwrap_or(false);
+        if enhanced_keyboard
+            && let Err(error) = execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+        {
+            let _ = execute!(
+                stdout,
+                PopKeyboardEnhancementFlags,
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            );
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
         match Terminal::new(CrosstermBackend::new(stdout)) {
-            Ok(terminal) => Ok(Self { terminal }),
+            Ok(terminal) => Ok(Self {
+                terminal,
+                enhanced_keyboard,
+            }),
             Err(error) => {
                 let mut stdout = io::stdout();
+                if enhanced_keyboard {
+                    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+                }
                 let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
                 let _ = disable_raw_mode();
                 Err(error)
@@ -1391,6 +1835,9 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        if self.enhanced_keyboard {
+            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        }
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
@@ -1430,6 +1877,298 @@ mod tests {
     fn calculates_wrapped_transcript_height() {
         let text = Text::from(vec![Line::from("1234567890"), Line::from("")]);
         assert_eq!(wrapped_text_height(&text, 5), 3);
+    }
+
+    fn description_modal(store: &ChatStore) -> AgentsModal {
+        let mut manager = AgentManager::new(&store.agents()).expect("manager");
+        manager.select(0, &store.agents()).expect("create");
+        manager
+            .submit("Редактор".into(), &store.agents())
+            .expect("name");
+        manager
+            .submit("editor".into(), &store.agents())
+            .expect("handle");
+        AgentsModal::new(manager)
+    }
+
+    fn system_prompt_modal(store: &ChatStore) -> AgentsModal {
+        let mut modal = description_modal(store);
+        modal.input.insert_str("Описание вручную");
+        modal.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &store.agents(),
+        );
+        modal
+    }
+
+    #[test]
+    fn description_cannot_generate_with_api() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut modal = description_modal(&store);
+        let agent = Agent::new(
+            crate::api::NeuralDeepClient::new("test-key".into(), "http://127.0.0.1:1".into())
+                .expect("client"),
+        );
+        modal.input.insert_str("Описание вручную");
+        modal.generate_system_prompt(&agent, "qwen3.8-27b");
+        assert!(modal.generation.is_none());
+        assert_eq!(modal.input.lines().join("\n"), "Описание вручную");
+    }
+
+    #[test]
+    fn description_accepts_plain_enter_control_enter_and_f4() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE),
+        ] {
+            let mut modal = description_modal(&store);
+            assert!(matches!(
+                modal.manager.page(),
+                AgentPage::Text {
+                    multiline: false,
+                    ..
+                }
+            ));
+            modal.input.insert_str("Проверяет текст");
+            assert!(!modal.handle_key(key, &store.agents()));
+            assert!(
+                matches!(modal.manager.page(),AgentPage::Text {title,multiline:true,..} if title=="System prompt")
+            );
+            assert!(store.agents().list().expect("agents").is_empty());
+        }
+    }
+
+    #[test]
+    fn multiline_fields_keep_enter_for_newline_and_accept_portable_f4() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut modal = description_modal(&store);
+        modal.input.insert_str("Описание");
+        modal.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &store.agents(),
+        );
+        modal.input.insert_str("Инструкция");
+        modal.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &store.agents(),
+        );
+        assert_eq!(modal.input.lines().len(), 2);
+        assert!(matches!(
+            modal.manager.page(),
+            AgentPage::Text {
+                multiline: true,
+                ..
+            }
+        ));
+        modal.handle_key(
+            KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE),
+            &store.agents(),
+        );
+        assert!(
+            matches!(modal.manager.page(),AgentPage::List {title,..} if title=="Модель агента")
+        );
+    }
+
+    #[tokio::test]
+    async fn system_prompt_generation_is_reviewable_and_preserves_text_on_error() {
+        for status in [200, 503] {
+            let server = crate::test_http::MockServer::new(move |_| {
+                let body = if status == 200 {
+                    serde_json::json!({"choices":[{"message":{"content":"Редактирует тексты и исправляет ошибки."},"finish_reason":"stop"}]})
+                } else {
+                    serde_json::json!({"detail":"Недоступно"})
+                };
+                (status, body.to_string())
+            });
+            let agent = Agent::new(
+                crate::api::NeuralDeepClient::new("test-key".into(), server.url.clone())
+                    .expect("client"),
+            );
+            let directory = TestDirectory::new();
+            let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+            let mut modal = system_prompt_modal(&store);
+            modal.input.insert_str("Создай инструкции редактора");
+            modal.generate_system_prompt(&agent, "qwen3.8-27b");
+            modal.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &store.agents(),
+            );
+            assert!(modal.manager.is_system_prompt());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !modal.poll_generation() {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("generation complete");
+            assert!(modal.manager.is_system_prompt());
+            assert!(store.agents().list().expect("agents").is_empty());
+            if status == 200 {
+                assert_eq!(
+                    modal.input.lines().join("\n"),
+                    "Редактирует тексты и исправляет ошибки."
+                );
+                modal.handle_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                    &store.agents(),
+                );
+                assert!(!modal.manager.is_system_prompt());
+            } else {
+                assert_eq!(
+                    modal.input.lines().join("\n"),
+                    "Создай инструкции редактора"
+                );
+                assert!(
+                    modal
+                        .manager
+                        .notice
+                        .as_deref()
+                        .is_some_and(|text| text.contains("не изменён"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_system_prompt_discards_late_result_and_keeps_editor() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut modal = system_prompt_modal(&store);
+        modal.input.insert_str("Мой запрос");
+        let (tx, rx) = oneshot::channel();
+        modal.generated = Some(rx);
+        modal.generation = Some(RequestTask(tokio::spawn(std::future::pending())));
+        assert!(!modal.handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &store.agents()
+        ));
+        assert!(modal.generation.is_none());
+        assert!(tx.send(Ok("Поздний ответ".into())).is_err());
+        assert!(!modal.poll_generation());
+        assert_eq!(modal.input.lines().join("\n"), "Мой запрос");
+        assert!(modal.manager.is_system_prompt());
+    }
+
+    #[test]
+    fn agents_menu_renders_global_catalog_and_is_blocked_during_request() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut definition = crate::agent_catalog::AgentDefinition::draft();
+        definition.name = "Редактор".into();
+        definition.handle = "editor".into();
+        definition.description = "Проверка текста".into();
+        definition
+            .settings
+            .set_system_prompt("Редактируй".into())
+            .expect("prompt");
+        store.agents().save(&definition, true).expect("save");
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        app.handle_command(ParsedCommand::parse("/agents").expect("command"));
+        assert!(matches!(app.modal, Some(Modal::Agents(_))));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let screen = (0..30)
+            .map(|row| buffer_row(terminal.backend().buffer(), row))
+            .collect::<String>();
+        assert!(screen.contains("Глобальные агенты"));
+        assert!(screen.contains("@editor"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.begin_question("Вопрос".into()).expect("question");
+        app.handle_command(ParsedCommand::parse("/agents").expect("command"));
+        assert!(app.modal.is_none());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Ctrl+C"))
+        );
+    }
+
+    #[test]
+    fn child_trace_is_visible_but_not_restored_and_stale_events_are_ignored() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        app.begin_question("@editor Проверь".into())
+            .expect("question");
+        let id = app.request_id;
+        app.handle_worker_event(WorkerEvent::Agent(id, AgentEvent::MainStarted));
+        app.handle_worker_event(WorkerEvent::Agent(
+            id,
+            AgentEvent::ChildStarted {
+                id: "child1".into(),
+                name: "Редактор".into(),
+                handle: "editor".into(),
+                model: "qwen3.8-27b".into(),
+                task: "Проверка".into(),
+            },
+        ));
+        assert!(app.transcript_markdown().contains("Статус: выполняется"));
+        app.handle_worker_event(WorkerEvent::Agent(
+            id,
+            AgentEvent::ChildCompleted {
+                id: "child1".into(),
+                content: "Дочерний результат".into(),
+                truncated: false,
+            },
+        ));
+        app.handle_worker_event(WorkerEvent::Finished(
+            id,
+            Ok(AgentAnswer {
+                content: "Итог главного".into(),
+                truncated: false,
+                elapsed_ms: 100,
+                calls: vec![crate::metrics::CallUsage {
+                    model: "qwen3.8-27b".into(),
+                    usage: Some(TokenUsage::default()),
+                }],
+            }),
+        ));
+        let trace = app.transcript_markdown();
+        assert!(trace.contains("Дочерний результат"));
+        assert!(!trace.contains("выполняется"));
+        let chat_id = app.chat.id();
+        let mut restored = store.load(chat_id).expect("restore");
+        assert_eq!(restored.messages().len(), 2);
+        assert_eq!(restored.messages()[1].content, "Итог главного");
+        let restored_app = App::with_history(
+            &store,
+            &mut restored,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        assert!(
+            !restored_app
+                .transcript_markdown()
+                .contains("Дочерний результат")
+        );
+        app.begin_question("Второй".into()).expect("question");
+        let cancelled = app.request_id;
+        app.cancel_request();
+        app.begin_question("Третий".into()).expect("question");
+        app.handle_worker_event(WorkerEvent::Agent(
+            cancelled,
+            AgentEvent::MainDelta("Запоздавший ответ".into()),
+        ));
+        assert!(app.streamed_answer.is_empty());
+        assert_eq!(app.pending_question.as_deref(), Some("Третий"));
+        assert!(!app.transcript_markdown().contains("Дочерний результат"));
     }
 
     #[test]
@@ -1534,6 +2273,7 @@ mod tests {
             }),
             estimated_cost_microrubles: Some(42_137),
             premium: Some(false),
+            calls: Vec::new(),
         };
         chat.record_exchange_with_metrics(
             "Вопрос".to_owned(),

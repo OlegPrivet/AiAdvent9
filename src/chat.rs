@@ -16,7 +16,7 @@ use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 2;
+const DATABASE_SCHEMA_VERSION: i64 = 3;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -258,6 +258,10 @@ pub(crate) enum ChatStoreError {
 }
 
 impl ChatStore {
+    pub(crate) fn agents(&self) -> crate::agent_catalog::AgentStore<'_> {
+        crate::agent_catalog::AgentStore::new(&self.connection)
+    }
+
     pub(crate) fn open() -> Result<Self, ChatStoreError> {
         let directory = state_directory().ok_or(ChatStoreError::MissingStateDirectory)?;
         Self::with_directory(directory)
@@ -645,9 +649,28 @@ fn initialize_database(
                  COMMIT;",
             )
             .map_err(|source| database_error("обновить схему", database_path, source)),
-        value if value == DATABASE_SCHEMA_VERSION => Ok(()),
+        2 | 3 => Ok(()),
         value => Err(ChatStoreError::UnsupportedSchema(value)),
+    }?;
+    if version < DATABASE_SCHEMA_VERSION {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS agents (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 handle TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                 name TEXT NOT NULL,
+                 description TEXT NOT NULL,
+                 settings_json TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             PRAGMA user_version = 3;
+             COMMIT;",
+            )
+            .map_err(|source| database_error("добавить каталог агентов", database_path, source))?;
     }
+    Ok(())
 }
 
 fn read_legacy_chat(path: &Path) -> Option<Chat> {
@@ -821,6 +844,7 @@ mod tests {
             }),
             estimated_cost_microrubles: Some(1_020),
             premium: Some(false),
+            calls: Vec::new(),
         };
         chat.record_exchange_with_metrics(
             "  Первый   вопрос  ".to_owned(),
@@ -844,6 +868,53 @@ mod tests {
         assert!(restored.is_persisted());
         assert!(!restored.is_dirty());
         assert!(directory.0.join(DATABASE_FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn migrates_version_two_and_preserves_chat_and_per_model_metrics() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut chat = Chat::new();
+        let metrics = ResponseMetrics::from_calls(
+            "qwen3.8-27b",
+            1200,
+            vec![
+                crate::metrics::CallUsage {
+                    model: "gpt-oss-20b".into(),
+                    usage: Some(TokenUsage {
+                        total_tokens: 15,
+                        ..TokenUsage::default()
+                    }),
+                },
+                crate::metrics::CallUsage {
+                    model: "qwen3.8-27b".into(),
+                    usage: Some(TokenUsage {
+                        total_tokens: 20,
+                        ..TokenUsage::default()
+                    }),
+                },
+            ],
+            &PriceCatalog::default(),
+        );
+        chat.record_exchange_with_metrics("Вопрос".into(), "Итог".into(), Some(metrics.clone()));
+        store.save(&mut chat).expect("save");
+        store
+            .connection
+            .execute_batch("DROP TABLE agents; PRAGMA user_version = 2;")
+            .expect("v2 fixture");
+        drop(store);
+        let migrated = ChatStore::for_tests(directory.0.clone()).expect("migrate");
+        assert!(migrated.agents().list().expect("catalog").is_empty());
+        let restored = migrated.load(chat.id()).expect("restore");
+        assert_eq!(restored.messages(), chat.messages());
+        assert_eq!(restored.last_response_metrics(), Some(&metrics));
+        assert_eq!(
+            migrated
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            3
+        );
     }
 
     #[test]
@@ -920,14 +991,14 @@ mod tests {
         let connection = Connection::open(directory.0.join(DATABASE_FILE_NAME))
             .expect("fixture database should open");
         connection
-            .execute_batch("PRAGMA user_version = 3;")
+            .execute_batch("PRAGMA user_version = 99;")
             .expect("fixture version should be set");
         drop(connection);
 
         let error =
             ChatStore::for_tests(directory.0.clone()).expect_err("newer schema should be rejected");
 
-        assert!(matches!(error, ChatStoreError::UnsupportedSchema(3)));
+        assert!(matches!(error, ChatStoreError::UnsupportedSchema(99)));
     }
 
     #[test]

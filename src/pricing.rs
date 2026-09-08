@@ -83,7 +83,7 @@ impl PriceCatalog {
     }
 
     #[cfg(test)]
-    fn with_price(model: &str, input: f64, output: f64, premium: bool) -> Self {
+    pub(crate) fn with_price(model: &str, input: f64, output: f64, premium: bool) -> Self {
         Self {
             prices: HashMap::from([(
                 model.to_owned(),
@@ -95,6 +95,17 @@ impl PriceCatalog {
             )]),
             fetched_at: Some(Instant::now()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_prices(prices: &[(&str, f64, f64)]) -> Self {
+        let mut catalog = Self::default();
+        for (model, input, output) in prices {
+            catalog
+                .prices
+                .extend(Self::with_price(model, *input, *output, false).prices);
+        }
+        catalog
     }
 }
 

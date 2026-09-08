@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -7,6 +8,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(test)]
 use crate::chat::ChatMessage;
 use crate::metrics::TokenUsage;
 use crate::settings::Settings;
@@ -64,13 +66,16 @@ pub(crate) struct ApiAnswer {
 
 #[derive(Debug, Error)]
 pub(crate) enum ApiError {
+    #[error(transparent)]
+    Context(#[from] crate::context::ContextError),
+    #[error("некорректный tool-call AI-сервиса: {0}")]
+    InvalidToolCall(String),
     #[error("не удалось настроить HTTP-клиент: {0}")]
     BuildClient(reqwest::Error),
     #[error("не удалось выполнить запрос к AI-сервису: {0}")]
     Request(reqwest::Error),
     #[error("AI-сервис вернул HTTP {status}: {message}")]
     Http { status: StatusCode, message: String },
-    #[cfg(test)]
     #[error("не удалось разобрать ответ AI-сервиса: {0}")]
     InvalidJson(reqwest::Error),
     #[error("не удалось разобрать фрагмент потокового ответа: {0}")]
@@ -99,6 +104,39 @@ impl NeuralDeepClient {
             api_key,
             base_url: base_url.trim_end_matches('/').to_owned(),
         })
+    }
+
+    /// A single ordinary completion for auxiliary UI requests, without tools or chat state.
+    pub(crate) async fn complete_text(
+        &self,
+        messages: &[ApiMessage],
+        model: &str,
+    ) -> Result<ApiAnswer, ApiError> {
+        let started_at = Instant::now();
+        let request = json!({
+            "model": model, "messages": messages, "max_tokens": 4096,
+            "temperature": 0.1, "stream": false,
+            "user": Uuid::new_v4().to_string(),
+            "chat_template_kwargs": {"enable_thinking": false}
+        });
+        let response = self
+            .post(&request)
+            .await?
+            .json::<ChatResponse>()
+            .await
+            .map_err(ApiError::InvalidJson)?;
+        let choice = response
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| missing_content(None))?;
+        finish_answer(
+            choice.message.content.unwrap_or_default(),
+            choice.finish_reason,
+            &Settings::default(),
+            response.usage.map(Into::into),
+            elapsed_millis(started_at.elapsed()),
+        )
     }
 
     #[cfg(test)]
@@ -133,26 +171,80 @@ impl NeuralDeepClient {
         )
     }
 
+    #[cfg(test)]
     pub(crate) async fn ask_streaming<F>(
         &self,
         history: &[ChatMessage],
         chat_id: Uuid,
         question: &str,
         settings: &Settings,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<ApiAnswer, ApiError>
     where
         F: FnMut(&str) -> io::Result<()>,
     {
-        let started_at = Instant::now();
-        let mut response = self
-            .send_request(history, chat_id, question, settings, true)
+        let mut messages = Vec::new();
+        if let Some(prompt) = settings.effective_system_prompt() {
+            messages.push(ApiMessage::text("system", prompt));
+        }
+        messages.extend(
+            history
+                .iter()
+                .map(|message| ApiMessage::text(message.role.as_api_str(), &message.content)),
+        );
+        messages.push(ApiMessage::text("user", question));
+        let turn = self
+            .complete_streaming(&messages, chat_id, settings, None, on_delta)
             .await?;
+        finish_answer(
+            turn.content,
+            turn.finish_reason,
+            settings,
+            turn.usage,
+            turn.elapsed_ms,
+        )
+    }
+
+    pub(crate) async fn complete_streaming<F>(
+        &self,
+        messages: &[ApiMessage],
+        session_id: Uuid,
+        settings: &Settings,
+        tools: Option<Value>,
+        mut on_delta: F,
+    ) -> Result<ApiTurn, ApiError>
+    where
+        F: FnMut(&str) -> io::Result<()>,
+    {
+        let started_at = Instant::now();
+        let messages = crate::context::fit_messages(
+            messages,
+            tools.as_ref(),
+            settings.context_tokens(),
+            settings.max_tokens(),
+        )?;
+        let mut request = json!({
+            "model": settings.model(), "messages": messages,
+            "max_tokens": settings.max_tokens(), "temperature": settings.temperature(),
+            "user": session_id.to_string(), "chat_template_kwargs": {"enable_thinking": false},
+            "stream": true, "stream_options": {"include_usage": true}
+        });
+        if let Some(tools) = tools {
+            request["tools"] = tools;
+            request["tool_choice"] = json!("auto");
+        } else if settings.response_format_enabled() {
+            request["response_format"] = structured_response_format();
+        }
+        if let Some(stop) = settings.stop_sequence() {
+            request["stop"] = json!(stop);
+        }
+        let mut response = self.post(&request).await?;
         let mut decoder = SseDecoder::default();
         let mut content = String::new();
         let mut finish_reason = None;
         let mut usage = None;
         let mut done = false;
+        let mut tool_calls = BTreeMap::new();
 
         'response: while let Some(chunk) = response.chunk().await.map_err(ApiError::Request)? {
             for data in decoder.push(&chunk) {
@@ -165,6 +257,7 @@ impl NeuralDeepClient {
                     &mut content,
                     &mut finish_reason,
                     &mut usage,
+                    &mut tool_calls,
                     &mut on_delta,
                 )?;
             }
@@ -181,6 +274,7 @@ impl NeuralDeepClient {
                     &mut content,
                     &mut finish_reason,
                     &mut usage,
+                    &mut tool_calls,
                     &mut on_delta,
                 )?;
             }
@@ -190,15 +284,37 @@ impl NeuralDeepClient {
             return Err(ApiError::IncompleteStream);
         }
 
-        finish_answer(
+        let tool_calls = tool_calls.into_values().collect::<Vec<_>>();
+        let mut ids = std::collections::HashSet::new();
+        for call in &tool_calls {
+            if call.id.is_empty()
+                || call.function.name.is_empty()
+                || call.kind != "function"
+                || !ids.insert(&call.id)
+            {
+                return Err(ApiError::InvalidToolCall(
+                    "отсутствует ID/имя, повторяется ID или неизвестен тип".into(),
+                ));
+            }
+        }
+        if finish_reason.as_deref() == Some("tool_calls") && tool_calls.is_empty() {
+            return Err(ApiError::InvalidToolCall("пустой список вызовов".into()));
+        }
+        if !tool_calls.is_empty() && finish_reason.as_deref() != Some("tool_calls") {
+            return Err(ApiError::InvalidToolCall(
+                "вызов не завершён (возможно, исчерпан max_tokens)".into(),
+            ));
+        }
+        Ok(ApiTurn {
             content,
             finish_reason,
-            settings,
             usage,
-            elapsed_millis(started_at.elapsed()),
-        )
+            tool_calls,
+            elapsed_ms: elapsed_millis(started_at.elapsed()),
+        })
     }
 
+    #[cfg(test)]
     async fn send_request(
         &self,
         history: &[ChatMessage],
@@ -244,6 +360,10 @@ impl NeuralDeepClient {
             }),
         };
 
+        self.post(&request).await
+    }
+
+    async fn post(&self, request: &impl Serialize) -> Result<Response, ApiError> {
         let response = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
@@ -271,6 +391,7 @@ fn consume_stream_chunk<F>(
     content: &mut String,
     finish_reason: &mut Option<String>,
     usage: &mut Option<TokenUsage>,
+    tool_calls: &mut BTreeMap<usize, ToolCall>,
     on_delta: &mut F,
 ) -> Result<(), ApiError>
 where
@@ -282,6 +403,34 @@ where
     }
 
     for choice in chunk.choices {
+        if choice.index != 0 {
+            continue;
+        }
+        for delta in choice.delta.tool_calls {
+            if delta.index > 255 {
+                return Err(ApiError::InvalidToolCall("слишком много вызовов".into()));
+            }
+            let call = tool_calls.entry(delta.index).or_default();
+            if let Some(id) = delta.id {
+                call.id.push_str(&id);
+            }
+            if let Some(kind) = delta.kind {
+                call.kind = kind;
+            }
+            if let Some(function) = delta.function {
+                if let Some(name) = function.name {
+                    call.function.name.push_str(&name);
+                }
+                if let Some(arguments) = function.arguments {
+                    call.function.arguments.push_str(&arguments);
+                }
+            }
+            if call.function.arguments.len() > 128_000 {
+                return Err(ApiError::InvalidToolCall(
+                    "аргументы превышают 128 КБ".into(),
+                ));
+            }
+        }
         if let Some(reason) = choice.finish_reason {
             *finish_reason = Some(reason);
         }
@@ -294,7 +443,7 @@ where
     Ok(())
 }
 
-fn finish_answer(
+pub(crate) fn finish_answer(
     content: String,
     finish_reason: Option<String>,
     settings: &Settings,
@@ -333,6 +482,7 @@ fn missing_content(finish_reason: Option<String>) -> ApiError {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
@@ -350,23 +500,25 @@ struct ChatRequest<'a> {
     stream_options: Option<StreamOptions>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 struct StreamOptions {
     include_usage: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 struct ChatTemplateKwargs {
     enable_thinking: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 struct RequestMessage<'a> {
     role: &'a str,
     content: &'a str,
 }
 
-#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -374,14 +526,12 @@ struct ChatResponse {
     usage: Option<UsagePayload>,
 }
 
-#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
     finish_reason: Option<String>,
 }
 
-#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
     content: Option<String>,
@@ -425,6 +575,8 @@ impl From<UsagePayload> for TokenUsage {
 
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
+    #[serde(default)]
+    index: usize,
     delta: StreamDelta,
     finish_reason: Option<String>,
 }
@@ -432,6 +584,77 @@ struct StreamChoice {
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCallDelta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ApiMessage {
+    pub(crate) role: String,
+    pub(crate) content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tool_calls: Vec<ToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_call_id: Option<String>,
+}
+
+impl ApiMessage {
+    pub(crate) fn text(role: &str, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ApiTurn {
+    pub(crate) content: String,
+    pub(crate) finish_reason: Option<String>,
+    pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) usage: Option<TokenUsage>,
+    pub(crate) elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ToolCall {
+    pub(crate) id: String,
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+    pub(crate) function: ToolFunction,
+}
+
+impl Default for ToolCall {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: "function".into(),
+            function: ToolFunction::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ToolFunction {
+    pub(crate) name: String,
+    pub(crate) arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    function: Option<ToolFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -526,6 +749,118 @@ mod tests {
 
     use super::*;
     use crate::input::BufferedInput;
+
+    #[tokio::test]
+    async fn fits_context_before_http_without_mutating_history() {
+        let server =
+            crate::test_http::MockServer::new(|_| crate::test_http::text_response("Ответ"));
+        let client = test_client(server.url.clone());
+        let messages = vec![
+            ApiMessage::text("system", "Правила"),
+            ApiMessage::text("user", "x".repeat(195_000)),
+            ApiMessage::text("assistant", "Старый ответ"),
+            ApiMessage::text("user", "Новый вопрос"),
+        ];
+        client
+            .complete_streaming(&messages, Uuid::nil(), &Settings::default(), None, |_| {
+                Ok(())
+            })
+            .await
+            .expect("answer");
+        let requests = server.requests();
+        assert_eq!(
+            requests[0]["messages"].as_array().expect("messages").len(),
+            2
+        );
+        assert_eq!(requests[0]["messages"][1]["content"], "Новый вопрос");
+        assert!(requests[0].get("context_tokens").is_none());
+        assert_eq!(messages.len(), 4);
+        let error = client
+            .complete_streaming(
+                &[ApiMessage::text("user", "x".repeat(200_000))],
+                Uuid::nil(),
+                &Settings::default(),
+                None,
+                |_| Ok(()),
+            )
+            .await
+            .expect_err("overflow");
+        assert!(matches!(error, ApiError::Context(_)));
+        assert_eq!(server.requests().len(), 1, "overflow must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn assembles_interleaved_fragmented_tool_calls_and_preserves_usage() {
+        let server = crate::test_http::MockServer::new(|_| {
+            let chunks = [
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":1,"id":"call_b","type":"function","function":{"name":"delegate_","arguments":"{\"handle\":"}},
+                    {"index":0,"id":"call_a","type":"function","function":{"name":"delegate_task","arguments":"{\"handle\":\"aa\","}}
+                ]}}]}),
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"function":{"arguments":"\"task\":\"Проверь\"}"}},
+                    {"index":1,"function":{"name":"task","arguments":"\"bb\",\"task\":\"Сравни\"}"}}
+                ]},"finish_reason":"tool_calls"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":30,"completion_tokens":10,"total_tokens":40}}),
+            ];
+            (
+                200,
+                chunks
+                    .iter()
+                    .map(|chunk| format!("data: {chunk}\n\n"))
+                    .collect::<String>()
+                    + "data: [DONE]\n\n",
+            )
+        });
+        let turn = test_client(server.url.clone())
+            .complete_streaming(
+                &[ApiMessage::text("user", "Вопрос")],
+                Uuid::nil(),
+                &Settings::default(),
+                Some(json!([])),
+                |_| Ok(()),
+            )
+            .await
+            .expect("turn");
+        assert_eq!(turn.tool_calls.len(), 2);
+        assert_eq!(turn.tool_calls[0].id, "call_a");
+        assert_eq!(turn.tool_calls[1].id, "call_b");
+        for call in &turn.tool_calls {
+            assert_eq!(call.function.name, "delegate_task");
+            assert!(serde_json::from_str::<Value>(&call.function.arguments).is_ok());
+        }
+        assert_eq!(turn.usage.expect("usage").total_tokens, 40);
+    }
+
+    #[tokio::test]
+    async fn rejects_tool_calls_with_missing_duplicate_ids_or_truncated_arguments() {
+        for case in 0..3 {
+            let server = crate::test_http::MockServer::new(move |_| {
+                let mut calls = vec![crate::test_http::delegate(0, "call_a", "aa")];
+                if case == 0 {
+                    calls[0]["id"] = json!("");
+                }
+                if case == 1 {
+                    calls.push(crate::test_http::delegate(1, "call_a", "aa"));
+                }
+                let (_, mut body) = crate::test_http::tool_response(calls);
+                if case == 2 {
+                    body = body.replace(
+                        "\"finish_reason\":\"tool_calls\"",
+                        "\"finish_reason\":\"length\"",
+                    );
+                }
+                (200, body)
+            });
+            let result = test_client(server.url.clone())
+                .complete_streaming(&[], Uuid::nil(), &Settings::default(), None, |_| Ok(()))
+                .await;
+            assert!(
+                matches!(result, Err(ApiError::InvalidToolCall(_))),
+                "case {case}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn sends_chat_request_and_returns_content() {

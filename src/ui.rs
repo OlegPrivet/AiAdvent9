@@ -109,6 +109,29 @@ pub(crate) struct LiveAnswer<'a, W: Write> {
 }
 
 impl<W: Write> LiveAnswer<'_, W> {
+    pub(crate) fn agent_event(&mut self, event: crate::agent::AgentEvent) -> io::Result<()> {
+        if let crate::agent::AgentEvent::MainDelta(delta) = event {
+            return self.push(&delta);
+        }
+        self.status.clear();
+        self.render_pending_markdown()?;
+        if self.wrote_plain || self.wrote_rendered {
+            writeln!(self.output)?;
+        }
+        self.source.clear();
+        self.wrote_plain = false;
+        self.wrote_rendered = false;
+        let text = sanitize_terminal_text(&event.display());
+        if self.renderer.is_some() {
+            self.write_markdown(&text)?;
+            self.wrote_rendered = false;
+        } else {
+            writeln!(self.output, "{text}")?;
+        }
+        writeln!(self.output)?;
+        self.output.flush()
+    }
+
     pub(crate) fn push(&mut self, delta: &str) -> io::Result<()> {
         let delta = sanitize_terminal_text(delta);
         if delta.is_empty() {

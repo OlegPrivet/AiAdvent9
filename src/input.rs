@@ -2,12 +2,9 @@ use std::borrow::Cow;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io;
 use std::io::Write as _;
+use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
-
-#[cfg(test)]
-use std::io::BufRead;
 
 use dialoguer::Select;
 use reedline::{
@@ -29,11 +26,14 @@ pub(crate) trait LineInput {
 }
 
 pub(crate) struct TerminalInput {
-    editor: Reedline,
+    editor: Option<Reedline>,
 }
 
 impl TerminalInput {
     pub(crate) fn new(mode: EditMode) -> io::Result<Self> {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Ok(Self { editor: None });
+        }
         let history = match history_path() {
             Some(path) => FileBackedHistory::with_file(HISTORY_CAPACITY, path),
             None => FileBackedHistory::new(HISTORY_CAPACITY),
@@ -50,7 +50,9 @@ impl TerminalInput {
             .with_highlighter(Box::new(MultilineInputHighlighter))
             .use_bracketed_paste(true);
 
-        Ok(Self { editor })
+        Ok(Self {
+            editor: Some(editor),
+        })
     }
 }
 
@@ -74,9 +76,15 @@ impl Highlighter for MultilineInputHighlighter {
 
 impl LineInput for TerminalInput {
     fn read_line(&mut self, prompt: &str) -> io::Result<Option<String>> {
+        let Some(editor) = self.editor.as_mut() else {
+            let mut output = io::stdout().lock();
+            write!(output, "{prompt} ")?;
+            output.flush()?;
+            return read_buffered_line(&mut io::stdin().lock());
+        };
         let prompt = InputPrompt::new(prompt);
 
-        match self.editor.read_line(&prompt)? {
+        match editor.read_line(&prompt)? {
             Signal::Success(line) => Ok(Some(normalize_submitted_line(line))),
             Signal::CtrlC => Ok(Some(String::new())),
             Signal::CtrlD => Ok(None),
@@ -88,6 +96,33 @@ impl LineInput for TerminalInput {
     fn select(&mut self, prompt: &str, items: &[String]) -> io::Result<Option<usize>> {
         if items.is_empty() {
             return Ok(None);
+        }
+
+        if self.editor.is_none() {
+            let mut output = io::stdout().lock();
+            writeln!(output, "{prompt}")?;
+            for (index, item) in items.iter().enumerate() {
+                writeln!(output, "{}. {item}", index + 1)?;
+            }
+            loop {
+                write!(output, "Номер пункта (esc: назад): ")?;
+                output.flush()?;
+                let Some(value) = read_buffered_line(&mut io::stdin().lock())? else {
+                    return Ok(None);
+                };
+                if value.is_empty() || value.eq_ignore_ascii_case("esc") {
+                    return Ok(None);
+                }
+                if let Some(index) = value
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|value| value.checked_sub(1))
+                    .filter(|index| *index < items.len())
+                {
+                    return Ok(Some(index));
+                }
+                writeln!(output, "Введите номер от 1 до {} или esc", items.len())?;
+            }
         }
 
         Select::new()
@@ -325,7 +360,6 @@ impl<R: BufRead> LineInput for BufferedInput<R> {
     }
 }
 
-#[cfg(test)]
 fn read_buffered_line<R: BufRead>(input: &mut R) -> io::Result<Option<String>> {
     let mut bytes = Vec::new();
     if input.read_until(b'\n', &mut bytes)? == 0 {

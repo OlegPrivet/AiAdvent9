@@ -1,12 +1,18 @@
+mod agent;
+mod agent_catalog;
+mod agents_ui;
 mod api;
 mod chat;
 mod cli;
 mod config;
+mod context;
 mod input;
 mod metrics;
 mod pricing;
 mod repl;
 mod settings;
+#[cfg(test)]
+mod test_http;
 mod tui;
 mod ui;
 
@@ -14,6 +20,7 @@ use std::error::Error;
 use std::io;
 use std::process::ExitCode;
 
+use agent::Agent;
 use api::NeuralDeepClient;
 use chat::{Chat, ChatStore};
 use clap::Parser;
@@ -37,7 +44,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let config = Config::from_env()?;
-    let client = NeuralDeepClient::new(config.api_key, config.base_url)?;
+    let client = Agent::new(NeuralDeepClient::new(config.api_key, config.base_url)?);
     let store = ChatStore::open()?;
     let mut chat = match cli.restore {
         Some(id) => store.load(id)?,

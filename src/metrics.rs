@@ -12,12 +12,20 @@ pub(crate) struct TokenUsage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CallUsage {
+    pub(crate) model: String,
+    pub(crate) usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ResponseMetrics {
     pub(crate) model: String,
     pub(crate) elapsed_ms: u64,
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) estimated_cost_microrubles: Option<u64>,
     pub(crate) premium: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) calls: Vec<CallUsage>,
 }
 
 impl ResponseMetrics {
@@ -35,15 +43,57 @@ impl ResponseMetrics {
             usage,
             estimated_cost_microrubles: estimate.map(|estimate| estimate.microrubles),
             premium: estimate.map(|estimate| estimate.premium),
+            calls: Vec::new(),
         }
     }
 
     pub(crate) fn refresh_cost(&mut self, prices: &PriceCatalog) {
+        if !self.calls.is_empty() {
+            let total = self
+                .calls
+                .iter()
+                .try_fold((0_u64, false), |(cost, premium), call| {
+                    let estimate = prices.estimate(&call.model, call.usage?)?;
+                    Some((
+                        cost.saturating_add(estimate.microrubles),
+                        premium || estimate.premium,
+                    ))
+                });
+            self.estimated_cost_microrubles = total.map(|(cost, _)| cost);
+            self.premium = total.map(|(_, premium)| premium);
+            return;
+        }
         let estimate = self
             .usage
             .and_then(|usage| prices.estimate(&self.model, usage));
         self.estimated_cost_microrubles = estimate.map(|estimate| estimate.microrubles);
         self.premium = estimate.map(|estimate| estimate.premium);
+    }
+
+    pub(crate) fn from_calls(
+        model: &str,
+        elapsed_ms: u64,
+        calls: Vec<CallUsage>,
+        prices: &PriceCatalog,
+    ) -> Self {
+        let usage = calls
+            .iter()
+            .try_fold(TokenUsage::default(), |mut total, call| {
+                let usage = call.usage?;
+                total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
+                total.completion_tokens = total
+                    .completion_tokens
+                    .saturating_add(usage.completion_tokens);
+                total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+                total.cached_prompt_tokens = total
+                    .cached_prompt_tokens
+                    .saturating_add(usage.cached_prompt_tokens);
+                Some(total)
+            });
+        let mut metrics = Self::new(model, elapsed_ms, usage, prices);
+        metrics.calls = calls;
+        metrics.refresh_cost(prices);
+        metrics
     }
 }
 
@@ -111,6 +161,45 @@ pub(crate) fn metric_lines(metrics: Option<&ResponseMetrics>) -> [String; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sums_cost_by_model_and_does_not_report_partial_totals() {
+        let prices = PriceCatalog::with_prices(&[("main", 10.0, 20.0), ("child", 30.0, 40.0)]);
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cached_prompt_tokens: 0,
+        };
+        let calls = vec![
+            CallUsage {
+                model: "main".into(),
+                usage: Some(usage),
+            },
+            CallUsage {
+                model: "child".into(),
+                usage: Some(usage),
+            },
+        ];
+        let metrics = ResponseMetrics::from_calls("main", 123, calls.clone(), &prices);
+        assert_eq!(metrics.usage.expect("total").total_tokens, 30);
+        assert_eq!(metrics.estimated_cost_microrubles, Some(700));
+        assert_eq!(metrics.elapsed_ms, 123);
+        let mut unavailable = ResponseMetrics::from_calls(
+            "main",
+            123,
+            calls.clone(),
+            &PriceCatalog::with_price("main", 10.0, 20.0, false),
+        );
+        assert_eq!(unavailable.estimated_cost_microrubles, None);
+        unavailable.refresh_cost(&prices);
+        assert_eq!(unavailable.estimated_cost_microrubles, Some(700));
+        let mut calls = calls;
+        calls[1].usage = None;
+        let unknown = ResponseMetrics::from_calls("main", 123, calls, &prices);
+        assert!(unknown.usage.is_none());
+        assert!(unknown.estimated_cost_microrubles.is_none());
+    }
 
     #[test]
     fn formats_metrics_for_russian_terminal() {

@@ -2,6 +2,8 @@ use std::io::{self, Write};
 
 use uuid::Uuid;
 
+use crate::agent::{Agent, AgentRequest};
+#[cfg(test)]
 use crate::api::NeuralDeepClient;
 use crate::chat::{Chat, ChatStore};
 use crate::input::LineInput;
@@ -18,7 +20,7 @@ pub(crate) struct ReplDisplay<'a> {
 }
 
 pub(crate) async fn run<I: LineInput, W: Write>(
-    client: &NeuralDeepClient,
+    client: &Agent,
     store: &ChatStore,
     chat: &mut Chat,
     initial_question: Option<String>,
@@ -62,6 +64,15 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                 configure_settings(store, chat, input, output)?;
             } else if command.matches(&["/chat", "/chats", "/чаты"]) {
                 choose_chat(store, chat, input, output, ui)?;
+            } else if command.matches(&["/agents", "/агенты"]) {
+                crate::agents_ui::run(
+                    client,
+                    chat.settings().model(),
+                    &store.agents(),
+                    input,
+                    output,
+                )
+                .await?;
             } else if command.matches(&["/restore", "/восстановить"]) {
                 restore_from_argument(store, chat, command.argument, output, ui)?;
             } else {
@@ -99,7 +110,7 @@ fn start_new_chat<W: Write>(store: &ChatStore, chat: &mut Chat, output: &mut W) 
 }
 
 async fn ask<W: Write>(
-    client: &NeuralDeepClient,
+    client: &Agent,
     store: &ChatStore,
     chat: &mut Chat,
     question: &str,
@@ -107,21 +118,15 @@ async fn ask<W: Write>(
     ui: &TerminalUi,
     prices: &PriceCatalog,
 ) -> io::Result<()> {
+    let agents = match store.agents().list() {
+        Ok(agents) => agents,
+        Err(error) => return writeln!(output, "Каталог агентов: {error}"),
+    };
     let mut live_answer = ui.begin_answer(output);
-    let render_deltas = !chat.settings().response_format_enabled();
     let result = client
-        .ask_streaming(
-            chat.messages(),
-            chat.id(),
-            question,
-            chat.settings(),
-            |delta| {
-                if render_deltas {
-                    live_answer.push(delta)
-                } else {
-                    Ok(())
-                }
-            },
+        .respond_streaming(
+            AgentRequest::new(chat, question.to_owned(), agents),
+            |event| live_answer.agent_event(event),
         )
         .await;
 
@@ -129,10 +134,10 @@ async fn ask<W: Write>(
         Ok(answer) => {
             live_answer.finish(&answer.content)?;
             let truncated = answer.truncated;
-            let metrics = ResponseMetrics::new(
+            let metrics = ResponseMetrics::from_calls(
                 chat.settings().model(),
                 answer.elapsed_ms,
-                answer.usage,
+                answer.calls,
                 prices,
             );
             chat.record_exchange_with_metrics(question.to_owned(), answer.content, Some(metrics));
@@ -391,6 +396,10 @@ fn from_russian_keyboard_layout(value: &str) -> String {
 
 fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(output, "Доступные команды:")?;
+    writeln!(
+        output,
+        "  /agents, /агенты        глобальный каталог агентов (вызов: @handle задача)"
+    )?;
     writeln!(output, "  /chat, /чаты             выбрать сохранённый чат")?;
     writeln!(
         output,
@@ -447,15 +456,113 @@ mod tests {
         }
     }
 
-    fn test_client() -> NeuralDeepClient {
-        NeuralDeepClient::new("test-key".to_owned(), "http://127.0.0.1:1".to_owned())
-            .expect("client should be built")
+    fn test_client() -> Agent {
+        Agent::new(
+            NeuralDeepClient::new("test-key".to_owned(), "http://127.0.0.1:1".to_owned())
+                .expect("client should be built"),
+        )
     }
 
     fn test_store() -> (TestDirectory, ChatStore) {
         let directory = TestDirectory::new();
         let store = ChatStore::for_tests(directory.0.clone()).expect("store should open");
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn shows_agents_and_persists_only_main_answer_with_aggregate_metrics() {
+        let server = crate::test_http::MockServer::new(|request| {
+            crate::test_http::text_response(if request.get("tools").is_some() {
+                "Итог главного"
+            } else {
+                "Дочерний результат"
+            })
+        });
+        let client = Agent::new(
+            NeuralDeepClient::new("test-key".into(), server.url.clone()).expect("client"),
+        );
+        let (_directory, store) = test_store();
+        let mut definition = crate::agent_catalog::AgentDefinition::draft();
+        definition.name = "Редактор".into();
+        definition.handle = "editor".into();
+        definition.description = "Редактирует".into();
+        definition
+            .settings
+            .set_system_prompt("Исправь".into())
+            .expect("prompt");
+        store.agents().save(&definition, true).expect("save");
+        let mut chat = Chat::new();
+        let mut input = BufferedInput::new(Cursor::new("@editor задача\n/exit\n"));
+        let mut output = Vec::new();
+        run(
+            &client,
+            &store,
+            &mut chat,
+            None,
+            &mut input,
+            &mut output,
+            ReplDisplay {
+                ui: &TerminalUi::plain(),
+                prices: &PriceCatalog::default(),
+            },
+        )
+        .await
+        .expect("run");
+        let output = String::from_utf8(output).expect("UTF-8");
+        assert!(output.contains("@editor"));
+        assert!(output.contains("Дочерний результат"));
+        assert!(output.contains("Итог главного"));
+        let restored = store.load(chat.id()).expect("restore");
+        assert_eq!(restored.messages().len(), 2);
+        assert_eq!(restored.messages()[1].content, "Итог главного");
+        assert_eq!(
+            restored
+                .last_response_metrics()
+                .expect("metrics")
+                .usage
+                .expect("usage")
+                .total_tokens,
+            30
+        );
+        assert_eq!(
+            restored
+                .last_response_metrics()
+                .expect("metrics")
+                .calls
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_main_answer_does_not_record_exchange() {
+        let server = crate::test_http::MockServer::new(|_| {
+            (500, r#"{"detail":"service unavailable"}"#.into())
+        });
+        let client = Agent::new(
+            NeuralDeepClient::new("test-key".into(), server.url.clone()).expect("client"),
+        );
+        let (_directory, store) = test_store();
+        let mut chat = Chat::new();
+        let mut output = Vec::new();
+        ask(
+            &client,
+            &store,
+            &mut chat,
+            "Вопрос",
+            &mut output,
+            &TerminalUi::plain(),
+            &PriceCatalog::default(),
+        )
+        .await
+        .expect("render failure");
+        assert!(chat.messages().is_empty());
+        assert!(!chat.is_persisted());
+        assert!(
+            String::from_utf8(output)
+                .expect("UTF-8")
+                .contains("Ошибка запроса")
+        );
     }
 
     #[tokio::test]
