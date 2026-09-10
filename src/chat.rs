@@ -16,7 +16,7 @@ use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 3;
+const DATABASE_SCHEMA_VERSION: i64 = 4;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -65,6 +65,8 @@ pub(crate) struct Chat {
     #[serde(default)]
     settings: Settings,
     messages: Vec<ChatMessage>,
+    #[serde(default)]
+    summary: Option<crate::summary::ConversationSummary>,
     #[serde(skip)]
     persisted: bool,
     #[serde(skip)]
@@ -82,6 +84,7 @@ impl Chat {
             updated_at_ms: now,
             settings: Settings::default(),
             messages: Vec::new(),
+            summary: None,
             persisted: false,
             dirty: false,
         }
@@ -103,12 +106,16 @@ impl Chat {
         &mut self.settings
     }
 
+    pub(crate) fn summary(&self) -> Option<&crate::summary::ConversationSummary> {
+        self.summary.as_ref()
+    }
+
     pub(crate) fn messages(&self) -> &[ChatMessage] {
         &self.messages
     }
 
     pub(crate) fn has_completed_turn(&self) -> bool {
-        !self.messages.is_empty()
+        self.summary.is_some() || !self.messages.is_empty()
     }
 
     pub(crate) fn is_persisted(&self) -> bool {
@@ -128,9 +135,24 @@ impl Chat {
         &mut self,
         question: String,
         answer: String,
-        metrics: Option<ResponseMetrics>,
+        mut metrics: Option<ResponseMetrics>,
     ) {
-        if self.messages.is_empty() {
+        let had_previous_usage = self.has_completed_turn();
+        let previous_usage = self.cumulative_api_usage();
+        if let Some(metrics) = metrics.as_mut() {
+            let new_usage = metrics.usage.map(|usage| {
+                usage.saturating_sub(metrics.already_counted_usage.unwrap_or_default())
+            });
+            metrics.cumulative_usage = if had_previous_usage {
+                previous_usage
+                    .zip(new_usage)
+                    .map(|(previous, current)| previous.saturating_add(current))
+            } else {
+                new_usage
+            };
+            metrics.already_counted_usage = None;
+        }
+        if self.messages.is_empty() && self.summary.is_none() {
             self.title = title_from_question(&question);
         }
         self.messages.push(ChatMessage {
@@ -151,23 +173,48 @@ impl Chat {
             .iter()
             .rev()
             .find_map(|message| message.metrics.as_ref())
+            .or_else(|| self.summary.as_ref().map(|summary| &summary.metrics))
+    }
+
+    pub(crate) fn cumulative_api_usage(&self) -> Option<crate::metrics::TokenUsage> {
+        if let Some(usage) = self
+            .last_response_metrics()
+            .and_then(|metrics| metrics.cumulative_usage)
+        {
+            return Some(usage);
+        }
+
+        let total = self
+            .summary
+            .iter()
+            .map(|summary| &summary.metrics)
+            .try_fold(crate::metrics::TokenUsage::default(), |total, metrics| {
+                Some(total.saturating_add(metrics.usage?))
+            })?;
+        self.messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .try_fold(total, |total, message| {
+                Some(total.saturating_add(message.metrics.as_ref()?.usage?))
+            })
     }
 
     pub(crate) fn refresh_last_response_cost(&mut self, prices: &PriceCatalog) -> bool {
-        let Some(metrics) = self
+        let last = self
             .messages
             .iter_mut()
             .rev()
-            .find_map(|message| message.metrics.as_mut())
-        else {
-            return false;
-        };
-        if metrics.estimated_cost_microrubles.is_some() {
-            return false;
+            .find_map(|message| message.metrics.as_mut());
+        let summary = self.summary.as_mut().map(|summary| &mut summary.metrics);
+        let mut changed = false;
+        for metrics in last.into_iter().chain(summary) {
+            if metrics.estimated_cost_microrubles.is_some() {
+                continue;
+            }
+            let previous = (metrics.estimated_cost_microrubles, metrics.premium);
+            metrics.refresh_cost(prices);
+            changed |= previous != (metrics.estimated_cost_microrubles, metrics.premium);
         }
-        let previous = (metrics.estimated_cost_microrubles, metrics.premium);
-        metrics.refresh_cost(prices);
-        let changed = previous != (metrics.estimated_cost_microrubles, metrics.premium);
         if changed {
             self.mark_changed();
         }
@@ -297,7 +344,7 @@ impl ChatStore {
         let row = self
             .connection
             .query_row(
-                "SELECT title, created_at_ms, updated_at_ms, settings_json
+                "SELECT title, created_at_ms, updated_at_ms, settings_json, summary_json
                  FROM chats WHERE id = ?1",
                 params![id.to_string()],
                 |row| {
@@ -306,12 +353,13 @@ impl ChatStore {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
             .optional()
             .map_err(self.database_error("прочитать"))?;
-        let Some((title, created_at_ms, updated_at_ms, settings_json)) = row else {
+        let Some((title, created_at_ms, updated_at_ms, settings_json, summary_json)) = row else {
             return Err(ChatStoreError::NotFound(id));
         };
         let settings = serde_json::from_str(&settings_json).map_err(|source| {
@@ -322,6 +370,24 @@ impl ChatStore {
             }
         })?;
 
+        let mut summary: Option<crate::summary::ConversationSummary> = summary_json
+            .map(|text| serde_json::from_str(&text))
+            .transpose()
+            .map_err(|source| ChatStoreError::SettingsJson {
+                action: "прочитать резюме",
+                id,
+                source,
+            })?;
+        // Older saved summaries predate the explicit operation marker.
+        if let Some(summary) = summary.as_mut() {
+            summary.metrics.is_summary = true;
+        }
+        if summary
+            .as_ref()
+            .is_some_and(|summary| summary.content.trim().is_empty())
+        {
+            return Err(ChatStoreError::InvalidConversation(id));
+        }
         let mut statement = self
             .connection
             .prepare(
@@ -367,7 +433,7 @@ impl ChatStore {
                 metrics,
             });
         }
-        if !valid_messages(&messages) {
+        if !(valid_messages(&messages) || (messages.is_empty() && summary.is_some())) {
             return Err(ChatStoreError::InvalidConversation(id));
         }
 
@@ -381,6 +447,7 @@ impl ChatStore {
                 .map_err(|_| ChatStoreError::InvalidTimestamp(id))?,
             settings,
             messages,
+            summary,
             persisted: false,
             dirty: false,
         };
@@ -430,6 +497,28 @@ impl ChatStore {
         })
     }
 
+    pub(crate) fn replace_with_summary(
+        &self,
+        chat: &mut Chat,
+        mut summary: crate::summary::ConversationSummary,
+    ) -> Result<(), ChatStoreError> {
+        if summary.content.trim().is_empty() {
+            return Err(ChatStoreError::InvalidConversation(chat.id));
+        }
+        let previous_usage = chat.cumulative_api_usage();
+        summary.metrics.cumulative_usage = previous_usage
+            .zip(summary.metrics.usage)
+            .map(|(previous, current)| previous.saturating_add(current));
+        summary.metrics.is_summary = true;
+        let mut replacement = chat.clone();
+        replacement.messages.clear();
+        replacement.summary = Some(summary);
+        replacement.mark_changed();
+        self.save(&mut replacement)?;
+        *chat = replacement;
+        Ok(())
+    }
+
     pub(crate) fn save(&self, chat: &mut Chat) -> Result<bool, ChatStoreError> {
         if !chat.has_completed_turn() {
             return Ok(false);
@@ -437,7 +526,8 @@ impl ChatStore {
         if chat.is_persisted() && !chat.is_dirty() {
             return Ok(true);
         }
-        if !valid_messages(&chat.messages) {
+        if !(valid_messages(&chat.messages) || (chat.messages.is_empty() && chat.summary.is_some()))
+        {
             return Err(ChatStoreError::InvalidConversation(chat.id));
         }
 
@@ -540,25 +630,35 @@ fn write_chat(
             id: chat.id,
             source,
         })?;
+    let summary_json = chat
+        .summary
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|source| ChatStoreError::SettingsJson {
+            action: "сохранить резюме",
+            id: chat.id,
+            source,
+        })?;
     let created_at_ms = timestamp_for_database(chat.id, chat.created_at_ms)?;
     let updated_at_ms = timestamp_for_database(chat.id, chat.updated_at_ms)?;
     let id = chat.id.to_string();
 
     let changed = match mode {
         WriteMode::Replace => transaction.execute(
-            "INSERT INTO chats(id, title, created_at_ms, updated_at_ms, settings_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO chats(id, title, created_at_ms, updated_at_ms, settings_json, summary_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET
                  title = excluded.title,
                  created_at_ms = excluded.created_at_ms,
                  updated_at_ms = excluded.updated_at_ms,
-                 settings_json = excluded.settings_json",
-            params![id, chat.title, created_at_ms, updated_at_ms, settings_json],
+                 settings_json = excluded.settings_json, summary_json = excluded.summary_json",
+            params![id, chat.title, created_at_ms, updated_at_ms, settings_json, summary_json],
         ),
         WriteMode::IgnoreExisting => transaction.execute(
-            "INSERT OR IGNORE INTO chats(id, title, created_at_ms, updated_at_ms, settings_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, chat.title, created_at_ms, updated_at_ms, settings_json],
+            "INSERT OR IGNORE INTO chats(id, title, created_at_ms, updated_at_ms, settings_json, summary_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, chat.title, created_at_ms, updated_at_ms, settings_json, summary_json],
         ),
     }
     .map_err(|source| database_error("записать чат", database_path, source))?;
@@ -649,10 +749,10 @@ fn initialize_database(
                  COMMIT;",
             )
             .map_err(|source| database_error("обновить схему", database_path, source)),
-        2 | 3 => Ok(()),
+        2..=4 => Ok(()),
         value => Err(ChatStoreError::UnsupportedSchema(value)),
     }?;
-    if version < DATABASE_SCHEMA_VERSION {
+    if version < 3 {
         connection
             .execute_batch(
                 "BEGIN IMMEDIATE;
@@ -669,6 +769,10 @@ fn initialize_database(
              COMMIT;",
             )
             .map_err(|source| database_error("добавить каталог агентов", database_path, source))?;
+    }
+    if version < DATABASE_SCHEMA_VERSION {
+        connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE chats ADD COLUMN summary_json TEXT; PRAGMA user_version = 4; COMMIT;")
+            .map_err(|source| database_error("добавить резюме", database_path, source))?;
     }
     Ok(())
 }
@@ -817,6 +921,179 @@ mod tests {
     }
 
     #[test]
+    fn migrates_version_three_without_changing_messages_or_agents() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut chat = Chat::new();
+        chat.record_exchange("Вопрос".into(), "Ответ".into());
+        store.save(&mut chat).expect("save");
+        store
+            .connection
+            .execute_batch("ALTER TABLE chats DROP COLUMN summary_json; PRAGMA user_version = 3;")
+            .expect("v3 fixture");
+        drop(store);
+        let migrated = ChatStore::for_tests(directory.0.clone()).expect("migrate");
+        let restored = migrated.load(chat.id()).expect("load");
+        assert_eq!(restored.messages(), chat.messages());
+        assert!(restored.summary().is_none());
+        assert!(migrated.agents().list().is_ok());
+        assert_eq!(
+            migrated
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            4
+        );
+    }
+
+    #[test]
+    fn summary_replaces_persisted_messages_atomically_and_preserves_identity() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut chat = Chat::new();
+        chat.record_exchange("Старый вопрос".into(), "Старый ответ".into());
+        store.save(&mut chat).expect("save");
+        let id = chat.id();
+        let title = chat.title().to_owned();
+        let summary = crate::summary::ConversationSummary {
+            content: "Резюме".into(),
+            replaced_messages: 2,
+            before_bytes: 100,
+            metrics: ResponseMetrics::new("main", 1, None, &PriceCatalog::default()),
+        };
+        store.connection.execute_batch("CREATE TRIGGER reject_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'test failure'); END;").expect("trigger");
+        assert!(
+            store
+                .replace_with_summary(&mut chat, summary.clone())
+                .is_err()
+        );
+        assert_eq!(chat.messages().len(), 2);
+        assert!(chat.summary().is_none());
+        assert_eq!(store.load(id).expect("load").messages().len(), 2);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_delete;")
+            .expect("remove trigger");
+        store
+            .replace_with_summary(&mut chat, summary)
+            .expect("replace");
+        store.connection.execute("UPDATE chats SET summary_json = json_remove(summary_json, '$.metrics.is_summary') WHERE id = ?1", params![id.to_string()]).expect("legacy summary fixture");
+        let mut restored = store.load(id).expect("summary-only chat");
+        assert!(
+            restored
+                .last_response_metrics()
+                .expect("summary metrics")
+                .is_summary
+        );
+        assert!(restored.messages().is_empty());
+        assert_eq!(restored.summary().expect("summary").content, "Резюме");
+        assert!(restored.has_completed_turn());
+        assert_eq!(restored.title(), title);
+        assert_eq!(restored.settings(), chat.settings());
+        restored.record_exchange("Новый вопрос".into(), "Ответ".into());
+        assert_eq!(restored.title(), title);
+        assert_eq!(restored.id(), id);
+        store.save(&mut restored).expect("save next turn");
+        assert_eq!(store.load(id).expect("load").messages().len(), 2);
+        assert!(Chat::new().summary().is_none());
+    }
+
+    #[test]
+    fn accumulates_every_api_usage_across_turns_and_summary_without_duplicates() {
+        use crate::metrics::{CallUsage, TokenUsage};
+
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let make_metrics = |prompt_tokens, completion_tokens| {
+            let usage = TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                cached_prompt_tokens: 0,
+            };
+            ResponseMetrics::from_calls(
+                "qwen3.8-27b",
+                0,
+                vec![CallUsage {
+                    context: None,
+                    model: "qwen3.8-27b".into(),
+                    usage: Some(usage),
+                }],
+                &PriceCatalog::default(),
+            )
+        };
+        let mut chat = Chat::new();
+        chat.record_exchange_with_metrics(
+            "Первый".into(),
+            "Ответ".into(),
+            Some(make_metrics(70, 30)),
+        );
+        chat.record_exchange_with_metrics(
+            "Второй".into(),
+            "Ответ".into(),
+            Some(make_metrics(150, 50)),
+        );
+        assert_eq!(
+            chat.cumulative_api_usage(),
+            Some(TokenUsage {
+                prompt_tokens: 220,
+                completion_tokens: 80,
+                total_tokens: 300,
+                cached_prompt_tokens: 0,
+            })
+        );
+
+        let summary_metrics = make_metrics(35, 15);
+        let summary_calls = summary_metrics.calls.clone();
+        store
+            .replace_with_summary(
+                &mut chat,
+                crate::summary::ConversationSummary {
+                    content: "Резюме".into(),
+                    replaced_messages: 4,
+                    before_bytes: 100,
+                    metrics: summary_metrics,
+                },
+            )
+            .expect("summary");
+        assert_eq!(
+            chat.cumulative_api_usage()
+                .expect("summary usage")
+                .total_tokens,
+            350
+        );
+
+        let mut calls = summary_calls;
+        calls.extend(make_metrics(20, 5).calls);
+        let mut combined =
+            ResponseMetrics::from_calls("qwen3.8-27b", 0, calls, &PriceCatalog::default());
+        combined.already_counted_usage = Some(TokenUsage {
+            prompt_tokens: 35,
+            completion_tokens: 15,
+            total_tokens: 50,
+            cached_prompt_tokens: 0,
+        });
+        chat.record_exchange_with_metrics("После резюме".into(), "Ответ".into(), Some(combined));
+        assert_eq!(
+            chat.cumulative_api_usage(),
+            Some(TokenUsage {
+                prompt_tokens: 275,
+                completion_tokens: 100,
+                total_tokens: 375,
+                cached_prompt_tokens: 0,
+            })
+        );
+        store.save(&mut chat).expect("save");
+        assert_eq!(
+            store
+                .load(chat.id())
+                .expect("restore")
+                .cumulative_api_usage(),
+            chat.cumulative_api_usage()
+        );
+    }
+
+    #[test]
     fn saves_only_after_complete_exchange_and_restores_settings() {
         let directory = TestDirectory::new();
         let store = ChatStore::for_tests(directory.0.clone()).expect("store should open");
@@ -834,6 +1111,7 @@ mod tests {
         assert!(store.list().expect("list should load").chats.is_empty());
 
         let metrics = ResponseMetrics {
+            is_summary: false,
             model: "gpt-oss-120b".to_owned(),
             elapsed_ms: 1_234,
             usage: Some(TokenUsage {
@@ -845,6 +1123,8 @@ mod tests {
             estimated_cost_microrubles: Some(1_020),
             premium: Some(false),
             calls: Vec::new(),
+            cumulative_usage: None,
+            already_counted_usage: None,
         };
         chat.record_exchange_with_metrics(
             "  Первый   вопрос  ".to_owned(),
@@ -864,7 +1144,10 @@ mod tests {
         assert_eq!(restored.settings().model(), "gpt-oss-120b");
         assert_eq!(restored.settings().max_tokens(), 900);
         assert_eq!(restored.settings().temperature(), 1.25);
-        assert_eq!(restored.last_response_metrics(), Some(&metrics));
+        assert_eq!(
+            restored.last_response_metrics(),
+            chat.last_response_metrics()
+        );
         assert!(restored.is_persisted());
         assert!(!restored.is_dirty());
         assert!(directory.0.join(DATABASE_FILE_NAME).is_file());
@@ -880,6 +1163,7 @@ mod tests {
             1200,
             vec![
                 crate::metrics::CallUsage {
+                    context: None,
                     model: "gpt-oss-20b".into(),
                     usage: Some(TokenUsage {
                         total_tokens: 15,
@@ -887,6 +1171,7 @@ mod tests {
                     }),
                 },
                 crate::metrics::CallUsage {
+                    context: None,
                     model: "qwen3.8-27b".into(),
                     usage: Some(TokenUsage {
                         total_tokens: 20,
@@ -900,20 +1185,23 @@ mod tests {
         store.save(&mut chat).expect("save");
         store
             .connection
-            .execute_batch("DROP TABLE agents; PRAGMA user_version = 2;")
+            .execute_batch("DROP TABLE agents; ALTER TABLE chats DROP COLUMN summary_json; PRAGMA user_version = 2;")
             .expect("v2 fixture");
         drop(store);
         let migrated = ChatStore::for_tests(directory.0.clone()).expect("migrate");
         assert!(migrated.agents().list().expect("catalog").is_empty());
         let restored = migrated.load(chat.id()).expect("restore");
         assert_eq!(restored.messages(), chat.messages());
-        assert_eq!(restored.last_response_metrics(), Some(&metrics));
+        assert_eq!(
+            restored.last_response_metrics(),
+            chat.last_response_metrics()
+        );
         assert_eq!(
             migrated
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            3
+            DATABASE_SCHEMA_VERSION
         );
     }
 

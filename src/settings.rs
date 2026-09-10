@@ -7,7 +7,7 @@ use crate::input::LineInput;
 
 const DEFAULT_MAX_TOKENS: u32 = 10000;
 const DEFAULT_TEMPERATURE: f32 = 0.1;
-use crate::config::{DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL};
+use crate::config::DEFAULT_MODEL;
 const MIN_STRUCTURED_TOKENS: u32 = 256;
 const MIN_TEMPERATURE: f32 = 0.0;
 const MAX_TEMPERATURE: f32 = 2.0;
@@ -90,7 +90,9 @@ pub(crate) struct Settings {
     model: String,
     response_format_enabled: bool,
     max_tokens: u32,
-    context_tokens: u32,
+    #[cfg(test)]
+    #[serde(skip)]
+    test_context_tokens: u32,
     temperature: f32,
     completion_condition: CompletionCondition,
     system_prompt: Option<String>,
@@ -102,7 +104,8 @@ impl Default for Settings {
             model: DEFAULT_MODEL.to_owned(),
             response_format_enabled: false,
             max_tokens: DEFAULT_MAX_TOKENS,
-            context_tokens: DEFAULT_CONTEXT_TOKENS,
+            #[cfg(test)]
+            test_context_tokens: 0,
             temperature: DEFAULT_TEMPERATURE,
             completion_condition: CompletionCondition::None,
             system_prompt: None,
@@ -111,6 +114,16 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub(crate) fn for_summary(model: &str, _context_tokens: u32, max_tokens: u32) -> Self {
+        Self {
+            model: model.into(),
+            #[cfg(test)]
+            test_context_tokens: _context_tokens,
+            max_tokens,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn model(&self) -> &str {
         &self.model
     }
@@ -124,18 +137,11 @@ impl Settings {
     }
 
     pub(crate) fn context_tokens(&self) -> u32 {
-        self.context_tokens
-    }
-
-    pub(crate) fn set_context_tokens(&mut self, value: &str) -> Result<(), String> {
-        let limit = value
-            .parse::<u32>()
-            .map_err(|_| "Контекст должен быть целым положительным числом".to_owned())?;
-        if limit <= self.max_tokens {
-            return Err("Контекст должен быть больше лимита ответа (max_tokens)".into());
+        #[cfg(test)]
+        if self.test_context_tokens != 0 {
+            return self.test_context_tokens;
         }
-        self.context_tokens = limit;
-        Ok(())
+        crate::config::model_context_tokens(self.model()).unwrap_or(0)
     }
 
     pub(crate) fn temperature(&self) -> f32 {
@@ -198,7 +204,6 @@ impl Settings {
                     "не задан"
                 }
             ),
-            format!("Контекст: {} токенов", self.context_tokens),
         ]
     }
 
@@ -247,7 +252,7 @@ impl Settings {
         if max_tokens == 0 {
             return Err("Требуется целое число больше нуля.".to_owned());
         }
-        if max_tokens >= self.context_tokens {
+        if max_tokens >= self.context_tokens() {
             return Err("Лимит ответа должен быть меньше окна контекста".into());
         }
         if self.response_format_enabled && max_tokens < MIN_STRUCTURED_TOKENS {
@@ -330,15 +335,6 @@ impl Settings {
                 3 => self.configure_temperature(input, output)?,
                 4 => self.configure_completion(input, output)?,
                 5 => self.configure_system_prompt(input, output)?,
-                6 => {
-                    if let Some(value) =
-                        input.read_line("Контекст в токенах (пустая строка — отмена): ")?
-                        && !value.trim().is_empty()
-                        && let Err(error) = self.set_context_tokens(value.trim())
-                    {
-                        writeln!(output, "{error}")?;
-                    }
-                }
                 _ => {}
             }
         }
@@ -439,7 +435,7 @@ impl Settings {
                     "Для Structured Output требуется минимум {MIN_STRUCTURED_TOKENS} токенов; значение не изменено."
                 )?;
             }
-            Ok(max_tokens) if max_tokens >= self.context_tokens => {
+            Ok(max_tokens) if max_tokens >= self.context_tokens() => {
                 writeln!(output, "Лимит ответа должен быть меньше окна контекста")?;
             }
             Ok(max_tokens) if max_tokens > 0 => {
@@ -778,27 +774,24 @@ mod tests {
     }
 
     #[test]
-    fn defaults_new_and_legacy_settings_to_200000_context_tokens() {
-        assert_eq!(Settings::default().context_tokens(), 200_000);
-        let legacy: Settings =
-            serde_json::from_str(r#"{"max_tokens":900}"#).expect("legacy settings");
-        assert_eq!(legacy.context_tokens(), 200_000);
-        assert_eq!(legacy.max_tokens(), 900);
-    }
-
-    #[test]
-    fn context_budget_roundtrips_and_reserves_output() {
-        let mut settings = Settings::default();
-        for invalid in ["0", "-1", "abc", "10000"] {
-            assert!(settings.set_context_tokens(invalid).is_err());
-            assert_eq!(settings.context_tokens(), 200_000);
+    fn legacy_local_budget_is_ignored_and_no_longer_saved() {
+        for (model, limit) in [
+            ("gpt-oss-120b", 131072),
+            ("qwen3.8-27b", 262144),
+            ("deepseek-v4-flash", 1000000),
+        ] {
+            let mut settings: Settings =
+                serde_json::from_value(serde_json::json!({"model":model,"context_tokens":200000}))
+                    .expect("legacy settings");
+            assert_eq!(settings.context_tokens(), limit);
+            assert!(settings.set_max_tokens(&limit.to_string()).is_err());
+            assert!(
+                serde_json::to_value(&settings)
+                    .expect("serialize")
+                    .get("context_tokens")
+                    .is_none()
+            );
         }
-        settings.set_context_tokens("120000").expect("context");
-        assert!(settings.set_max_tokens("120000").is_err());
-        let saved = serde_json::to_string(&settings).expect("serialize");
-        let restored: Settings = serde_json::from_str(&saved).expect("restore");
-        assert_eq!(restored.context_tokens(), 120_000);
-        assert_eq!(restored.max_tokens(), 10_000);
     }
 
     #[test]

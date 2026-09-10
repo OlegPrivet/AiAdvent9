@@ -2,9 +2,9 @@ use std::io::{self, IsTerminal, Stdout};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -35,6 +35,10 @@ use crate::settings::Settings;
 use crate::ui::sanitize_terminal_text;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const ACTIVE_CLOCK_INTERVAL: Duration = Duration::from_millis(250);
+const STREAM_BATCH_INTERVAL: Duration = Duration::from_millis(40);
+const STREAM_BATCH_BYTES: usize = 1024;
 const PRICE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_INPUT_HEIGHT: u16 = 8;
 const COMMAND_PALETTE: &[CommandOption] = &[
@@ -49,6 +53,7 @@ const COMMAND_PALETTE: &[CommandOption] = &[
         "настройки текущего чата",
         &["/setting", "/настройки"],
     ),
+    CommandOption::run("/summarize", "заменить историю резюме", &["/суммаризация"]),
     CommandOption::run("/clear", "начать новый чат без контекста", &["/очистить"]),
     CommandOption::run("/help", "показать справку", &["/помощь"]),
     CommandOption::run("/exit", "сохранить чат и выйти", &["/quit", "/выход"]),
@@ -133,15 +138,12 @@ pub(crate) async fn run(
     }
 
     let mut needs_draw = true;
+    let mut last_draw = Instant::now() - MIN_FRAME_INTERVAL;
     let exit_message = loop {
         if let Some(Modal::Agents(agents)) = &mut app.modal
             && agents.poll_generation()
         {
             needs_draw = true;
-        }
-        if needs_draw || app.request_started_at.is_some() {
-            session.terminal.draw(|frame| app.render(frame))?;
-            needs_draw = false;
         }
 
         while let Ok(worker_event) = worker_rx.try_recv() {
@@ -153,15 +155,29 @@ pub(crate) async fn run(
             needs_draw = true;
         }
 
+        if app.request_started_at.is_some() && last_draw.elapsed() >= ACTIVE_CLOCK_INTERVAL {
+            needs_draw = true;
+        }
+        if needs_draw && last_draw.elapsed() >= MIN_FRAME_INTERVAL {
+            session.terminal.draw(|frame| app.render(frame))?;
+            needs_draw = false;
+            last_draw = Instant::now();
+        }
+
         if app.should_refresh_prices() {
             spawn_price_refresh(worker_tx.clone());
             app.price_refresh_started();
         }
 
-        let poll_interval = if app.request_started_at.is_some() {
+        let base_poll_interval = if app.request_started_at.is_some() {
             EVENT_POLL_INTERVAL
         } else {
             Duration::from_millis(200)
+        };
+        let poll_interval = if needs_draw {
+            base_poll_interval.min(MIN_FRAME_INTERVAL.saturating_sub(last_draw.elapsed()))
+        } else {
+            base_poll_interval
         };
         if event::poll(poll_interval)? {
             needs_draw = true;
@@ -228,26 +244,110 @@ fn spawn_request(
     worker_tx: UnboundedSender<WorkerEvent>,
 ) -> RequestTask {
     let client = client.clone();
-    let request = store
-        .agents()
-        .list()
-        .map(|agents| AgentRequest::new(chat, question, agents));
+    let manual = crate::summary::is_command(&question);
+    let request = store.agents().list().map(|agents| {
+        AgentRequest::new(chat, if manual { String::new() } else { question }, agents)
+    });
     RequestTask(tokio::spawn(async move {
         let delta_tx = worker_tx.clone();
         let result = match request {
             Err(error) => Err(AgentError::from(error)),
-            Ok(request) => {
-                client
-                    .respond_streaming(request, move |event| {
-                        delta_tx
-                            .send(WorkerEvent::Agent(request_id, event))
-                            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI закрыт"))
-                    })
-                    .await
+            Ok(mut request) => {
+                async {
+                    let mut summary_metrics = None;
+                    if let Some(target) = crate::summary::prepare(&request, manual)? {
+                        let _ = worker_tx.send(WorkerEvent::SummaryStarted(request_id));
+                        let summary = client.summarize(&request, target).await?;
+                        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                        worker_tx
+                            .send(WorkerEvent::SummaryReady(
+                                request_id,
+                                summary.clone(),
+                                ack_tx,
+                            ))
+                            .map_err(|_| AgentError::InvalidRequest("TUI закрыт".into()))?;
+                        ack_rx
+                            .await
+                            .map_err(|_| {
+                                AgentError::InvalidRequest("Суммаризация отменена".into())
+                            })?
+                            .map_err(AgentError::InvalidRequest)?;
+                        summary_metrics = Some(summary.metrics.clone());
+                        crate::summary::apply(&mut request, summary);
+                    }
+                    if manual {
+                        return Ok(AgentAnswer {
+                            content: String::new(),
+                            truncated: false,
+                            elapsed_ms: 0,
+                            calls: Vec::new(),
+                            already_counted_usage: None,
+                        });
+                    }
+                    let mut pending_delta = String::new();
+                    let mut last_delta_flush = Instant::now() - STREAM_BATCH_INTERVAL;
+                    let answer = {
+                        let mut forward_event = |event| match event {
+                            AgentEvent::MainDelta(delta) => {
+                                pending_delta.push_str(&delta);
+                                if pending_delta.len() >= STREAM_BATCH_BYTES
+                                    || last_delta_flush.elapsed() >= STREAM_BATCH_INTERVAL
+                                {
+                                    send_agent_event(
+                                        &delta_tx,
+                                        request_id,
+                                        AgentEvent::MainDelta(std::mem::take(&mut pending_delta)),
+                                    )?;
+                                    last_delta_flush = Instant::now();
+                                }
+                                Ok(())
+                            }
+                            event => {
+                                if !pending_delta.is_empty() {
+                                    send_agent_event(
+                                        &delta_tx,
+                                        request_id,
+                                        AgentEvent::MainDelta(std::mem::take(&mut pending_delta)),
+                                    )?;
+                                    last_delta_flush = Instant::now();
+                                }
+                                send_agent_event(&delta_tx, request_id, event)
+                            }
+                        };
+                        client.respond_streaming(request, &mut forward_event).await
+                    };
+                    if !pending_delta.is_empty() {
+                        send_agent_event(
+                            &delta_tx,
+                            request_id,
+                            AgentEvent::MainDelta(pending_delta),
+                        )?;
+                    }
+                    let mut answer = answer?;
+                    if let Some(metrics) = summary_metrics {
+                        answer.already_counted_usage = metrics.usage;
+                        let mut calls = metrics.calls;
+                        calls.append(&mut answer.calls);
+                        answer.calls = calls;
+                        answer.elapsed_ms = answer.elapsed_ms.saturating_add(metrics.elapsed_ms);
+                    }
+                    Ok(answer)
+                }
+                .await
             }
         };
         let _ = worker_tx.send(WorkerEvent::Finished(request_id, result));
     }))
+}
+
+fn send_agent_event(
+    worker_tx: &UnboundedSender<WorkerEvent>,
+    request_id: Uuid,
+    event: AgentEvent,
+) -> io::Result<()> {
+    worker_tx
+        .send(WorkerEvent::Agent(request_id, event))
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI закрыт"))
 }
 
 struct RequestTask(JoinHandle<()>);
@@ -268,6 +368,12 @@ fn spawn_price_refresh(worker_tx: UnboundedSender<WorkerEvent>) {
 }
 
 enum WorkerEvent {
+    SummaryStarted(Uuid),
+    SummaryReady(
+        Uuid,
+        crate::summary::ConversationSummary,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
     Agent(Uuid, AgentEvent),
     Finished(Uuid, Result<AgentAnswer, AgentError>),
     Prices(Result<PriceCatalog, String>),
@@ -377,7 +483,7 @@ impl<'a> App<'a> {
                 Constraint::Min(3),
                 Constraint::Length(input_height),
                 Constraint::Length(palette_height),
-                Constraint::Length(3),
+                Constraint::Length(5),
             ])
             .split(area);
 
@@ -474,11 +580,13 @@ impl<'a> App<'a> {
         let lines = if let Some(started_at) = self.request_started_at {
             [
                 format!(
-                    "👉 Время ответа: {}",
+                    "Время ответа: {}",
                     format_duration(elapsed_millis(started_at.elapsed()))
                 ),
-                "👉 Токены: …".to_owned(),
-                "👉 Стоимость: …".to_owned(),
+                "Контекстное окно: …".to_owned(),
+                "Выход последнего вызова: …".to_owned(),
+                "API за весь диалог: … · вход … · выход …".to_owned(),
+                "Стоимость: …".to_owned(),
             ]
         } else {
             metric_lines(
@@ -520,6 +628,11 @@ impl<'a> App<'a> {
 
     fn transcript_markdown(&self) -> String {
         let mut markdown = String::new();
+        if let Some(summary) = self.chat.summary() {
+            markdown.push_str("**Резюме диалога**\n\n");
+            markdown.push_str(&sanitize_terminal_text(&summary.content));
+            markdown.push_str(&format!("\n\n{}\n\n---\n\n", summary.report()));
+        }
         for (index, message) in self
             .chat
             .messages()
@@ -840,6 +953,9 @@ impl<'a> App<'a> {
             self.set_input("");
             return Ok(None);
         }
+        if crate::summary::is_command(&value) {
+            return self.begin_question("/summarize".into()).map(Some);
+        }
         if let Some(command) = ParsedCommand::parse(&value) {
             self.set_input("");
             self.handle_command(command);
@@ -888,6 +1004,15 @@ impl<'a> App<'a> {
                 self.set_input("");
                 match option.action {
                     CommandAction::Run(command) => {
+                        if crate::summary::is_command(command) {
+                            return Some(match self.begin_question("/summarize".into()) {
+                                Ok(question) => Action::Submit(question),
+                                Err(error) => {
+                                    self.notice = Some(error.to_string());
+                                    Action::None
+                                }
+                            });
+                        }
                         if let Some(command) = ParsedCommand::parse(command) {
                             self.handle_command(command);
                         }
@@ -959,11 +1084,28 @@ impl<'a> App<'a> {
     }
 
     fn handle_worker_event(&mut self, event: WorkerEvent) {
-        if matches!(&event, WorkerEvent::Agent(id, _) | WorkerEvent::Finished(id, _) if *id != self.request_id || self.pending_question.is_none())
+        if matches!(&event, WorkerEvent::Agent(id, _) | WorkerEvent::Finished(id, _) | WorkerEvent::SummaryStarted(id) | WorkerEvent::SummaryReady(id, _, _) if *id != self.request_id || self.pending_question.is_none())
         {
             return;
         }
         match event {
+            WorkerEvent::SummaryStarted(_) => {
+                self.notice = Some("Сжимаю историю…".into());
+            }
+            WorkerEvent::SummaryReady(_, mut summary, ack) => {
+                summary.metrics.refresh_cost(&self.prices);
+                let result = self
+                    .store
+                    .replace_with_summary(self.chat, summary.clone())
+                    .map_err(|error| error.to_string());
+                if result.is_ok() {
+                    self.visible_from = 0;
+                    self.history_scroll = 0;
+                    self.follow_tail = true;
+                    self.notice = Some(summary.report());
+                }
+                let _ = ack.send(result);
+            }
             WorkerEvent::Agent(_, event) => {
                 match event {
                     AgentEvent::MainDelta(delta) => self.streamed_answer.push_str(&delta),
@@ -987,15 +1129,25 @@ impl<'a> App<'a> {
                     .map(|started_at| elapsed_millis(started_at.elapsed()))
                     .unwrap_or_default();
                 match result {
+                    Ok(_) if crate::summary::is_command(&question) => {
+                        self.trace_question = None;
+                        self.streamed_answer.clear();
+                        self.transient_metrics = None;
+                        self.notice = Some(self.chat.summary().map_or_else(
+                            || "Нет новых сообщений для суммаризации.".into(),
+                            |summary| summary.report(),
+                        ));
+                    }
                     Ok(answer) => {
                         self.trace_question = None;
                         let truncated = answer.truncated;
-                        let metrics = ResponseMetrics::from_calls(
+                        let mut metrics = ResponseMetrics::from_calls(
                             &model,
                             answer.elapsed_ms,
                             answer.calls,
                             &self.prices,
                         );
+                        metrics.already_counted_usage = answer.already_counted_usage;
                         self.chat.record_exchange_with_metrics(
                             question,
                             answer.content,
@@ -1237,11 +1389,6 @@ impl<'a> App<'a> {
                         kind: ListKind::SystemPrompt,
                     });
                 }
-                6 => self.open_text_modal(
-                    "Контекст в токенах · Enter: сохранить",
-                    TextKind::ContextTokens,
-                    self.chat.settings().context_tokens().to_string(),
-                ),
                 _ => self.open_settings(),
             },
             ListKind::Models => {
@@ -1311,7 +1458,6 @@ impl<'a> App<'a> {
 
     fn apply_text_setting(&mut self, kind: TextKind, value: String) -> Result<(), String> {
         match kind {
-            TextKind::ContextTokens => self.chat.settings_mut().set_context_tokens(value.trim()),
             TextKind::MaxTokens => self
                 .chat
                 .settings_mut()
@@ -1413,7 +1559,6 @@ enum ListKind {
 
 #[derive(Clone, Copy)]
 enum TextKind {
-    ContextTokens,
     MaxTokens,
     Temperature,
     StopSequence,
@@ -1679,6 +1824,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/restore <UUID>          восстановить чат",
                 "/settings, /настройки   настройки текущего чата",
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
+                "/summarize, /суммаризация заменить историю резюме",
                 "/clear, /очистить        начать новый чат без старого контекста",
                 "/exit, /выход            завершить работу",
                 "",
@@ -1795,7 +1941,18 @@ impl TerminalSession {
     fn new() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
+            let _ = execute!(
+                stdout,
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -1810,7 +1967,8 @@ impl TerminalSession {
                 stdout,
                 PopKeyboardEnhancementFlags,
                 LeaveAlternateScreen,
-                DisableMouseCapture
+                DisableMouseCapture,
+                DisableBracketedPaste
             );
             let _ = disable_raw_mode();
             return Err(error);
@@ -1825,7 +1983,12 @@ impl TerminalSession {
                 if enhanced_keyboard {
                     let _ = execute!(stdout, PopKeyboardEnhancementFlags);
                 }
-                let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+                let _ = execute!(
+                    stdout,
+                    DisableBracketedPaste,
+                    LeaveAlternateScreen,
+                    DisableMouseCapture
+                );
                 let _ = disable_raw_mode();
                 Err(error)
             }
@@ -1841,6 +2004,7 @@ impl Drop for TerminalSession {
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
+            DisableBracketedPaste,
             LeaveAlternateScreen,
             DisableMouseCapture
         );
@@ -1871,6 +2035,128 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn long_multiline_paste_is_inserted_in_full_and_waits_for_enter() {
+        for mode in [EditMode::Emacs, EditMode::Vim] {
+            let directory = TestDirectory::new();
+            let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+            let mut chat = Chat::new();
+            let mut app = App::with_history(&store, &mut chat, mode, CommandHistory::default());
+            let text = format!(
+                "/exit\n{}Конец вставки\n",
+                "Длинная строка с Unicode 🙂 и пробелами  \n".repeat(5000)
+            );
+            app.handle_paste(&text);
+            assert_eq!(app.input_value(), text);
+            assert!(app.pending_question.is_none());
+            assert!(app.request_started_at.is_none());
+            assert!(!app.exit_requested, "pasted commands must remain text");
+            assert!(app.chat.messages().is_empty());
+            match app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+                Action::Submit(question) => assert_eq!(question, text),
+                _ => panic!("only explicit Enter should submit the full paste"),
+            }
+            assert_eq!(app.pending_question.as_deref(), Some(text.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_worker_waits_for_persistence_and_ignores_cancelled_results() {
+        let server = crate::test_http::MockServer::new(|request| {
+            crate::test_http::text_response(
+                if request["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Сожми"))
+                {
+                    "Резюме"
+                } else {
+                    "Ответ"
+                },
+            )
+        });
+        let client = Agent::new(
+            crate::api::NeuralDeepClient::new("test-key".into(), server.url.clone())
+                .expect("client"),
+        );
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut chat = Chat::new();
+        *chat.settings_mut() = crate::settings::Settings::for_summary("qwen3.8-27b", 20000, 1000);
+        let metrics = ResponseMetrics::from_calls(
+            "qwen3.8-27b",
+            0,
+            vec![crate::metrics::CallUsage {
+                context: None,
+                model: "qwen3.8-27b".into(),
+                usage: Some(TokenUsage {
+                    total_tokens: 17_000,
+                    ..TokenUsage::default()
+                }),
+            }],
+            &PriceCatalog::default(),
+        );
+        chat.record_exchange_with_metrics("x".repeat(17000), "Старый ответ".into(), Some(metrics));
+        store.save(&mut chat).expect("save");
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        let question = app.begin_question("Продолжи".into()).expect("question");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _task = spawn_request(&client, &store, app.chat, question, app.request_id, tx);
+        let ready = loop {
+            let event = rx.recv().await.expect("event");
+            if matches!(event, WorkerEvent::SummaryReady(..)) {
+                break event;
+            }
+            app.handle_worker_event(event);
+        };
+        let summary_calls = server.requests().len();
+        assert!(
+            server
+                .requests()
+                .iter()
+                .all(|call| call["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Сожми"))),
+            "main must wait for commit acknowledgement"
+        );
+        assert!(app.chat.summary().is_none());
+        app.handle_worker_event(ready);
+        assert!(
+            store
+                .load(app.chat.id())
+                .expect("saved before main")
+                .summary()
+                .is_some()
+        );
+        loop {
+            let event = rx.recv().await.expect("event");
+            let finished = matches!(event, WorkerEvent::Finished(..));
+            app.handle_worker_event(event);
+            if finished {
+                break;
+            }
+        }
+        assert_eq!(server.requests().len(), summary_calls + 1);
+        assert!(app.transcript_markdown().contains("Резюме диалога"));
+        assert!(!app.transcript_markdown().contains("Старый ответ"));
+        let summary = app.chat.summary().expect("summary").clone();
+        app.begin_question("/summarize".into()).expect("manual");
+        let id = app.request_id;
+        app.cancel_request();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        app.handle_worker_event(WorkerEvent::SummaryReady(id, summary, ack_tx));
+        assert!(ack_rx.await.is_err());
+        assert_eq!(
+            app.chat.messages().len(),
+            2,
+            "stale result must not replace new messages"
+        );
     }
 
     #[test]
@@ -2135,9 +2421,11 @@ mod tests {
                 truncated: false,
                 elapsed_ms: 100,
                 calls: vec![crate::metrics::CallUsage {
+                    context: None,
                     model: "qwen3.8-27b".into(),
                     usage: Some(TokenUsage::default()),
                 }],
+                already_counted_usage: None,
             }),
         ));
         let trace = app.transcript_markdown();
@@ -2230,10 +2518,10 @@ mod tests {
             .expect("command palette should render");
 
         let buffer = terminal.backend().buffer();
-        assert!(buffer_row(buffer, 10).contains("Ввод"));
-        assert!(buffer_row(buffer, 13).contains("Команды"));
-        assert!(buffer_row(buffer, 14).contains("/chat"));
-        assert!(buffer_row(buffer, 21).contains("Время ответа"));
+        assert!(buffer_row(buffer, 8).contains("Ввод"));
+        assert!(buffer_row(buffer, 11).contains("Команды"));
+        assert!(buffer_row(buffer, 12).contains("/chat"));
+        assert!(buffer_row(buffer, 19).contains("Время ответа"));
 
         assert!(matches!(
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
@@ -2263,6 +2551,7 @@ mod tests {
         let store = ChatStore::for_tests(directory.0.clone()).expect("test store should open");
         let mut chat = Chat::new();
         let metrics = ResponseMetrics {
+            is_summary: false,
             model: "qwen3.8-27b-noreason".to_owned(),
             elapsed_ms: 2_345,
             usage: Some(TokenUsage {
@@ -2274,6 +2563,8 @@ mod tests {
             estimated_cost_microrubles: Some(42_137),
             premium: Some(false),
             calls: Vec::new(),
+            cumulative_usage: None,
+            already_counted_usage: None,
         };
         chat.record_exchange_with_metrics(
             "Вопрос".to_owned(),
@@ -2294,9 +2585,13 @@ mod tests {
             .expect("TUI should render");
 
         let buffer = terminal.backend().buffer();
-        assert!(buffer_row(buffer, 18).contains("Ввод"));
-        assert!(buffer_row(buffer, 21).contains("Время ответа: 2,35 с"));
-        assert!(buffer_row(buffer, 22).contains("Токены: 1 234"));
+        assert!(buffer_row(buffer, 16).contains("Ввод"));
+        assert!(buffer_row(buffer, 19).contains("Время ответа: 2,35 с"));
+        assert!(
+            buffer_row(buffer, 20).contains("Контекстное окно: 1 234 / 262 144 токенов (0,5%)")
+        );
+        assert!(buffer_row(buffer, 21).contains("Выход последнего вызова: 254 токенов"));
+        assert!(buffer_row(buffer, 22).contains("API за весь диалог: 1 234 токенов"));
         assert!(buffer_row(buffer, 23).contains("Стоимость: ≈ 0,042137 ₽"));
     }
 

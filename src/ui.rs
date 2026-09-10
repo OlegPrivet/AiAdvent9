@@ -57,9 +57,28 @@ impl TerminalUi {
         }
     }
 
+    pub(crate) fn print_replaced_chat<W: Write>(
+        &self,
+        output: &mut W,
+        chat: &Chat,
+    ) -> io::Result<()> {
+        if self.interactive {
+            write!(output, "\x1b[2J\x1b[H")?;
+        }
+        self.print_chat(output, chat)
+    }
+
     pub(crate) fn print_chat<W: Write>(&self, output: &mut W, chat: &Chat) -> io::Result<()> {
         writeln!(output, "\nЧат: {} [{}]", chat.title(), chat.id())?;
 
+        if let Some(summary) = chat.summary() {
+            writeln!(
+                output,
+                "\nРезюме диалога:\n{}\n{}",
+                sanitize_terminal_text(&summary.content),
+                summary.report()
+            )?;
+        }
         for message in chat.messages() {
             let label = match message.role {
                 MessageRole::User => "Вы",

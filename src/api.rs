@@ -13,9 +13,10 @@ use crate::chat::ChatMessage;
 use crate::metrics::TokenUsage;
 use crate::settings::Settings;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const STREAM_RETRY_DELAY: Duration = Duration::from_millis(250);
 
-fn structured_response_format() -> Value {
+pub(crate) fn structured_response_format() -> Value {
     json!({
         "type": "json_schema",
         "json_schema": {
@@ -66,22 +67,28 @@ pub(crate) struct ApiAnswer {
 
 #[derive(Debug, Error)]
 pub(crate) enum ApiError {
-    #[error(transparent)]
-    Context(#[from] crate::context::ContextError),
+    #[error("неизвестно окно контекста модели {0}; обновите справочник моделей")]
+    UnknownContext(String),
     #[error("некорректный tool-call AI-сервиса: {0}")]
     InvalidToolCall(String),
     #[error("не удалось настроить HTTP-клиент: {0}")]
     BuildClient(reqwest::Error),
     #[error("не удалось выполнить запрос к AI-сервису: {0}")]
-    Request(reqwest::Error),
+    Request(String),
     #[error("AI-сервис вернул HTTP {status}: {message}")]
     Http { status: StatusCode, message: String },
     #[error("не удалось разобрать ответ AI-сервиса: {0}")]
-    InvalidJson(reqwest::Error),
+    InvalidJson(String),
     #[error("не удалось разобрать фрагмент потокового ответа: {0}")]
     InvalidStream(serde_json::Error),
-    #[error("потоковый ответ завершился без маркера [DONE]")]
-    IncompleteStream,
+    #[error(
+        "потоковый ответ оборвался без маркера [DONE] (получено {received_bytes} байт, текста: {received_chars} символов, finish_reason: {finish_reason})"
+    )]
+    IncompleteStream {
+        received_bytes: usize,
+        received_chars: usize,
+        finish_reason: String,
+    },
     #[error("не удалось вывести потоковый ответ: {0}")]
     Output(io::Error),
     #[error("Structured Output не соответствует ожидаемой JSON Schema: {0}")]
@@ -95,7 +102,7 @@ pub(crate) enum ApiError {
 impl NeuralDeepClient {
     pub(crate) fn new(api_key: String, base_url: String) -> Result<Self, ApiError> {
         let http = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(ApiError::BuildClient)?;
 
@@ -124,7 +131,7 @@ impl NeuralDeepClient {
             .await?
             .json::<ChatResponse>()
             .await
-            .map_err(ApiError::InvalidJson)?;
+            .map_err(|error| ApiError::InvalidJson(describe_reqwest_error(&error)))?;
         let choice = response
             .choices
             .into_iter()
@@ -154,7 +161,7 @@ impl NeuralDeepClient {
         let response = response
             .json::<ChatResponse>()
             .await
-            .map_err(ApiError::InvalidJson)?;
+            .map_err(|error| ApiError::InvalidJson(describe_reqwest_error(&error)))?;
         let usage = response.usage.map(Into::into);
         let choice = response
             .choices
@@ -217,12 +224,10 @@ impl NeuralDeepClient {
         F: FnMut(&str) -> io::Result<()>,
     {
         let started_at = Instant::now();
-        let messages = crate::context::fit_messages(
-            messages,
-            tools.as_ref(),
-            settings.context_tokens(),
-            settings.max_tokens(),
-        )?;
+        if settings.context_tokens() == 0 {
+            return Err(ApiError::UnknownContext(settings.model().into()));
+        }
+        let messages = messages.to_vec();
         let mut request = json!({
             "model": settings.model(), "messages": messages,
             "max_tokens": settings.max_tokens(), "temperature": settings.temperature(),
@@ -245,21 +250,56 @@ impl NeuralDeepClient {
         let mut usage = None;
         let mut done = false;
         let mut tool_calls = BTreeMap::new();
+        let mut received_bytes = 0_usize;
+        let mut received_events = 0_usize;
+        let mut retried = false;
 
-        'response: while let Some(chunk) = response.chunk().await.map_err(ApiError::Request)? {
-            for data in decoder.push(&chunk) {
-                if data == b"[DONE]" {
-                    done = true;
-                    break 'response;
+        'response: loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    received_bytes = received_bytes.saturating_add(chunk.len());
+                    for data in decoder.push(&chunk) {
+                        if data == b"[DONE]" {
+                            done = true;
+                            break 'response;
+                        }
+                        received_events = received_events.saturating_add(1);
+                        consume_stream_chunk(
+                            &data,
+                            &mut content,
+                            &mut finish_reason,
+                            &mut usage,
+                            &mut tool_calls,
+                            &mut on_delta,
+                        )?;
+                    }
                 }
-                consume_stream_chunk(
-                    &data,
-                    &mut content,
-                    &mut finish_reason,
-                    &mut usage,
-                    &mut tool_calls,
-                    &mut on_delta,
-                )?;
+                Ok(None) if received_events == 0 && !retried => {
+                    retried = true;
+                    tokio::time::sleep(STREAM_RETRY_DELAY).await;
+                    response = self.post(&request).await?;
+                    decoder = SseDecoder::default();
+                    received_bytes = 0;
+                }
+                Ok(None) => break,
+                Err(_) if received_events == 0 && !retried => {
+                    retried = true;
+                    tokio::time::sleep(STREAM_RETRY_DELAY).await;
+                    response = self.post(&request).await?;
+                    decoder = SseDecoder::default();
+                    received_bytes = 0;
+                }
+                Err(error) => {
+                    let retry = if retried {
+                        "; повтор до начала потока уже выполнен"
+                    } else {
+                        ""
+                    };
+                    return Err(ApiError::Request(format!(
+                        "чтение потокового ответа после {received_bytes} байт{retry}: {}",
+                        describe_reqwest_error(&error)
+                    )));
+                }
             }
         }
 
@@ -281,7 +321,11 @@ impl NeuralDeepClient {
         }
 
         if !done {
-            return Err(ApiError::IncompleteStream);
+            return Err(ApiError::IncompleteStream {
+                received_bytes,
+                received_chars: content.chars().count(),
+                finish_reason: finish_reason.unwrap_or_else(|| "не указан".into()),
+            });
         }
 
         let tool_calls = tool_calls.into_values().collect::<Vec<_>>();
@@ -305,7 +349,17 @@ impl NeuralDeepClient {
                 "вызов не завершён (возможно, исчерпан max_tokens)".into(),
             ));
         }
+        let actual_context = usage
+            .and_then(|usage| usize::try_from(usage.total_tokens).ok())
+            .unwrap_or_default();
         Ok(ApiTurn {
+            context: crate::context::ContextReport {
+                limit: settings.context_tokens(),
+                before: actual_context,
+                after: actual_context,
+                output_reserve: 0,
+                removed_messages: 0,
+            },
             content,
             finish_reason,
             usage,
@@ -371,11 +425,21 @@ impl NeuralDeepClient {
             .json(&request)
             .send()
             .await
-            .map_err(ApiError::Request)?;
+            .map_err(|error| {
+                ApiError::Request(format!(
+                    "соединение или отправка запроса: {}",
+                    describe_reqwest_error(&error)
+                ))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.map_err(ApiError::Request)?;
+            let body = response.text().await.map_err(|error| {
+                ApiError::Request(format!(
+                    "чтение тела HTTP-ошибки: {}",
+                    describe_reqwest_error(&error)
+                ))
+            })?;
             return Err(ApiError::Http {
                 status,
                 message: extract_error_message(&body),
@@ -384,6 +448,32 @@ impl NeuralDeepClient {
 
         Ok(response)
     }
+}
+
+fn describe_reqwest_error(error: &reqwest::Error) -> String {
+    use std::error::Error as _;
+
+    let kind = if error.is_timeout() {
+        "таймаут"
+    } else if error.is_connect() {
+        "ошибка соединения"
+    } else if error.is_body() {
+        "обрыв тела ответа"
+    } else if error.is_decode() {
+        "ошибка декодирования"
+    } else {
+        "транспортная ошибка"
+    };
+    let mut details = vec![format!("{kind}: {error}")];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if !details.iter().any(|detail| detail == &message) {
+            details.push(message);
+        }
+        source = cause.source();
+    }
+    details.join(": ")
 }
 
 fn consume_stream_chunk<F>(
@@ -611,6 +701,7 @@ impl ApiMessage {
 
 #[derive(Debug)]
 pub(crate) struct ApiTurn {
+    pub(crate) context: crate::context::ContextReport,
     pub(crate) content: String,
     pub(crate) finish_reason: Option<String>,
     pub(crate) tool_calls: Vec<ToolCall>,
@@ -751,42 +842,24 @@ mod tests {
     use crate::input::BufferedInput;
 
     #[tokio::test]
-    async fn fits_context_before_http_without_mutating_history() {
+    async fn sends_large_context_to_provider_without_local_token_guessing() {
         let server =
             crate::test_http::MockServer::new(|_| crate::test_http::text_response("Ответ"));
         let client = test_client(server.url.clone());
         let messages = vec![
-            ApiMessage::text("system", "Правила"),
-            ApiMessage::text("user", "x".repeat(195_000)),
-            ApiMessage::text("assistant", "Старый ответ"),
+            ApiMessage::text("user", "x".repeat(300_000)),
+            ApiMessage::text("assistant", "Ответ"),
             ApiMessage::text("user", "Новый вопрос"),
         ];
-        client
+        let turn = client
             .complete_streaming(&messages, Uuid::nil(), &Settings::default(), None, |_| {
                 Ok(())
             })
             .await
-            .expect("answer");
-        let requests = server.requests();
-        assert_eq!(
-            requests[0]["messages"].as_array().expect("messages").len(),
-            2
-        );
-        assert_eq!(requests[0]["messages"][1]["content"], "Новый вопрос");
-        assert!(requests[0].get("context_tokens").is_none());
-        assert_eq!(messages.len(), 4);
-        let error = client
-            .complete_streaming(
-                &[ApiMessage::text("user", "x".repeat(200_000))],
-                Uuid::nil(),
-                &Settings::default(),
-                None,
-                |_| Ok(()),
-            )
-            .await
-            .expect_err("overflow");
-        assert!(matches!(error, ApiError::Context(_)));
-        assert_eq!(server.requests().len(), 1, "overflow must fail before HTTP");
+            .expect("provider decides whether context fits");
+        assert_eq!(turn.content, "Ответ");
+        assert_eq!(server.requests().len(), 1);
+        assert_eq!(messages.len(), 3);
     }
 
     #[tokio::test]
@@ -985,6 +1058,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_stream_once_when_body_breaks_before_first_byte() {
+        let complete = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Ответ после повтора\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, request_rx, server) =
+            spawn_stream_sequence(&[(1024, ""), (complete.len(), complete)]);
+
+        let answer = test_client(base_url)
+            .ask_streaming(&[], Uuid::nil(), "test", &Settings::default(), |_| Ok(()))
+            .await
+            .expect("second stream should succeed");
+        assert_eq!(answer.content, "Ответ после повтора");
+        request_rx.recv().expect("first request");
+        request_rx.recv().expect("retry request");
+        server.join().expect("mock server should stop");
+    }
+
+    #[tokio::test]
+    async fn reports_stream_stage_progress_and_cause_after_retry_fails() {
+        let (base_url, request_rx, server) = spawn_stream_sequence(&[(1024, ""), (1024, "")]);
+
+        let error = test_client(base_url)
+            .ask_streaming(&[], Uuid::nil(), "test", &Settings::default(), |_| Ok(()))
+            .await
+            .expect_err("both streams should fail");
+        let message = error.to_string();
+        assert!(message.contains("чтение потокового ответа после 0 байт"));
+        assert!(message.contains("повтор до начала потока уже выполнен"));
+        assert!(message.contains("error decoding response body"));
+        request_rx.recv().expect("first request");
+        request_rx.recv().expect("retry request");
+        server.join().expect("mock server should stop");
+    }
+
+    #[tokio::test]
     async fn sends_full_chat_history_custom_prompt_and_session_id() {
         let response_body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Продолжение\"},\"finish_reason\":null}]}\n\n",
@@ -1088,7 +1197,9 @@ mod tests {
 
             match expected {
                 "malformed" => assert!(matches!(error, ApiError::InvalidStream(_))),
-                "incomplete" => assert!(matches!(error, ApiError::IncompleteStream)),
+                "incomplete" => {
+                    assert!(matches!(error, ApiError::IncompleteStream { .. }))
+                }
                 _ => panic!("unknown test case"),
             }
         }
@@ -1220,6 +1331,34 @@ mod tests {
             stream
                 .write_all(response.as_bytes())
                 .expect("mock response should be written");
+        });
+
+        (format!("http://{address}"), request_rx, server)
+    }
+
+    fn spawn_stream_sequence(
+        responses: &[(usize, &str)],
+    ) -> (String, Receiver<String>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        let responses = responses
+            .iter()
+            .map(|(length, body)| (*length, (*body).to_owned()))
+            .collect::<Vec<_>>();
+        let (request_tx, request_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            for (content_length, body) in responses {
+                let (mut stream, _) = listener.accept().expect("mock server should accept");
+                let request = read_request(&mut stream);
+                request_tx.send(request).expect("request should be sent");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{body}"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("mock response should be written");
+            }
         });
 
         (format!("http://{address}"), request_rx, server)

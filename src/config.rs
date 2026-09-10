@@ -5,7 +5,28 @@ use thiserror::Error;
 const API_KEY_ENV: &str = "NEURALDEEP_API_KEY";
 const DEFAULT_BASE_URL: &str = "https://api.neuraldeep.ru/v1";
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.8-27b";
-pub(crate) const DEFAULT_CONTEXT_TOKENS: u32 = 200_000;
+
+/// NeuralDeep llms-full.txt, checked 2026-09-09. Rounded catalog values
+/// are kept conservative; unknown models cannot be sent until their window is known.
+pub(crate) fn model_context_tokens(model: &str) -> Option<u32> {
+    match model.strip_suffix("-noreason").unwrap_or(model) {
+        "gpt-oss-20b" | "gpt-oss-120b" => Some(131_072),
+        "qwen3.8-27b" | "qwen3.6-35b-a3b" | "qwen3.6-fp8" => Some(262_144),
+        "gemma-4-31b" | "kimi-k2.7-code" => Some(262_000),
+        "kimi-k2.6" => Some(256_000),
+        "minimax-m2.5" => Some(204_800),
+        "glm-5.3-flash" => Some(1_300_000),
+        "glm-5.2"
+        | "glm-5.3"
+        | "qwen3.7-flash"
+        | "qwen3.7-plus"
+        | "deepseek-v4-pro"
+        | "deepseek-v4-flash"
+        | "deepseek-v4-flash-vision-exp"
+        | "kimi-k3" => Some(1_000_000),
+        _ => None,
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct Config {

@@ -56,7 +56,12 @@ pub(crate) async fn run<I: LineInput, W: Write>(
             if command.matches(&["/exit", "/quit", "/выход"]) {
                 return finish_session(store, chat, output);
             }
-            if command.matches(&["/clear", "/очистить"]) {
+            if command.matches(&["/summarize", "/суммаризация"]) {
+                if let Err(error) = compact(client, store, chat, "", true, output, ui, prices).await
+                {
+                    writeln!(output, "Суммаризация не выполнена: {error}")?;
+                }
+            } else if command.matches(&["/clear", "/очистить"]) {
                 start_new_chat(store, chat, output)?;
             } else if command.matches(&["/help", "/помощь"]) {
                 print_help(output)?;
@@ -109,6 +114,49 @@ fn start_new_chat<W: Write>(store: &ChatStore, chat: &mut Chat, output: &mut W) 
     output.flush()
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn compact<W: Write>(
+    client: &Agent,
+    store: &ChatStore,
+    chat: &mut Chat,
+    question: &str,
+    manual: bool,
+    output: &mut W,
+    ui: &TerminalUi,
+    prices: &PriceCatalog,
+) -> Result<Option<crate::summary::ConversationSummary>, String> {
+    let request = AgentRequest::new(
+        chat,
+        question.into(),
+        store.agents().list().map_err(|error| error.to_string())?,
+    );
+    let Some(target) =
+        crate::summary::prepare(&request, manual).map_err(|error| error.to_string())?
+    else {
+        if manual {
+            writeln!(output, "Нет новых сообщений для суммаризации.")
+                .map_err(|error| error.to_string())?;
+        }
+        return Ok(None);
+    };
+    writeln!(output, "Сжимаю историю…")
+        .and_then(|_| output.flush())
+        .map_err(|error| error.to_string())?;
+    let mut summary = client
+        .summarize(&request, target)
+        .await
+        .map_err(|error| error.to_string())?;
+    summary.metrics.refresh_cost(prices);
+    store
+        .replace_with_summary(chat, summary.clone())
+        .map_err(|error| error.to_string())?;
+    ui.print_replaced_chat(output, chat)
+        .map_err(|error| error.to_string())?;
+    ui.print_metrics(output, Some(&summary.metrics))
+        .map_err(|error| error.to_string())?;
+    Ok(Some(summary))
+}
+
 async fn ask<W: Write>(
     client: &Agent,
     store: &ChatStore,
@@ -118,6 +166,10 @@ async fn ask<W: Write>(
     ui: &TerminalUi,
     prices: &PriceCatalog,
 ) -> io::Result<()> {
+    let compaction = match compact(client, store, chat, question, false, output, ui, prices).await {
+        Ok(summary) => summary,
+        Err(error) => return writeln!(output, "Суммаризация не выполнена: {error}"),
+    };
     let agents = match store.agents().list() {
         Ok(agents) => agents,
         Err(error) => return writeln!(output, "Каталог агентов: {error}"),
@@ -131,15 +183,23 @@ async fn ask<W: Write>(
         .await;
 
     match result {
-        Ok(answer) => {
+        Ok(mut answer) => {
+            if let Some(summary) = compaction {
+                answer.already_counted_usage = summary.metrics.usage;
+                let mut calls = summary.metrics.calls;
+                calls.append(&mut answer.calls);
+                answer.calls = calls;
+                answer.elapsed_ms = answer.elapsed_ms.saturating_add(summary.metrics.elapsed_ms);
+            }
             live_answer.finish(&answer.content)?;
             let truncated = answer.truncated;
-            let metrics = ResponseMetrics::from_calls(
+            let mut metrics = ResponseMetrics::from_calls(
                 chat.settings().model(),
                 answer.elapsed_ms,
                 answer.calls,
                 prices,
             );
+            metrics.already_counted_usage = answer.already_counted_usage;
             chat.record_exchange_with_metrics(question.to_owned(), answer.content, Some(metrics));
             if let Err(error) = store.save(chat) {
                 writeln!(
@@ -398,6 +458,10 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(output, "Доступные команды:")?;
     writeln!(
         output,
+        "  /summarize, /суммаризация заменить всю историю кратким резюме"
+    )?;
+    writeln!(
+        output,
         "  /agents, /агенты        глобальный каталог агентов (вызов: @handle задача)"
     )?;
     writeln!(output, "  /chat, /чаты             выбрать сохранённый чат")?;
@@ -470,6 +534,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_summary_is_saved_before_main_request_even_if_main_fails() {
+        for fail_main in [false, true] {
+            let server = crate::test_http::MockServer::new(move |request| {
+                let summarizing = request["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Сожми"));
+                if summarizing {
+                    crate::test_http::text_response("Резюме проекта")
+                } else if fail_main {
+                    (500, "{}".into())
+                } else {
+                    crate::test_http::text_response("Продолжаю")
+                }
+            });
+            let client = Agent::new(
+                NeuralDeepClient::new("test-key".into(), server.url.clone()).expect("client"),
+            );
+            let (_directory, store) = test_store();
+            let mut chat = Chat::new();
+            *chat.settings_mut() =
+                crate::settings::Settings::for_summary("qwen3.8-27b", 20000, 1000);
+            let metrics = ResponseMetrics::from_calls(
+                "qwen3.8-27b",
+                0,
+                vec![crate::metrics::CallUsage {
+                    context: None,
+                    model: "qwen3.8-27b".into(),
+                    usage: Some(crate::metrics::TokenUsage {
+                        total_tokens: 17_000,
+                        ..crate::metrics::TokenUsage::default()
+                    }),
+                }],
+                &PriceCatalog::default(),
+            );
+            chat.record_exchange_with_metrics(
+                "x".repeat(17000),
+                "Старый ответ".into(),
+                Some(metrics),
+            );
+            store.save(&mut chat).expect("save");
+            let old_title = chat.title().to_owned();
+            let mut output = Vec::new();
+            ask(
+                &client,
+                &store,
+                &mut chat,
+                "Продолжи",
+                &mut output,
+                &TerminalUi::plain(),
+                &PriceCatalog::default(),
+            )
+            .await
+            .expect("ask");
+            let restored = store.load(chat.id()).expect("load");
+            assert_eq!(
+                restored.summary().expect("summary").content,
+                "Резюме проекта"
+            );
+            assert_eq!(restored.title(), old_title);
+            assert_eq!(restored.messages().len(), if fail_main { 0 } else { 2 });
+            let calls = server.requests();
+            assert_eq!(
+                calls.len(),
+                restored.summary().expect("summary").metrics.calls.len() + 1
+            );
+            let main = calls.last().expect("main call")["messages"]
+                .as_array()
+                .expect("messages");
+            assert!(main.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Резюме проекта"))
+            }));
+            assert!(
+                !main.iter().any(
+                    |message| message["content"].as_str().is_some_and(|text| text
+                        .contains("Старый ответ")
+                        || text.contains(&"x".repeat(100)))
+                )
+            );
+            assert_eq!(main.last().expect("question")["content"], "Продолжи");
+            if !fail_main {
+                assert_eq!(
+                    restored
+                        .last_response_metrics()
+                        .expect("metrics")
+                        .usage
+                        .expect("usage")
+                        .total_tokens,
+                    calls.len() as u64 * 15
+                );
+            }
+            let output = String::from_utf8(output).expect("utf8");
+            assert!(output.contains("История заменена резюме"));
+            assert!(
+                !output.contains("\x1b[2J"),
+                "piped output must not clear the screen"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_summary_replaces_every_message_and_is_noop_without_new_messages() {
+        let server =
+            crate::test_http::MockServer::new(|_| crate::test_http::text_response("Резюме"));
+        let client = Agent::new(
+            NeuralDeepClient::new("test-key".into(), server.url.clone()).expect("client"),
+        );
+        let (_directory, store) = test_store();
+        let mut chat = Chat::new();
+        chat.record_exchange("Вопрос".repeat(50), "Ответ".repeat(50));
+        let mut input = BufferedInput::new(Cursor::new("/summarize\n/суммаризация\n/exit\n"));
+        run(
+            &client,
+            &store,
+            &mut chat,
+            None,
+            &mut input,
+            &mut Vec::new(),
+            ReplDisplay {
+                ui: &TerminalUi::plain(),
+                prices: &PriceCatalog::default(),
+            },
+        )
+        .await
+        .expect("run");
+        assert_eq!(server.requests().len(), 1);
+        assert!(chat.messages().is_empty());
+        assert!(store.load(chat.id()).expect("load").summary().is_some());
+    }
+
+    #[tokio::test]
     async fn shows_agents_and_persists_only_main_answer_with_aggregate_metrics() {
         let server = crate::test_http::MockServer::new(|request| {
             crate::test_http::text_response(if request.get("tools").is_some() {
@@ -512,6 +708,11 @@ mod tests {
         assert!(output.contains("@editor"));
         assert!(output.contains("Дочерний результат"));
         assert!(output.contains("Итог главного"));
+        assert!(output.contains("Контекстное окно: 15 / 262 144 токенов (0,0%)"));
+        assert!(output.contains("Выход последнего вызова: 5 токенов"));
+        assert!(
+            output.contains("API за весь диалог: 30 токенов · вход 20 токенов · выход 10 токенов")
+        );
         let restored = store.load(chat.id()).expect("restore");
         assert_eq!(restored.messages().len(), 2);
         assert_eq!(restored.messages()[1].content, "Итог главного");

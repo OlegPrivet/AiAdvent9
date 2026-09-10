@@ -11,14 +11,46 @@ pub(crate) struct TokenUsage {
     pub(crate) cached_prompt_tokens: u64,
 }
 
+impl TokenUsage {
+    pub(crate) fn saturating_add(self, other: Self) -> Self {
+        Self {
+            prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_add(other.completion_tokens),
+            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+            cached_prompt_tokens: self
+                .cached_prompt_tokens
+                .saturating_add(other.cached_prompt_tokens),
+        }
+    }
+
+    pub(crate) fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            prompt_tokens: self.prompt_tokens.saturating_sub(other.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_sub(other.completion_tokens),
+            total_tokens: self.total_tokens.saturating_sub(other.total_tokens),
+            cached_prompt_tokens: self
+                .cached_prompt_tokens
+                .saturating_sub(other.cached_prompt_tokens),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CallUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context: Option<crate::context::ContextReport>,
     pub(crate) model: String,
     pub(crate) usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ResponseMetrics {
+    #[serde(default)]
+    pub(crate) is_summary: bool,
     pub(crate) model: String,
     pub(crate) elapsed_ms: u64,
     pub(crate) usage: Option<TokenUsage>,
@@ -26,6 +58,10 @@ pub(crate) struct ResponseMetrics {
     pub(crate) premium: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) calls: Vec<CallUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cumulative_usage: Option<TokenUsage>,
+    #[serde(skip)]
+    pub(crate) already_counted_usage: Option<TokenUsage>,
 }
 
 impl ResponseMetrics {
@@ -38,12 +74,15 @@ impl ResponseMetrics {
         let model = model.into();
         let estimate = usage.and_then(|usage| prices.estimate(&model, usage));
         Self {
+            is_summary: false,
             model,
             elapsed_ms,
             usage,
             estimated_cost_microrubles: estimate.map(|estimate| estimate.microrubles),
             premium: estimate.map(|estimate| estimate.premium),
             calls: Vec::new(),
+            cumulative_usage: None,
+            already_counted_usage: None,
         }
     }
 
@@ -123,44 +162,216 @@ pub(crate) fn format_cost(microrubles: u64) -> String {
     format!("{rubles},{fraction:06} ₽")
 }
 
-pub(crate) fn metric_lines(metrics: Option<&ResponseMetrics>) -> [String; 3] {
+pub(crate) fn metric_lines(metrics: Option<&ResponseMetrics>) -> [String; 5] {
     let Some(metrics) = metrics else {
         return [
-            "👉 Время ответа: —".to_owned(),
-            "👉 Токены: —".to_owned(),
-            "👉 Стоимость: —".to_owned(),
-        ];
+            "Время ответа: —",
+            "Контекстное окно: —",
+            "Выход последнего вызова: —",
+            "API за весь диалог: —",
+            "Стоимость: —",
+        ]
+        .map(str::to_owned);
     };
-    let tokens = metrics.usage.map_or_else(
-        || "👉 Токены: нет данных API".to_owned(),
-        |usage| {
-            format!(
-                "👉 Токены: {} · вход {} · выход {}",
-                format_tokens(usage.total_tokens),
-                format_tokens(usage.prompt_tokens),
-                format_tokens(usage.completion_tokens)
-            )
+    let usage = metrics
+        .calls
+        .last()
+        .map_or(metrics.usage, |call| call.usage);
+    let tokens = |value: Option<u64>| {
+        value.map_or_else(
+            || "нет данных API".into(),
+            |value| format!("{} токенов", format_tokens(value)),
+        )
+    };
+    let model = metrics
+        .calls
+        .last()
+        .map_or(metrics.model.as_str(), |call| call.model.as_str());
+    let context = usage.map_or_else(
+        || "нет данных API".into(),
+        |usage| match crate::config::model_context_tokens(model) {
+            Some(limit) => {
+                let percent = usage.total_tokens as f64 * 100.0 / f64::from(limit);
+                format!(
+                    "{} / {} токенов ({:.1}%)",
+                    format_tokens(usage.total_tokens),
+                    format_tokens(limit as u64),
+                    percent
+                )
+                .replace('.', ",")
+            }
+            None => format!("{} / неизвестно токенов", format_tokens(usage.total_tokens)),
         },
     );
     let cost = metrics.estimated_cost_microrubles.map_or_else(
-        || "👉 Стоимость: нет данных".to_owned(),
-        |cost| {
-            format!(
-                "👉 Стоимость: ≈ {} · расчёт по токенному прайсу",
-                format_cost(cost)
-            )
-        },
+        || "нет данных".into(),
+        |cost| format!("≈ {}", format_cost(cost)),
     );
     [
-        format!("👉 Время ответа: {}", format_duration(metrics.elapsed_ms)),
-        tokens,
-        cost,
+        format!(
+            "{}: {}",
+            if metrics.is_summary {
+                "Время суммаризации"
+            } else {
+                "Время ответа"
+            },
+            format_duration(metrics.elapsed_ms)
+        ),
+        format!("Контекстное окно: {}", context),
+        format!(
+            "Выход последнего вызова: {}",
+            tokens(usage.map(|usage| usage.completion_tokens))
+        ),
+        format!(
+            "API за весь диалог: {} · вход {} · выход {}",
+            tokens(metrics.cumulative_usage.map(|usage| usage.total_tokens)),
+            tokens(metrics.cumulative_usage.map(|usage| usage.prompt_tokens)),
+            tokens(
+                metrics
+                    .cumulative_usage
+                    .map(|usage| usage.completion_tokens)
+            ),
+        ),
+        format!("Стоимость: {cost}"),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_labels_distinguish_api_input_from_replacement_history() {
+        let mut metrics = ResponseMetrics::from_calls(
+            "main",
+            11130,
+            vec![CallUsage {
+                model: "main".into(),
+                usage: Some(TokenUsage {
+                    prompt_tokens: 29003,
+                    completion_tokens: 2223,
+                    total_tokens: 31226,
+                    cached_prompt_tokens: 0,
+                }),
+                context: Some(crate::context::ContextReport {
+                    limit: 200000,
+                    before: 40000,
+                    after: 40000,
+                    output_reserve: 8192,
+                    removed_messages: 0,
+                }),
+            }],
+            &PriceCatalog::default(),
+        );
+        metrics.is_summary = true;
+        metrics.cumulative_usage = metrics.usage;
+        let lines = metric_lines(Some(&metrics));
+        assert_eq!(lines[0], "Время суммаризации: 11,13 с");
+        assert_eq!(lines[1], "Контекстное окно: 31 226 / неизвестно токенов");
+        assert_eq!(lines[2], "Выход последнего вызова: 2 223 токенов");
+        assert_eq!(
+            lines[3],
+            "API за весь диалог: 31 226 токенов · вход 29 003 токенов · выход 2 223 токенов"
+        );
+        metrics.calls[0].usage = None;
+        assert!(metric_lines(Some(&metrics))[1].contains("нет данных API"));
+    }
+
+    #[test]
+    fn displays_actual_final_prompt_without_reserves_or_other_calls() {
+        let report = crate::context::ContextReport {
+            limit: 200_000,
+            before: 12_179,
+            after: 12_179,
+            output_reserve: 10_000,
+            removed_messages: 0,
+        };
+        let mut metrics = ResponseMetrics::from_calls(
+            "main",
+            0,
+            vec![
+                CallUsage {
+                    model: "child".into(),
+                    context: None,
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 5000,
+                        ..TokenUsage::default()
+                    }),
+                },
+                CallUsage {
+                    model: "main".into(),
+                    context: Some(report),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 100,
+                        completion_tokens: 200,
+                        total_tokens: 300,
+                        cached_prompt_tokens: 50,
+                    }),
+                },
+            ],
+            &PriceCatalog::default(),
+        );
+        assert_eq!(
+            metric_lines(Some(&metrics))[1],
+            "Контекстное окно: 300 / неизвестно токенов"
+        );
+        metrics.calls[1].model = "deepseek-v4-flash".into();
+        assert_eq!(
+            metric_lines(Some(&metrics))[1],
+            "Контекстное окно: 300 / 1 000 000 токенов (0,0%)"
+        );
+        metrics.calls[1].usage = None;
+        assert_eq!(
+            metric_lines(Some(&metrics))[1],
+            "Контекстное окно: нет данных API"
+        );
+    }
+
+    #[test]
+    fn shows_context_decision_even_without_api_usage() {
+        let metrics = ResponseMetrics::from_calls(
+            "main",
+            0,
+            vec![CallUsage {
+                model: "main".into(),
+                usage: None,
+                context: Some(crate::context::ContextReport {
+                    limit: 2500,
+                    before: 3112,
+                    after: 2067,
+                    output_reserve: 1000,
+                    removed_messages: 2,
+                }),
+            }],
+            &PriceCatalog::default(),
+        );
+        let lines = metric_lines(Some(&metrics));
+        assert_eq!(lines[1], "Контекстное окно: нет данных API");
+        assert!(!lines.join("\n").contains("2 067"));
+        let restored: ResponseMetrics =
+            serde_json::from_str(&serde_json::to_string(&metrics).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(restored, metrics);
+    }
+
+    #[test]
+    fn loads_older_metrics() {
+        let metrics: ResponseMetrics = serde_json::from_str(
+            r#"{
+            "model":"main", "elapsed_ms":0, "usage":null,
+            "estimated_cost_microrubles":null, "premium":null
+        }"#,
+        )
+        .expect("legacy metrics");
+        assert_eq!(
+            metric_lines(Some(&metrics))[1],
+            "Контекстное окно: нет данных API"
+        );
+        assert_eq!(
+            metric_lines(Some(&metrics))[2],
+            "Выход последнего вызова: нет данных API"
+        );
+    }
 
     #[test]
     fn sums_cost_by_model_and_does_not_report_partial_totals() {
@@ -173,10 +384,12 @@ mod tests {
         };
         let calls = vec![
             CallUsage {
+                context: None,
                 model: "main".into(),
                 usage: Some(usage),
             },
             CallUsage {
+                context: None,
                 model: "child".into(),
                 usage: Some(usage),
             },
@@ -213,7 +426,13 @@ mod tests {
     fn displays_unavailable_metrics_without_guessing() {
         assert_eq!(
             metric_lines(None),
-            ["👉 Время ответа: —", "👉 Токены: —", "👉 Стоимость: —"]
+            [
+                "Время ответа: —",
+                "Контекстное окно: —",
+                "Выход последнего вызова: —",
+                "API за весь диалог: —",
+                "Стоимость: —"
+            ]
         );
     }
 }

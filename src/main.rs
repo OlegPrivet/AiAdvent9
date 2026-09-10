@@ -11,6 +11,7 @@ mod metrics;
 mod pricing;
 mod repl;
 mod settings;
+mod summary;
 #[cfg(test)]
 mod test_http;
 mod tui;
