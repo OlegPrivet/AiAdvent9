@@ -11,12 +11,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::context::{ContextStrategyKind, Facts, MAX_FACTS, validate_fact, validate_facts};
 use crate::metrics::ResponseMetrics;
 use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 4;
+const DATABASE_SCHEMA_VERSION: i64 = 5;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -67,6 +68,14 @@ pub(crate) struct Chat {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     summary: Option<crate::summary::ConversationSummary>,
+    #[serde(default)]
+    facts: Facts,
+    #[serde(default)]
+    branch_group_id: Option<Uuid>,
+    #[serde(default)]
+    branch_name: Option<String>,
+    #[serde(default)]
+    parent_checkpoint_id: Option<Uuid>,
     #[serde(skip)]
     persisted: bool,
     #[serde(skip)]
@@ -76,15 +85,20 @@ pub(crate) struct Chat {
 impl Chat {
     pub(crate) fn new() -> Self {
         let now = now_millis();
+        let id = Uuid::new_v4();
         Self {
             schema_version: LEGACY_CHAT_SCHEMA_VERSION,
-            id: Uuid::new_v4(),
+            id,
             title: "Новый чат".to_owned(),
             created_at_ms: now,
             updated_at_ms: now,
             settings: Settings::default(),
             messages: Vec::new(),
             summary: None,
+            facts: Facts::new(),
+            branch_group_id: Some(id),
+            branch_name: Some("main".to_owned()),
+            parent_checkpoint_id: None,
             persisted: false,
             dirty: false,
         }
@@ -114,6 +128,36 @@ impl Chat {
         &self.messages
     }
 
+    pub(crate) fn facts(&self) -> &Facts {
+        &self.facts
+    }
+
+    pub(crate) fn branch_group_id(&self) -> Uuid {
+        self.branch_group_id.unwrap_or(self.id)
+    }
+
+    pub(crate) fn branch_name(&self) -> &str {
+        self.branch_name.as_deref().unwrap_or("main")
+    }
+
+    pub(crate) fn set_fact(&mut self, key: String, value: String) -> Result<(), String> {
+        validate_fact(&key, &value)?;
+        if !self.facts.contains_key(&key) && self.facts.len() >= MAX_FACTS {
+            return Err(format!("Допускается не более {MAX_FACTS} фактов."));
+        }
+        self.facts.insert(key, value);
+        self.mark_changed();
+        Ok(())
+    }
+
+    pub(crate) fn delete_fact(&mut self, key: &str) -> bool {
+        let removed = self.facts.remove(key).is_some();
+        if removed {
+            self.mark_changed();
+        }
+        removed
+    }
+
     pub(crate) fn has_completed_turn(&self) -> bool {
         self.summary.is_some() || !self.messages.is_empty()
     }
@@ -131,11 +175,22 @@ impl Chat {
         self.record_exchange_with_metrics(question, answer, None);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_exchange_with_metrics(
         &mut self,
         question: String,
         answer: String,
+        metrics: Option<ResponseMetrics>,
+    ) {
+        self.record_exchange_with_context(question, answer, metrics, None);
+    }
+
+    pub(crate) fn record_exchange_with_context(
+        &mut self,
+        question: String,
+        answer: String,
         mut metrics: Option<ResponseMetrics>,
+        facts: Option<Facts>,
     ) {
         let had_previous_usage = self.has_completed_turn();
         let previous_usage = self.cumulative_api_usage();
@@ -165,7 +220,23 @@ impl Chat {
             content: answer,
             metrics,
         });
+        if let Some(facts) = facts {
+            debug_assert!(validate_facts(&facts).is_ok());
+            self.facts = facts;
+        }
+        self.prune_context_messages();
         self.mark_changed();
+    }
+
+    fn prune_context_messages(&mut self) {
+        let strategy = self.settings.context_strategy();
+        if strategy.kind == ContextStrategyKind::Branching
+            || self.messages.len() <= strategy.max_messages
+        {
+            return;
+        }
+        let remove = self.messages.len() - strategy.max_messages;
+        self.messages.drain(..remove);
     }
 
     pub(crate) fn last_response_metrics(&self) -> Option<&ResponseMetrics> {
@@ -255,6 +326,27 @@ pub(crate) struct ChatList {
     pub(crate) skipped_entries: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchInfo {
+    pub(crate) id: Uuid,
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckpointInfo {
+    pub(crate) id: Uuid,
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CheckpointSnapshot {
+    title: String,
+    settings: Settings,
+    messages: Vec<ChatMessage>,
+    summary: Option<crate::summary::ConversationSummary>,
+    facts: Facts,
+}
+
 #[derive(Debug)]
 pub(crate) struct ChatStore {
     connection: Connection,
@@ -302,6 +394,12 @@ pub(crate) enum ChatStoreError {
     InvalidConversation(Uuid),
     #[error("чат {0} содержит некорректную временную метку")]
     InvalidTimestamp(Uuid),
+    #[error("{0}")]
+    InvalidName(String),
+    #[error("checkpoint «{0}» не найден в текущей группе веток")]
+    CheckpointNotFound(String),
+    #[error("ветка «{0}» не найдена в текущей группе веток")]
+    BranchNotFound(String),
 }
 
 impl ChatStore {
@@ -344,7 +442,8 @@ impl ChatStore {
         let row = self
             .connection
             .query_row(
-                "SELECT title, created_at_ms, updated_at_ms, settings_json, summary_json
+                "SELECT title, created_at_ms, updated_at_ms, settings_json, summary_json,
+                        facts_json, branch_group_id, branch_name, parent_checkpoint_id
                  FROM chats WHERE id = ?1",
                 params![id.to_string()],
                 |row| {
@@ -354,12 +453,27 @@ impl ChatStore {
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
             .optional()
             .map_err(self.database_error("прочитать"))?;
-        let Some((title, created_at_ms, updated_at_ms, settings_json, summary_json)) = row else {
+        let Some((
+            title,
+            created_at_ms,
+            updated_at_ms,
+            settings_json,
+            summary_json,
+            facts_json,
+            branch_group_id,
+            branch_name,
+            parent_checkpoint_id,
+        )) = row
+        else {
             return Err(ChatStoreError::NotFound(id));
         };
         let settings = serde_json::from_str(&settings_json).map_err(|source| {
@@ -369,6 +483,24 @@ impl ChatStore {
                 source,
             }
         })?;
+        let facts: Facts =
+            serde_json::from_str(&facts_json).map_err(|source| ChatStoreError::SettingsJson {
+                action: "прочитать facts",
+                id,
+                source,
+            })?;
+        validate_facts(&facts).map_err(|_| ChatStoreError::InvalidConversation(id))?;
+        let branch_group_id = branch_group_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|_| ChatStoreError::InvalidConversation(id))?
+            .or(Some(id));
+        let parent_checkpoint_id = parent_checkpoint_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|_| ChatStoreError::InvalidConversation(id))?;
 
         let mut summary: Option<crate::summary::ConversationSummary> = summary_json
             .map(|text| serde_json::from_str(&text))
@@ -448,6 +580,10 @@ impl ChatStore {
             settings,
             messages,
             summary,
+            facts,
+            branch_group_id,
+            branch_name: branch_name.or_else(|| Some("main".to_owned())),
+            parent_checkpoint_id,
             persisted: false,
             dirty: false,
         };
@@ -495,6 +631,190 @@ impl ChatStore {
             chats,
             skipped_entries,
         })
+    }
+
+    pub(crate) fn create_checkpoint(
+        &self,
+        chat: &Chat,
+        name: &str,
+    ) -> Result<Uuid, ChatStoreError> {
+        validate_context_name(name, true).map_err(ChatStoreError::InvalidName)?;
+        if chat.settings.context_strategy().kind != ContextStrategyKind::Branching {
+            return Err(ChatStoreError::InvalidName(
+                "Checkpoint доступен только для стратегии Branching.".into(),
+            ));
+        }
+        if !chat.has_completed_turn() {
+            return Err(ChatStoreError::InvalidName(
+                "Checkpoint можно создать только после завершённого ответа.".into(),
+            ));
+        }
+        let snapshot = CheckpointSnapshot {
+            title: chat.title.clone(),
+            settings: chat.settings.clone(),
+            messages: chat.messages.clone(),
+            summary: chat.summary.clone(),
+            facts: chat.facts.clone(),
+        };
+        let snapshot_json =
+            serde_json::to_string(&snapshot).map_err(|source| ChatStoreError::SettingsJson {
+                action: "сохранить checkpoint",
+                id: chat.id,
+                source,
+            })?;
+        let id = Uuid::new_v4();
+        self.connection
+            .execute(
+                "INSERT INTO checkpoints(id, branch_group_id, name, source_chat_id,
+                                          created_at_ms, snapshot_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id.to_string(),
+                    chat.branch_group_id().to_string(),
+                    name,
+                    chat.id.to_string(),
+                    timestamp_for_database(id, now_millis())?,
+                    snapshot_json
+                ],
+            )
+            .map_err(|source| self.database_error_with_source("сохранить checkpoint", source))?;
+        Ok(id)
+    }
+
+    pub(crate) fn create_branch(
+        &self,
+        group_id: Uuid,
+        checkpoint_name: &str,
+        branch_name: &str,
+    ) -> Result<Chat, ChatStoreError> {
+        validate_context_name(checkpoint_name, true).map_err(ChatStoreError::InvalidName)?;
+        validate_context_name(branch_name, false).map_err(ChatStoreError::InvalidName)?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT id, snapshot_json FROM checkpoints
+                 WHERE branch_group_id = ?1 AND name = ?2 COLLATE NOCASE",
+                params![group_id.to_string(), checkpoint_name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(self.database_error("прочитать checkpoint"))?;
+        let Some((checkpoint_id, snapshot_json)) = row else {
+            return Err(ChatStoreError::CheckpointNotFound(checkpoint_name.into()));
+        };
+        let snapshot: CheckpointSnapshot =
+            serde_json::from_str(&snapshot_json).map_err(|source| {
+                ChatStoreError::SettingsJson {
+                    action: "прочитать checkpoint",
+                    id: group_id,
+                    source,
+                }
+            })?;
+        let id = Uuid::new_v4();
+        let now = now_millis();
+        let mut chat = Chat {
+            schema_version: LEGACY_CHAT_SCHEMA_VERSION,
+            id,
+            title: format!("{} · {}", snapshot.title, branch_name),
+            created_at_ms: now,
+            updated_at_ms: now,
+            settings: snapshot.settings,
+            messages: snapshot.messages,
+            summary: snapshot.summary,
+            facts: snapshot.facts,
+            branch_group_id: Some(group_id),
+            branch_name: Some(branch_name.to_owned()),
+            parent_checkpoint_id: Some(
+                Uuid::parse_str(&checkpoint_id)
+                    .map_err(|_| ChatStoreError::InvalidConversation(group_id))?,
+            ),
+            persisted: false,
+            dirty: true,
+        };
+        self.save(&mut chat)?;
+        Ok(chat)
+    }
+
+    pub(crate) fn branches(&self, group_id: Uuid) -> Result<Vec<BranchInfo>, ChatStoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, branch_name FROM chats
+                 WHERE branch_group_id = ?1 ORDER BY created_at_ms, branch_name COLLATE NOCASE",
+            )
+            .map_err(|source| {
+                self.database_error_with_source("подготовить список веток", source)
+            })?;
+        let rows = statement
+            .query_map(params![group_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| self.database_error_with_source("прочитать ветки", source))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, name) =
+                row.map_err(|source| self.database_error_with_source("прочитать ветку", source))?;
+            let id =
+                Uuid::parse_str(&id).map_err(|_| ChatStoreError::InvalidConversation(group_id))?;
+            result.push(BranchInfo { id, name });
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn checkpoints(
+        &self,
+        group_id: Uuid,
+    ) -> Result<Vec<CheckpointInfo>, ChatStoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, name FROM checkpoints
+                 WHERE branch_group_id = ?1 ORDER BY created_at_ms, name COLLATE NOCASE",
+            )
+            .map_err(|source| {
+                self.database_error_with_source("подготовить список checkpoints", source)
+            })?;
+        let rows = statement
+            .query_map(params![group_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| self.database_error_with_source("прочитать checkpoints", source))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, name) = row.map_err(|source| {
+                self.database_error_with_source("прочитать checkpoint", source)
+            })?;
+            let id =
+                Uuid::parse_str(&id).map_err(|_| ChatStoreError::InvalidConversation(group_id))?;
+            result.push(CheckpointInfo { id, name });
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn load_branch(
+        &self,
+        group_id: Uuid,
+        name_or_id: &str,
+    ) -> Result<Chat, ChatStoreError> {
+        if let Ok(id) = Uuid::parse_str(name_or_id) {
+            let chat = self.load(id)?;
+            return (chat.branch_group_id() == group_id)
+                .then_some(chat)
+                .ok_or_else(|| ChatStoreError::BranchNotFound(name_or_id.into()));
+        }
+        let id = self
+            .connection
+            .query_row(
+                "SELECT id FROM chats
+                 WHERE branch_group_id = ?1 AND branch_name = ?2 COLLATE NOCASE",
+                params![group_id.to_string(), name_or_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(self.database_error("найти ветку"))?
+            .ok_or_else(|| ChatStoreError::BranchNotFound(name_or_id.into()))?;
+        let id = Uuid::parse_str(&id).map_err(|_| ChatStoreError::InvalidConversation(group_id))?;
+        self.load(id)
     }
 
     pub(crate) fn replace_with_summary(
@@ -640,25 +960,59 @@ fn write_chat(
             id: chat.id,
             source,
         })?;
+    let facts_json =
+        serde_json::to_string(&chat.facts).map_err(|source| ChatStoreError::SettingsJson {
+            action: "сохранить facts",
+            id: chat.id,
+            source,
+        })?;
     let created_at_ms = timestamp_for_database(chat.id, chat.created_at_ms)?;
     let updated_at_ms = timestamp_for_database(chat.id, chat.updated_at_ms)?;
     let id = chat.id.to_string();
 
     let changed = match mode {
         WriteMode::Replace => transaction.execute(
-            "INSERT INTO chats(id, title, created_at_ms, updated_at_ms, settings_json, summary_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO chats(id, title, created_at_ms, updated_at_ms, settings_json, summary_json,
+                               facts_json, branch_group_id, branch_name, parent_checkpoint_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET
                  title = excluded.title,
                  created_at_ms = excluded.created_at_ms,
                  updated_at_ms = excluded.updated_at_ms,
-                 settings_json = excluded.settings_json, summary_json = excluded.summary_json",
-            params![id, chat.title, created_at_ms, updated_at_ms, settings_json, summary_json],
+                 settings_json = excluded.settings_json, summary_json = excluded.summary_json,
+                 facts_json = excluded.facts_json, branch_group_id = excluded.branch_group_id,
+                 branch_name = excluded.branch_name,
+                 parent_checkpoint_id = excluded.parent_checkpoint_id",
+            params![
+                id,
+                chat.title,
+                created_at_ms,
+                updated_at_ms,
+                settings_json,
+                summary_json,
+                facts_json,
+                chat.branch_group_id().to_string(),
+                chat.branch_name(),
+                chat.parent_checkpoint_id.map(|value| value.to_string())
+            ],
         ),
         WriteMode::IgnoreExisting => transaction.execute(
-            "INSERT OR IGNORE INTO chats(id, title, created_at_ms, updated_at_ms, settings_json, summary_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, chat.title, created_at_ms, updated_at_ms, settings_json, summary_json],
+            "INSERT OR IGNORE INTO chats(id, title, created_at_ms, updated_at_ms, settings_json,
+                                         summary_json, facts_json, branch_group_id, branch_name,
+                                         parent_checkpoint_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                id,
+                chat.title,
+                created_at_ms,
+                updated_at_ms,
+                settings_json,
+                summary_json,
+                facts_json,
+                chat.branch_group_id().to_string(),
+                chat.branch_name(),
+                chat.parent_checkpoint_id.map(|value| value.to_string())
+            ],
         ),
     }
     .map_err(|source| database_error("записать чат", database_path, source))?;
@@ -749,7 +1103,7 @@ fn initialize_database(
                  COMMIT;",
             )
             .map_err(|source| database_error("обновить схему", database_path, source)),
-        2..=4 => Ok(()),
+        2..=5 => Ok(()),
         value => Err(ChatStoreError::UnsupportedSchema(value)),
     }?;
     if version < 3 {
@@ -770,9 +1124,37 @@ fn initialize_database(
             )
             .map_err(|source| database_error("добавить каталог агентов", database_path, source))?;
     }
-    if version < DATABASE_SCHEMA_VERSION {
+    if version < 4 {
         connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE chats ADD COLUMN summary_json TEXT; PRAGMA user_version = 4; COMMIT;")
             .map_err(|source| database_error("добавить резюме", database_path, source))?;
+    }
+    if version < DATABASE_SCHEMA_VERSION {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE chats ADD COLUMN facts_json TEXT NOT NULL DEFAULT '{}';
+                 ALTER TABLE chats ADD COLUMN branch_group_id TEXT;
+                 ALTER TABLE chats ADD COLUMN branch_name TEXT;
+                 ALTER TABLE chats ADD COLUMN parent_checkpoint_id TEXT;
+                 UPDATE chats SET branch_group_id = id, branch_name = 'main'
+                   WHERE branch_group_id IS NULL OR branch_name IS NULL;
+                 CREATE UNIQUE INDEX IF NOT EXISTS chats_branch_name
+                   ON chats(branch_group_id, branch_name COLLATE NOCASE);
+                 CREATE TABLE IF NOT EXISTS checkpoints (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     branch_group_id TEXT NOT NULL,
+                     name TEXT NOT NULL COLLATE NOCASE,
+                     source_chat_id TEXT NOT NULL,
+                     created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+                     snapshot_json TEXT NOT NULL,
+                     UNIQUE(branch_group_id, name)
+                 );
+                 PRAGMA user_version = 5;
+                 COMMIT;",
+            )
+            .map_err(|source| {
+                database_error("добавить стратегии контекста", database_path, source)
+            })?;
     }
     Ok(())
 }
@@ -805,6 +1187,20 @@ fn valid_messages(messages: &[ChatMessage]) -> bool {
                 && pair[0].metrics.is_none()
                 && pair[1].role == MessageRole::Assistant
         })
+}
+
+fn validate_context_name(name: &str, allow_main: bool) -> Result<(), String> {
+    let valid = (1..=32).contains(&name.len())
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || byte == b'_' || (byte == b'-' && index > 0)
+        });
+    if !valid {
+        return Err("Имя должно содержать 1–32 ASCII-символа: буквы, цифры, '_' или '-'.".into());
+    }
+    if !allow_main && name.eq_ignore_ascii_case("main") {
+        return Err("Имя ветки main зарезервировано.".into());
+    }
+    Ok(())
 }
 
 fn title_from_question(question: &str) -> String {
@@ -929,7 +1325,16 @@ mod tests {
         store.save(&mut chat).expect("save");
         store
             .connection
-            .execute_batch("ALTER TABLE chats DROP COLUMN summary_json; PRAGMA user_version = 3;")
+            .execute_batch(
+                "DROP TABLE checkpoints;
+                 DROP INDEX chats_branch_name;
+                 ALTER TABLE chats DROP COLUMN parent_checkpoint_id;
+                 ALTER TABLE chats DROP COLUMN branch_name;
+                 ALTER TABLE chats DROP COLUMN branch_group_id;
+                 ALTER TABLE chats DROP COLUMN facts_json;
+                 ALTER TABLE chats DROP COLUMN summary_json;
+                 PRAGMA user_version = 3;",
+            )
             .expect("v3 fixture");
         drop(store);
         let migrated = ChatStore::for_tests(directory.0.clone()).expect("migrate");
@@ -942,7 +1347,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            4
+            DATABASE_SCHEMA_VERSION
         );
     }
 
@@ -1185,7 +1590,17 @@ mod tests {
         store.save(&mut chat).expect("save");
         store
             .connection
-            .execute_batch("DROP TABLE agents; ALTER TABLE chats DROP COLUMN summary_json; PRAGMA user_version = 2;")
+            .execute_batch(
+                "DROP TABLE agents;
+                 DROP TABLE checkpoints;
+                 DROP INDEX chats_branch_name;
+                 ALTER TABLE chats DROP COLUMN parent_checkpoint_id;
+                 ALTER TABLE chats DROP COLUMN branch_name;
+                 ALTER TABLE chats DROP COLUMN branch_group_id;
+                 ALTER TABLE chats DROP COLUMN facts_json;
+                 ALTER TABLE chats DROP COLUMN summary_json;
+                 PRAGMA user_version = 2;",
+            )
             .expect("v2 fixture");
         drop(store);
         let migrated = ChatStore::for_tests(directory.0.clone()).expect("migrate");
@@ -1342,6 +1757,102 @@ mod tests {
 
         assert_eq!(title.chars().count(), MAX_TITLE_CHARS);
         assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn sliding_window_discards_old_exchanges() {
+        let mut chat = Chat::new();
+        chat.settings_mut().set_context_window("2").expect("window");
+        for index in 1..=3 {
+            chat.record_exchange(format!("Вопрос {index}"), format!("Ответ {index}"));
+        }
+        assert_eq!(chat.messages().len(), 2);
+        assert_eq!(chat.messages()[0].content, "Вопрос 3");
+        assert_eq!(chat.messages()[1].content, "Ответ 3");
+    }
+
+    #[test]
+    fn sticky_facts_and_window_are_persisted() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut chat = Chat::new();
+        chat.settings_mut()
+            .select_context_strategy(ContextStrategyKind::StickyFacts);
+        chat.settings_mut().set_context_window("2").expect("window");
+        chat.set_fact("goal".into(), "Собрать CLI".into())
+            .expect("fact");
+        chat.record_exchange("Первый".into(), "Один".into());
+        chat.record_exchange("Второй".into(), "Два".into());
+        store.save(&mut chat).expect("save");
+        let restored = store.load(chat.id()).expect("load");
+        assert_eq!(
+            restored.facts().get("goal").map(String::as_str),
+            Some("Собрать CLI")
+        );
+        assert_eq!(restored.messages().len(), 2);
+        assert_eq!(restored.messages()[0].content, "Второй");
+    }
+
+    #[test]
+    fn creates_independent_branches_from_one_checkpoint() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut main = Chat::new();
+        main.settings_mut()
+            .select_context_strategy(ContextStrategyKind::Branching);
+        main.record_exchange("Основа".into(), "Принято".into());
+        store.save(&mut main).expect("save main");
+        store.create_checkpoint(&main, "base").expect("checkpoint");
+
+        let mut first = store
+            .create_branch(main.branch_group_id(), "base", "first")
+            .expect("first branch");
+        first.record_exchange("Путь A".into(), "Ответ A".into());
+        store.save(&mut first).expect("save first");
+        let mut second = store
+            .create_branch(main.branch_group_id(), "base", "second")
+            .expect("second branch");
+        second.record_exchange("Путь B".into(), "Ответ B".into());
+        store.save(&mut second).expect("save second");
+
+        let first = store
+            .load_branch(main.branch_group_id(), "first")
+            .expect("load first");
+        let second = store
+            .load_branch(main.branch_group_id(), "second")
+            .expect("load second");
+        assert!(
+            first
+                .messages()
+                .iter()
+                .any(|message| message.content == "Путь A")
+        );
+        assert!(
+            !first
+                .messages()
+                .iter()
+                .any(|message| message.content == "Путь B")
+        );
+        assert!(
+            second
+                .messages()
+                .iter()
+                .any(|message| message.content == "Путь B")
+        );
+        assert_eq!(
+            store
+                .branches(main.branch_group_id())
+                .expect("branches")
+                .len(),
+            3
+        );
+        assert_eq!(
+            store
+                .checkpoints(main.branch_group_id())
+                .expect("checkpoints")
+                .len(),
+            1
+        );
     }
 
     #[test]

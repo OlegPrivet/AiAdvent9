@@ -27,6 +27,7 @@ use crate::agent::{Agent, AgentAnswer, AgentError, AgentEvent, AgentRequest};
 use crate::agents_ui::{AgentManager, AgentPage};
 use crate::chat::{Chat, ChatStore, ChatSummary, MessageRole};
 use crate::cli::EditMode;
+use crate::context::ContextStrategyKind;
 use crate::input::CommandHistory;
 use crate::metrics::{ResponseMetrics, format_duration, metric_lines};
 use crate::pricing::PriceCatalog;
@@ -58,6 +59,9 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     CommandOption::run("/help", "показать справку", &["/помощь"]),
     CommandOption::run("/exit", "сохранить чат и выйти", &["/quit", "/выход"]),
     CommandOption::run("/agents", "глобальный каталог агентов", &["/агенты"]),
+    CommandOption::run("/facts", "память Sticky Facts", &["/факты"]),
+    CommandOption::run("/checkpoint", "сохранить точку ветвления", &["/чекпоинт"]),
+    CommandOption::run("/branch", "управление ветками", &["/ветка"]),
 ];
 
 #[derive(Clone, Copy)]
@@ -252,36 +256,30 @@ fn spawn_request(
         let delta_tx = worker_tx.clone();
         let result = match request {
             Err(error) => Err(AgentError::from(error)),
-            Ok(mut request) => {
+            Ok(request) => {
                 async {
-                    let mut summary_metrics = None;
-                    if let Some(target) = crate::summary::prepare(&request, manual)? {
-                        let _ = worker_tx.send(WorkerEvent::SummaryStarted(request_id));
-                        let summary = client.summarize(&request, target).await?;
-                        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                        worker_tx
-                            .send(WorkerEvent::SummaryReady(
-                                request_id,
-                                summary.clone(),
-                                ack_tx,
-                            ))
-                            .map_err(|_| AgentError::InvalidRequest("TUI закрыт".into()))?;
-                        ack_rx
-                            .await
-                            .map_err(|_| {
-                                AgentError::InvalidRequest("Суммаризация отменена".into())
-                            })?
-                            .map_err(AgentError::InvalidRequest)?;
-                        summary_metrics = Some(summary.metrics.clone());
-                        crate::summary::apply(&mut request, summary);
-                    }
                     if manual {
+                        if let Some(target) = crate::summary::prepare(&request, true)? {
+                            let _ = worker_tx.send(WorkerEvent::SummaryStarted(request_id));
+                            let summary = client.summarize(&request, target).await?;
+                            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                            worker_tx
+                                .send(WorkerEvent::SummaryReady(request_id, summary, ack_tx))
+                                .map_err(|_| AgentError::InvalidRequest("TUI закрыт".into()))?;
+                            ack_rx
+                                .await
+                                .map_err(|_| {
+                                    AgentError::InvalidRequest("Суммаризация отменена".into())
+                                })?
+                                .map_err(AgentError::InvalidRequest)?;
+                        }
                         return Ok(AgentAnswer {
                             content: String::new(),
                             truncated: false,
                             elapsed_ms: 0,
                             calls: Vec::new(),
                             already_counted_usage: None,
+                            updated_facts: None,
                         });
                     }
                     let mut pending_delta = String::new();
@@ -323,15 +321,7 @@ fn spawn_request(
                             AgentEvent::MainDelta(pending_delta),
                         )?;
                     }
-                    let mut answer = answer?;
-                    if let Some(metrics) = summary_metrics {
-                        answer.already_counted_usage = metrics.usage;
-                        let mut calls = metrics.calls;
-                        calls.append(&mut answer.calls);
-                        answer.calls = calls;
-                        answer.elapsed_ms = answer.elapsed_ms.saturating_add(metrics.elapsed_ms);
-                    }
-                    Ok(answer)
+                    answer
                 }
                 .await
             }
@@ -1067,6 +1057,12 @@ impl<'a> App<'a> {
                 }
                 Err(error) => self.notice = Some(error.to_string()),
             }
+        } else if command.matches(&["/facts", "/факты"]) {
+            self.handle_facts(command.argument);
+        } else if command.matches(&["/checkpoint", "/чекпоинт"]) {
+            self.handle_checkpoint(command.argument);
+        } else if command.matches(&["/branch", "/ветка"]) {
+            self.handle_branch(command.argument);
         } else if command.matches(&["/restore", "/восстановить"]) {
             match command
                 .argument
@@ -1081,6 +1077,190 @@ impl<'a> App<'a> {
                 command.name
             ));
         }
+    }
+
+    fn handle_facts(&mut self, argument: Option<&str>) {
+        if self.chat.settings().context_strategy().kind != ContextStrategyKind::StickyFacts {
+            self.notice = Some("Facts доступны только для стратегии Sticky Facts.".into());
+            return;
+        }
+        match argument {
+            None => {
+                let content = if self.chat.facts().is_empty() {
+                    "Facts пока пусты.".into()
+                } else {
+                    self.chat
+                        .facts()
+                        .iter()
+                        .map(|(key, value)| format!("{key} = {value}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.modal = Some(Modal::Message {
+                    title: "Sticky Facts".into(),
+                    content,
+                });
+            }
+            Some(argument) if argument.starts_with("set ") => {
+                let Some((key, value)) = argument[4..].trim().split_once(char::is_whitespace)
+                else {
+                    self.notice = Some("Использование: /facts set <ключ> <значение>".into());
+                    return;
+                };
+                self.notice = match self.chat.set_fact(key.into(), value.trim().into()) {
+                    Ok(()) => self.store.save(self.chat).err().map_or_else(
+                        || Some(format!("Fact {key} сохранён.")),
+                        |error| Some(error.to_string()),
+                    ),
+                    Err(error) => Some(format!("Fact не изменён: {error}")),
+                };
+            }
+            Some(argument) if argument.starts_with("delete ") => {
+                let key = argument[7..].trim();
+                self.notice = if self.chat.delete_fact(key) {
+                    self.store.save(self.chat).err().map_or_else(
+                        || Some(format!("Fact {key} удалён.")),
+                        |error| Some(error.to_string()),
+                    )
+                } else {
+                    Some(format!("Fact {key} не найден."))
+                };
+            }
+            _ => {
+                self.notice = Some(
+                    "Использование: /facts | /facts set <ключ> <значение> | /facts delete <ключ>"
+                        .into(),
+                );
+            }
+        }
+    }
+
+    fn handle_checkpoint(&mut self, name: Option<&str>) {
+        let Some(name) = name else {
+            self.notice = Some("Использование: /checkpoint <имя>".into());
+            return;
+        };
+        if self.chat.is_dirty()
+            && let Err(error) = self.store.save(self.chat)
+        {
+            self.notice = Some(format!("Checkpoint не создан: {error}"));
+            return;
+        }
+        self.notice = Some(match self.store.create_checkpoint(self.chat, name) {
+            Ok(id) => format!("Checkpoint {name} сохранён [{id}]."),
+            Err(error) => format!("Checkpoint не создан: {error}"),
+        });
+    }
+
+    fn handle_branch(&mut self, argument: Option<&str>) {
+        if self.chat.settings().context_strategy().kind != ContextStrategyKind::Branching {
+            self.notice = Some("Ветки доступны только для стратегии Branching.".into());
+            return;
+        }
+        let Some(argument) = argument else {
+            self.notice = Some(
+                "Использование: /branch list | create <checkpoint> <ветка> | switch <ветка|UUID>"
+                    .into(),
+            );
+            return;
+        };
+        if argument.eq_ignore_ascii_case("list") {
+            let result = self
+                .store
+                .branches(self.chat.branch_group_id())
+                .and_then(|branches| {
+                    self.store
+                        .checkpoints(self.chat.branch_group_id())
+                        .map(|checkpoints| {
+                            let branches = branches
+                                .into_iter()
+                                .map(|branch| {
+                                    format!(
+                                        "{} [{}]{}",
+                                        branch.name,
+                                        branch.id,
+                                        if branch.id == self.chat.id() {
+                                            " *"
+                                        } else {
+                                            ""
+                                        }
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let checkpoints = checkpoints
+                                .into_iter()
+                                .map(|checkpoint| {
+                                    format!("{} [{}]", checkpoint.name, checkpoint.id)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            format!("Ветки:\n{branches}\n\nCheckpoints:\n{checkpoints}")
+                        })
+                });
+            match result {
+                Ok(content) => {
+                    self.modal = Some(Modal::Message {
+                        title: "Ветки диалога".into(),
+                        content,
+                    });
+                }
+                Err(error) => self.notice = Some(error.to_string()),
+            }
+            return;
+        }
+        if let Some(arguments) = argument.strip_prefix("create ") {
+            let mut parts = arguments.split_whitespace();
+            let (Some(checkpoint), Some(branch), None) = (parts.next(), parts.next(), parts.next())
+            else {
+                self.notice = Some("Использование: /branch create <checkpoint> <ветка>".into());
+                return;
+            };
+            if self.chat.is_dirty()
+                && let Err(error) = self.store.save(self.chat)
+            {
+                self.notice = Some(format!("Ветка не создана: {error}"));
+                return;
+            }
+            match self
+                .store
+                .create_branch(self.chat.branch_group_id(), checkpoint, branch)
+            {
+                Ok(created) => {
+                    *self.chat = created;
+                    self.agent_events.clear();
+                    self.visible_from = 0;
+                    self.notice = Some(format!("Открыта ветка {branch}."));
+                }
+                Err(error) => self.notice = Some(format!("Ветка не создана: {error}")),
+            }
+            return;
+        }
+        if let Some(name) = argument.strip_prefix("switch ") {
+            match self
+                .store
+                .load_branch(self.chat.branch_group_id(), name.trim())
+            {
+                Ok(restored) => {
+                    if self.chat.is_dirty()
+                        && let Err(error) = self.store.save(self.chat)
+                    {
+                        self.notice = Some(format!("Переключение отменено: {error}"));
+                        return;
+                    }
+                    *self.chat = restored;
+                    self.agent_events.clear();
+                    self.visible_from = 0;
+                    self.notice = Some(format!("Открыта ветка {}.", self.chat.branch_name()));
+                }
+                Err(error) => self.notice = Some(format!("Переключение отменено: {error}")),
+            }
+            return;
+        }
+        self.notice = Some(
+            "Использование: /branch list | create <checkpoint> <ветка> | switch <ветка|UUID>"
+                .into(),
+        );
     }
 
     fn handle_worker_event(&mut self, event: WorkerEvent) {
@@ -1148,10 +1328,11 @@ impl<'a> App<'a> {
                             &self.prices,
                         );
                         metrics.already_counted_usage = answer.already_counted_usage;
-                        self.chat.record_exchange_with_metrics(
+                        self.chat.record_exchange_with_context(
                             question,
                             answer.content,
                             Some(metrics),
+                            answer.updated_facts,
                         );
                         self.streamed_answer.clear();
                         self.transient_metrics = None;
@@ -1290,6 +1471,11 @@ impl<'a> App<'a> {
                     return;
                 }
             }
+            Modal::Message { .. } => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                    return;
+                }
+            }
             Modal::List {
                 selected,
                 items,
@@ -1389,6 +1575,31 @@ impl<'a> App<'a> {
                         kind: ListKind::SystemPrompt,
                     });
                 }
+                6 => {
+                    self.modal = Some(Modal::List {
+                        title: "Стратегия контекста".to_owned(),
+                        items: vec![
+                            "Sliding Window".to_owned(),
+                            "Sticky Facts / Key-Value Memory".to_owned(),
+                            "Branching".to_owned(),
+                        ],
+                        selected: match self.chat.settings().context_strategy().kind {
+                            ContextStrategyKind::SlidingWindow => 0,
+                            ContextStrategyKind::StickyFacts => 1,
+                            ContextStrategyKind::Branching => 2,
+                        },
+                        kind: ListKind::ContextStrategies,
+                    });
+                }
+                7 => self.open_text_modal(
+                    "Окно: чётное число 2–200 · Enter: сохранить",
+                    TextKind::ContextWindow,
+                    self.chat
+                        .settings()
+                        .context_strategy()
+                        .max_messages
+                        .to_string(),
+                ),
                 _ => self.open_settings(),
             },
             ListKind::Models => {
@@ -1437,6 +1648,26 @@ impl<'a> App<'a> {
                 }
                 _ => self.open_settings(),
             },
+            ListKind::ContextStrategies => {
+                if self.chat.has_completed_turn() {
+                    self.notice =
+                        Some("Стратегию можно менять только до первого ответа.".to_owned());
+                } else {
+                    let kind = match selected {
+                        0 => ContextStrategyKind::SlidingWindow,
+                        1 => ContextStrategyKind::StickyFacts,
+                        2 => ContextStrategyKind::Branching,
+                        _ => {
+                            self.open_settings();
+                            return;
+                        }
+                    };
+                    if self.chat.settings_mut().select_context_strategy(kind) {
+                        self.settings_changed();
+                    }
+                }
+                self.open_settings();
+            }
             ListKind::Chats(chats) => {
                 if let Some(summary) = chats.get(selected) {
                     self.switch_chat(summary.id);
@@ -1469,6 +1700,13 @@ impl<'a> App<'a> {
                 self.chat.settings_mut().set_completion_instruction(value)
             }
             TextKind::SystemPrompt => self.chat.settings_mut().set_system_prompt(value),
+            TextKind::ContextWindow => {
+                if self.chat.has_completed_turn() {
+                    Err("Размер окна можно менять только до первого ответа.".to_owned())
+                } else {
+                    self.chat.settings_mut().set_context_window(value.trim())
+                }
+            }
         }
     }
 
@@ -1554,6 +1792,7 @@ enum ListKind {
     Structured,
     Completion,
     SystemPrompt,
+    ContextStrategies,
     Chats(Vec<ChatSummary>),
 }
 
@@ -1564,6 +1803,7 @@ enum TextKind {
     StopSequence,
     CompletionInstruction,
     SystemPrompt,
+    ContextWindow,
 }
 
 impl TextKind {
@@ -1800,6 +2040,10 @@ fn submits_text_field(key: KeyEvent, multiline: bool) -> bool {
 enum Modal {
     Agents(Box<AgentsModal>),
     Help,
+    Message {
+        title: String,
+        content: String,
+    },
     List {
         title: String,
         items: Vec<String>,
@@ -1824,6 +2068,9 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/restore <UUID>          восстановить чат",
                 "/settings, /настройки   настройки текущего чата",
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
+                "/facts ...              память Sticky Facts",
+                "/checkpoint <имя>       сохранить точку ветвления",
+                "/branch ...             создать, показать или открыть ветку",
                 "/summarize, /суммаризация заменить историю резюме",
                 "/clear, /очистить        начать новый чат без старого контекста",
                 "/exit, /выход            завершить работу",
@@ -1840,6 +2087,16 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
             ];
             let paragraph = Paragraph::new(help.join("\n"))
                 .block(Block::default().borders(Borders::ALL).title(" Справка "))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, area);
+        }
+        Modal::Message { title, content } => {
+            let paragraph = Paragraph::new(content.as_str())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" {title} · Esc/Enter: закрыть ")),
+                )
                 .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, area);
         }
@@ -2063,7 +2320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_worker_waits_for_persistence_and_ignores_cancelled_results() {
+    async fn manual_summary_worker_waits_for_persistence_and_ignores_cancelled_results() {
         let server = crate::test_http::MockServer::new(|request| {
             crate::test_http::text_response(
                 if request["messages"][0]["content"]
@@ -2105,7 +2362,7 @@ mod tests {
             EditMode::Emacs,
             CommandHistory::default(),
         );
-        let question = app.begin_question("Продолжи".into()).expect("question");
+        let question = app.begin_question("/summarize".into()).expect("question");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let _task = spawn_request(&client, &store, app.chat, question, app.request_id, tx);
         let ready = loop {
@@ -2142,7 +2399,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(server.requests().len(), summary_calls + 1);
+        assert_eq!(server.requests().len(), summary_calls);
         assert!(app.transcript_markdown().contains("Резюме диалога"));
         assert!(!app.transcript_markdown().contains("Старый ответ"));
         let summary = app.chat.summary().expect("summary").clone();
@@ -2154,7 +2411,7 @@ mod tests {
         assert!(ack_rx.await.is_err());
         assert_eq!(
             app.chat.messages().len(),
-            2,
+            0,
             "stale result must not replace new messages"
         );
     }
@@ -2426,6 +2683,7 @@ mod tests {
                     usage: Some(TokenUsage::default()),
                 }],
                 already_counted_usage: None,
+                updated_facts: None,
             }),
         ));
         let trace = app.transcript_markdown();

@@ -3,6 +3,7 @@ use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::{ContextStrategy, ContextStrategyKind};
 use crate::input::LineInput;
 
 const DEFAULT_MAX_TOKENS: u32 = 10000;
@@ -96,6 +97,8 @@ pub(crate) struct Settings {
     temperature: f32,
     completion_condition: CompletionCondition,
     system_prompt: Option<String>,
+    #[serde(default = "ContextStrategy::legacy_branching")]
+    context_strategy: ContextStrategy,
 }
 
 impl Default for Settings {
@@ -109,6 +112,7 @@ impl Default for Settings {
             temperature: DEFAULT_TEMPERATURE,
             completion_condition: CompletionCondition::None,
             system_prompt: None,
+            context_strategy: ContextStrategy::sliding_default(),
         }
     }
 }
@@ -166,6 +170,31 @@ impl Settings {
         self.system_prompt.as_deref()
     }
 
+    pub(crate) fn context_strategy(&self) -> &ContextStrategy {
+        &self.context_strategy
+    }
+
+    pub(crate) fn select_context_strategy(&mut self, kind: ContextStrategyKind) -> bool {
+        if self.context_strategy.kind == kind {
+            return false;
+        }
+        self.context_strategy.kind = kind;
+        true
+    }
+
+    pub(crate) fn replace_context_strategy(&mut self, strategy: ContextStrategy) {
+        self.context_strategy = strategy;
+    }
+
+    pub(crate) fn set_context_window(&mut self, value: &str) -> Result<(), String> {
+        let value = value
+            .parse::<usize>()
+            .map_err(|_| "Размер окна должен быть целым числом.".to_owned())?;
+        ContextStrategy::validate_window(value)?;
+        self.context_strategy.max_messages = value;
+        Ok(())
+    }
+
     pub(crate) fn effective_system_prompt(&self) -> Option<String> {
         let mut prompt = self.system_prompt.clone();
         if let Some(instruction) = self.completion_instruction() {
@@ -203,6 +232,11 @@ impl Settings {
                 } else {
                     "не задан"
                 }
+            ),
+            format!("Стратегия контекста: {}", self.context_strategy.kind),
+            format!(
+                "Окно истории: {} сообщений",
+                self.context_strategy.max_messages
             ),
         ]
     }
@@ -335,6 +369,8 @@ impl Settings {
                 3 => self.configure_temperature(input, output)?,
                 4 => self.configure_completion(input, output)?,
                 5 => self.configure_system_prompt(input, output)?,
+                6 => self.configure_context_strategy(input)?,
+                7 => self.configure_context_window(input, output)?,
                 _ => {}
             }
         }
@@ -557,6 +593,45 @@ impl Settings {
         }
         Ok(())
     }
+
+    fn configure_context_strategy<I: LineInput>(&mut self, input: &mut I) -> io::Result<()> {
+        let items = vec![
+            "Sliding Window".to_owned(),
+            "Sticky Facts / Key-Value Memory".to_owned(),
+            "Branching".to_owned(),
+        ];
+        let Some(choice) = input.select("Стратегия контекста — Esc: назад", &items)?
+        else {
+            return Ok(());
+        };
+        let kind = match choice {
+            0 => ContextStrategyKind::SlidingWindow,
+            1 => ContextStrategyKind::StickyFacts,
+            2 => ContextStrategyKind::Branching,
+            _ => return Ok(()),
+        };
+        self.select_context_strategy(kind);
+        Ok(())
+    }
+
+    fn configure_context_window<I: LineInput, W: Write>(
+        &mut self,
+        input: &mut I,
+        output: &mut W,
+    ) -> io::Result<()> {
+        let Some(value) = input
+            .read_line("Чётное количество сообщений в окне (2–200; пустая строка — отмена): ")?
+        else {
+            return Ok(());
+        };
+        if value.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) = self.set_context_window(&value) {
+            writeln!(output, "Значение не изменено: {error}")?;
+        }
+        Ok(())
+    }
 }
 
 fn terminal_safe(value: &str) -> String {
@@ -619,6 +694,10 @@ mod tests {
         assert_eq!(settings.completion_instruction(), None);
         assert_eq!(settings.system_prompt(), None);
         assert_eq!(settings.effective_system_prompt(), None);
+        assert_eq!(
+            settings.context_strategy(),
+            &ContextStrategy::sliding_default()
+        );
     }
 
     #[test]
@@ -822,6 +901,26 @@ mod tests {
         assert_eq!(settings.model(), DEFAULT_MODEL);
         assert_eq!(settings.max_tokens(), 900);
         assert_eq!(settings.temperature(), DEFAULT_TEMPERATURE);
+    }
+
+    #[test]
+    fn legacy_settings_preserve_full_history_with_branching() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"model":"gpt-oss-20b"}"#).expect("legacy settings");
+        assert_eq!(
+            settings.context_strategy().kind,
+            ContextStrategyKind::Branching
+        );
+    }
+
+    #[test]
+    fn validates_even_context_window() {
+        let mut settings = Settings::default();
+        assert!(settings.set_context_window("2").is_ok());
+        assert!(settings.set_context_window("200").is_ok());
+        for invalid in ["0", "3", "202", "text"] {
+            assert!(settings.set_context_window(invalid).is_err());
+        }
     }
 
     #[test]

@@ -522,3 +522,78 @@ async fn invalid_mentions_and_unsupported_main_model_fail_before_network() {
     assert!(error.to_string().contains("/settings"));
     assert!(server.requests().is_empty());
 }
+
+#[tokio::test]
+async fn sticky_facts_are_updated_before_main_request_and_returned_for_commit() {
+    let server = MockServer::new(|request| {
+        if request["stream"] == false {
+            (
+                200,
+                json!({
+                    "choices":[{"message":{"content":"{\"facts\":[{\"key\":\"goal\",\"value\":\"Собрать CLI\"}]}"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}
+                })
+                .to_string(),
+            )
+        } else {
+            text_response("Готово")
+        }
+    });
+    let mut request = request("Запомни цель: собрать CLI", vec![]);
+    request
+        .settings
+        .select_context_strategy(ContextStrategyKind::StickyFacts);
+    let answer = runner(&server)
+        .respond_streaming(request, |_| Ok(()))
+        .await
+        .expect("answer");
+    assert_eq!(answer.calls.len(), 2);
+    assert_eq!(
+        answer
+            .updated_facts
+            .as_ref()
+            .and_then(|facts| facts.get("goal"))
+            .map(String::as_str),
+        Some("Собрать CLI")
+    );
+    let requests = server.requests();
+    assert_eq!(
+        requests[0]["response_format"]["json_schema"]["name"],
+        "agi_facts"
+    );
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Собрать CLI"))
+            })
+    );
+}
+
+#[tokio::test]
+async fn invalid_sticky_facts_cancel_main_request() {
+    let server = MockServer::new(|_| {
+        (
+            200,
+            json!({"choices":[{"message":{"content":"not json"},"finish_reason":"stop"}]})
+                .to_string(),
+        )
+    });
+    let mut request = request("Запомни", vec![]);
+    request
+        .settings
+        .select_context_strategy(ContextStrategyKind::StickyFacts);
+    assert!(
+        runner(&server)
+            .respond_streaming(request, |_| Ok(()))
+            .await
+            .expect_err("invalid facts")
+            .to_string()
+            .contains("основной запрос отменён")
+    );
+    assert_eq!(server.requests().len(), 1);
+}

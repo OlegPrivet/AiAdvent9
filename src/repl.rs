@@ -6,6 +6,7 @@ use crate::agent::{Agent, AgentRequest};
 #[cfg(test)]
 use crate::api::NeuralDeepClient;
 use crate::chat::{Chat, ChatStore};
+use crate::context::ContextStrategyKind;
 use crate::input::LineInput;
 use crate::metrics::ResponseMetrics;
 use crate::pricing::PriceCatalog;
@@ -78,6 +79,12 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                     output,
                 )
                 .await?;
+            } else if command.matches(&["/facts", "/факты"]) {
+                manage_facts(store, chat, command.argument, output)?;
+            } else if command.matches(&["/checkpoint", "/чекпоинт"]) {
+                create_checkpoint(store, chat, command.argument, output)?;
+            } else if command.matches(&["/branch", "/ветка"]) {
+                manage_branches(store, chat, command.argument, output, ui)?;
             } else if command.matches(&["/restore", "/восстановить"]) {
                 restore_from_argument(store, chat, command.argument, output, ui)?;
             } else {
@@ -166,10 +173,6 @@ async fn ask<W: Write>(
     ui: &TerminalUi,
     prices: &PriceCatalog,
 ) -> io::Result<()> {
-    let compaction = match compact(client, store, chat, question, false, output, ui, prices).await {
-        Ok(summary) => summary,
-        Err(error) => return writeln!(output, "Суммаризация не выполнена: {error}"),
-    };
     let agents = match store.agents().list() {
         Ok(agents) => agents,
         Err(error) => return writeln!(output, "Каталог агентов: {error}"),
@@ -183,14 +186,7 @@ async fn ask<W: Write>(
         .await;
 
     match result {
-        Ok(mut answer) => {
-            if let Some(summary) = compaction {
-                answer.already_counted_usage = summary.metrics.usage;
-                let mut calls = summary.metrics.calls;
-                calls.append(&mut answer.calls);
-                answer.calls = calls;
-                answer.elapsed_ms = answer.elapsed_ms.saturating_add(summary.metrics.elapsed_ms);
-            }
+        Ok(answer) => {
             live_answer.finish(&answer.content)?;
             let truncated = answer.truncated;
             let mut metrics = ResponseMetrics::from_calls(
@@ -200,7 +196,12 @@ async fn ask<W: Write>(
                 prices,
             );
             metrics.already_counted_usage = answer.already_counted_usage;
-            chat.record_exchange_with_metrics(question.to_owned(), answer.content, Some(metrics));
+            chat.record_exchange_with_context(
+                question.to_owned(),
+                answer.content,
+                Some(metrics),
+                answer.updated_facts,
+            );
             if let Err(error) = store.save(chat) {
                 writeln!(
                     output,
@@ -229,7 +230,16 @@ fn configure_settings<I: LineInput, W: Write>(
     input: &mut I,
     output: &mut W,
 ) -> io::Result<()> {
+    let original_context = chat.settings().context_strategy().clone();
     if chat.settings_mut().configure(input, output)? {
+        if chat.has_completed_turn() && chat.settings().context_strategy() != &original_context {
+            chat.settings_mut()
+                .replace_context_strategy(original_context);
+            writeln!(
+                output,
+                "Стратегию и размер окна можно менять только до первого ответа."
+            )?;
+        }
         chat.mark_changed();
         if chat.has_completed_turn()
             && let Err(error) = store.save(chat)
@@ -239,6 +249,160 @@ fn configure_settings<I: LineInput, W: Write>(
                 "Предупреждение: настройки не удалось сохранить: {error}"
             )?;
         }
+    }
+    Ok(())
+}
+
+fn manage_facts<W: Write>(
+    store: &ChatStore,
+    chat: &mut Chat,
+    argument: Option<&str>,
+    output: &mut W,
+) -> io::Result<()> {
+    if chat.settings().context_strategy().kind != ContextStrategyKind::StickyFacts {
+        return writeln!(output, "Facts доступны только для стратегии Sticky Facts.");
+    }
+    match argument {
+        None => {
+            if chat.facts().is_empty() {
+                writeln!(output, "Facts пока пусты.")?;
+            } else {
+                writeln!(output, "Facts:")?;
+                for (key, value) in chat.facts() {
+                    writeln!(output, "  {key} = {value}")?;
+                }
+            }
+        }
+        Some(argument) if argument.starts_with("set ") => {
+            let Some((key, value)) = argument[4..].trim().split_once(char::is_whitespace) else {
+                return writeln!(output, "Использование: /facts set <ключ> <значение>");
+            };
+            match chat.set_fact(key.into(), value.trim().into()) {
+                Ok(()) => {
+                    save_changed_chat(store, chat, output)?;
+                    writeln!(output, "Fact {key} сохранён.")?;
+                }
+                Err(error) => writeln!(output, "Fact не изменён: {error}")?,
+            }
+        }
+        Some(argument) if argument.starts_with("delete ") => {
+            let key = argument[7..].trim();
+            if chat.delete_fact(key) {
+                save_changed_chat(store, chat, output)?;
+                writeln!(output, "Fact {key} удалён.")?;
+            } else {
+                writeln!(output, "Fact {key} не найден.")?;
+            }
+        }
+        _ => writeln!(
+            output,
+            "Использование: /facts | /facts set <ключ> <значение> | /facts delete <ключ>"
+        )?,
+    }
+    Ok(())
+}
+
+fn create_checkpoint<W: Write>(
+    store: &ChatStore,
+    chat: &mut Chat,
+    argument: Option<&str>,
+    output: &mut W,
+) -> io::Result<()> {
+    let Some(name) = argument else {
+        return writeln!(output, "Использование: /checkpoint <имя>");
+    };
+    if chat.is_dirty()
+        && let Err(error) = store.save(chat)
+    {
+        return writeln!(output, "Checkpoint не создан: {error}");
+    }
+    match store.create_checkpoint(chat, name) {
+        Ok(id) => writeln!(output, "Checkpoint {name} сохранён [{id}]."),
+        Err(error) => writeln!(output, "Checkpoint не создан: {error}"),
+    }
+}
+
+fn manage_branches<W: Write>(
+    store: &ChatStore,
+    chat: &mut Chat,
+    argument: Option<&str>,
+    output: &mut W,
+    ui: &TerminalUi,
+) -> io::Result<()> {
+    if chat.settings().context_strategy().kind != ContextStrategyKind::Branching {
+        return writeln!(output, "Ветки доступны только для стратегии Branching.");
+    }
+    let Some(argument) = argument else {
+        return writeln!(
+            output,
+            "Использование: /branch list | create <checkpoint> <ветка> | switch <ветка|UUID>"
+        );
+    };
+    if argument.eq_ignore_ascii_case("list") {
+        writeln!(output, "Ветки:")?;
+        for branch in store
+            .branches(chat.branch_group_id())
+            .map_err(io::Error::other)?
+        {
+            let active = if branch.id == chat.id() { " *" } else { "" };
+            writeln!(output, "  {} [{}]{}", branch.name, branch.id, active)?;
+        }
+        writeln!(output, "Checkpoints:")?;
+        for checkpoint in store
+            .checkpoints(chat.branch_group_id())
+            .map_err(io::Error::other)?
+        {
+            writeln!(output, "  {} [{}]", checkpoint.name, checkpoint.id)?;
+        }
+        return Ok(());
+    }
+    if let Some(arguments) = argument.strip_prefix("create ") {
+        let mut parts = arguments.split_whitespace();
+        let (Some(checkpoint), Some(branch), None) = (parts.next(), parts.next(), parts.next())
+        else {
+            return writeln!(output, "Использование: /branch create <checkpoint> <ветка>");
+        };
+        if chat.is_dirty()
+            && let Err(error) = store.save(chat)
+        {
+            return writeln!(output, "Ветка не создана: {error}");
+        }
+        match store.create_branch(chat.branch_group_id(), checkpoint, branch) {
+            Ok(created) => {
+                *chat = created;
+                ui.print_chat(output, chat)
+            }
+            Err(error) => writeln!(output, "Ветка не создана: {error}"),
+        }
+    } else if let Some(name) = argument.strip_prefix("switch ") {
+        let restored = match store.load_branch(chat.branch_group_id(), name.trim()) {
+            Ok(chat) => chat,
+            Err(error) => return writeln!(output, "Переключение отменено: {error}"),
+        };
+        if chat.is_dirty()
+            && let Err(error) = store.save(chat)
+        {
+            return writeln!(output, "Переключение отменено: {error}");
+        }
+        *chat = restored;
+        ui.print_chat(output, chat)
+    } else {
+        writeln!(
+            output,
+            "Использование: /branch list | create <checkpoint> <ветка> | switch <ветка|UUID>"
+        )
+    }
+}
+
+fn save_changed_chat<W: Write>(
+    store: &ChatStore,
+    chat: &mut Chat,
+    output: &mut W,
+) -> io::Result<()> {
+    if chat.has_completed_turn()
+        && let Err(error) = store.save(chat)
+    {
+        writeln!(output, "Предупреждение: изменения не сохранены: {error}")?;
     }
     Ok(())
 }
@@ -475,6 +639,18 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         output,
+        "  /facts, /факты           просмотреть или изменить Sticky Facts"
+    )?;
+    writeln!(
+        output,
+        "  /checkpoint <имя>        сохранить точку ветвления"
+    )?;
+    writeln!(
+        output,
+        "  /branch ...              создать, показать или открыть ветку"
+    )?;
+    writeln!(
+        output,
         "  /clear, /очистить        начать новый чат без предыдущего контекста"
     )?;
     writeln!(output, "  /help, /помощь           показать эту справку")?;
@@ -534,105 +710,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_summary_is_saved_before_main_request_even_if_main_fails() {
-        for fail_main in [false, true] {
-            let server = crate::test_http::MockServer::new(move |request| {
-                let summarizing = request["messages"][0]["content"]
-                    .as_str()
-                    .is_some_and(|text| text.starts_with("Сожми"));
-                if summarizing {
-                    crate::test_http::text_response("Резюме проекта")
-                } else if fail_main {
-                    (500, "{}".into())
-                } else {
-                    crate::test_http::text_response("Продолжаю")
-                }
-            });
-            let client = Agent::new(
-                NeuralDeepClient::new("test-key".into(), server.url.clone()).expect("client"),
-            );
-            let (_directory, store) = test_store();
-            let mut chat = Chat::new();
-            *chat.settings_mut() =
-                crate::settings::Settings::for_summary("qwen3.8-27b", 20000, 1000);
-            let metrics = ResponseMetrics::from_calls(
-                "qwen3.8-27b",
-                0,
-                vec![crate::metrics::CallUsage {
-                    context: None,
-                    model: "qwen3.8-27b".into(),
-                    usage: Some(crate::metrics::TokenUsage {
-                        total_tokens: 17_000,
-                        ..crate::metrics::TokenUsage::default()
-                    }),
-                }],
-                &PriceCatalog::default(),
-            );
-            chat.record_exchange_with_metrics(
-                "x".repeat(17000),
-                "Старый ответ".into(),
-                Some(metrics),
-            );
-            store.save(&mut chat).expect("save");
-            let old_title = chat.title().to_owned();
-            let mut output = Vec::new();
-            ask(
-                &client,
-                &store,
-                &mut chat,
-                "Продолжи",
-                &mut output,
-                &TerminalUi::plain(),
-                &PriceCatalog::default(),
-            )
-            .await
-            .expect("ask");
-            let restored = store.load(chat.id()).expect("load");
-            assert_eq!(
-                restored.summary().expect("summary").content,
-                "Резюме проекта"
-            );
-            assert_eq!(restored.title(), old_title);
-            assert_eq!(restored.messages().len(), if fail_main { 0 } else { 2 });
-            let calls = server.requests();
-            assert_eq!(
-                calls.len(),
-                restored.summary().expect("summary").metrics.calls.len() + 1
-            );
-            let main = calls.last().expect("main call")["messages"]
-                .as_array()
-                .expect("messages");
-            assert!(main.iter().any(|message| {
-                message["content"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("Резюме проекта"))
-            }));
-            assert!(
-                !main.iter().any(
-                    |message| message["content"].as_str().is_some_and(|text| text
-                        .contains("Старый ответ")
-                        || text.contains(&"x".repeat(100)))
-                )
-            );
-            assert_eq!(main.last().expect("question")["content"], "Продолжи");
-            if !fail_main {
-                assert_eq!(
-                    restored
-                        .last_response_metrics()
-                        .expect("metrics")
-                        .usage
-                        .expect("usage")
-                        .total_tokens,
-                    calls.len() as u64 * 15
-                );
-            }
-            let output = String::from_utf8(output).expect("utf8");
-            assert!(output.contains("История заменена резюме"));
-            assert!(
-                !output.contains("\x1b[2J"),
-                "piped output must not clear the screen"
-            );
-        }
+    async fn automatic_summary_is_disabled() {
+        let server =
+            crate::test_http::MockServer::new(|_| crate::test_http::text_response("Продолжаю"));
+        let client = Agent::new(
+            NeuralDeepClient::new("test-key".into(), server.url.clone()).expect("client"),
+        );
+        let (_directory, store) = test_store();
+        let mut chat = Chat::new();
+        *chat.settings_mut() = crate::settings::Settings::for_summary("qwen3.8-27b", 20000, 1000);
+        chat.record_exchange("Старый вопрос".into(), "Старый ответ".into());
+        store.save(&mut chat).expect("save");
+        ask(
+            &client,
+            &store,
+            &mut chat,
+            "Продолжи",
+            &mut Vec::new(),
+            &TerminalUi::plain(),
+            &PriceCatalog::default(),
+        )
+        .await
+        .expect("ask");
+        assert!(chat.summary().is_none());
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let messages = requests[0]["messages"].as_array().expect("messages");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["content"] == "Старый ответ")
+        );
     }
 
     #[tokio::test]

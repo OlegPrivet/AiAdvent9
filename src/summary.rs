@@ -80,6 +80,7 @@ fn latest_main_usage(request: &AgentRequest) -> Option<TokenUsage> {
         .flatten()
 }
 
+#[cfg(test)]
 pub(crate) fn apply(request: &mut AgentRequest, summary: ConversationSummary) {
     request.history.clear();
     request.summary = Some(summary);
