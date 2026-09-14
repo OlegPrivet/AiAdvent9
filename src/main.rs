@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod context;
 mod input;
+mod memory;
 mod metrics;
 mod pricing;
 mod repl;

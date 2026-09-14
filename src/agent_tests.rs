@@ -171,6 +171,51 @@ fn request(question: &str, agents: Vec<AgentDefinition>) -> AgentRequest {
     AgentRequest::new(&Chat::new(), question.into(), agents)
 }
 
+#[test]
+fn memory_layers_are_injected_before_dialogue_as_separate_blocks() {
+    let mut chat = Chat::new();
+    chat.record_exchange("Старый вопрос".into(), "Старый ответ".into());
+    let mut working = crate::memory::WorkingMemory::new();
+    working.insert("goal".into(), "Проверить prompt".into());
+    let memory = crate::memory::MemoryContext {
+        profile: Some("## Style\nКратко".into()),
+        long_term: vec![(
+            crate::memory::MemoryRef {
+                kind: crate::memory::LongTermKind::Decision,
+                name: "storage".into(),
+            },
+            "Рабочие данные хранить в SQLite".into(),
+        )],
+        working,
+    };
+    let messages =
+        main_messages(&AgentRequest::new(&chat, "Новый вопрос".into(), vec![]).with_memory(memory));
+    assert_eq!(messages[0].role, "system");
+    assert!(
+        messages[0]
+            .content
+            .as_deref()
+            .is_some_and(|value| value.contains("ПРОФИЛЬ"))
+    );
+    assert!(
+        messages[1]
+            .content
+            .as_deref()
+            .is_some_and(|value| value.contains("decision / storage"))
+    );
+    assert!(
+        messages[2]
+            .content
+            .as_deref()
+            .is_some_and(|value| value.contains("РАБОЧАЯ ПАМЯТЬ"))
+    );
+    assert_eq!(messages[3].content.as_deref(), Some("Старый вопрос"));
+    assert_eq!(
+        messages.last().expect("question").content.as_deref(),
+        Some("Новый вопрос")
+    );
+}
+
 fn runner(server: &MockServer) -> Agent {
     Agent::new(NeuralDeepClient::new("test-key".into(), server.url.clone()).expect("client"))
 }
@@ -199,6 +244,40 @@ async fn simple_agent_returns_streamed_answer_without_catalog_or_tools() {
 }
 
 #[tokio::test]
+async fn selected_profile_changes_answer_for_the_same_question() {
+    let server = MockServer::new(|request| {
+        let personalized = request["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Senior Rust developer"))
+            });
+        text_response(if personalized {
+            "Ответ для опытного Rust-разработчика"
+        } else {
+            "Общее объяснение"
+        })
+    });
+    let plain = runner(&server)
+        .respond_streaming(request("Объясни DI", vec![]), |_| Ok(()))
+        .await
+        .expect("plain answer");
+    let mut personalized_request = request("Объясни DI", vec![]);
+    personalized_request.memory.profile = Some("## Context\nSenior Rust developer".into());
+    let personalized = runner(&server)
+        .respond_streaming(personalized_request, |_| Ok(()))
+        .await
+        .expect("personalized answer");
+
+    assert_eq!(plain.content, "Общее объяснение");
+    assert_eq!(personalized.content, "Ответ для опытного Rust-разработчика");
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
 async fn automatically_delegates_and_returns_result_with_matching_tool_id() {
     let server = MockServer::new(|req| {
         if req.get("tools").is_none() {
@@ -215,6 +294,7 @@ async fn automatically_delegates_and_returns_result_with_matching_tool_id() {
         tool_response(vec![delegate(0, "call_editor", "editor")])
     });
     let mut req = request("Проверь решение", vec![definition("editor")]);
+    req.memory.profile = Some("## Style\nОтвечай кратко".into());
     req.settings
         .set_system_prompt("Пиши по-русски".into())
         .expect("prompt");
@@ -250,6 +330,24 @@ async fn automatically_delegates_and_returns_result_with_matching_tool_id() {
         .expect("prompt");
     assert!(child_prompt.contains("Пиши по-русски"));
     assert!(child_prompt.contains("Собственная инструкция editor"));
+    assert!(
+        requests[0]["messages"]
+            .as_array()
+            .expect("main messages")
+            .iter()
+            .any(|message| message["content"]
+                .as_str()
+                .is_some_and(|value| value.contains("Отвечай кратко")))
+    );
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .expect("child messages")
+            .iter()
+            .any(|message| message["content"]
+                .as_str()
+                .is_some_and(|value| value.contains("Отвечай кратко")))
+    );
     let messages = requests[2]["messages"].as_array().expect("messages");
     let tool = messages
         .iter()

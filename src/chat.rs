@@ -12,12 +12,16 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::context::{ContextStrategyKind, Facts, MAX_FACTS, validate_fact, validate_facts};
+use crate::memory::{
+    MAX_WORKING_ENTRIES, MemoryRef, MemorySelection, MemoryStore, WorkingMemory,
+    validate_working_entry, validate_working_memory,
+};
 use crate::metrics::ResponseMetrics;
 use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 5;
+const DATABASE_SCHEMA_VERSION: i64 = 6;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -71,6 +75,10 @@ pub(crate) struct Chat {
     #[serde(default)]
     facts: Facts,
     #[serde(default)]
+    working_memory: WorkingMemory,
+    #[serde(default)]
+    memory_selection: MemorySelection,
+    #[serde(default)]
     branch_group_id: Option<Uuid>,
     #[serde(default)]
     branch_name: Option<String>,
@@ -96,6 +104,8 @@ impl Chat {
             messages: Vec::new(),
             summary: None,
             facts: Facts::new(),
+            working_memory: WorkingMemory::new(),
+            memory_selection: MemorySelection::default(),
             branch_group_id: Some(id),
             branch_name: Some("main".to_owned()),
             parent_checkpoint_id: None,
@@ -132,6 +142,70 @@ impl Chat {
         &self.facts
     }
 
+    pub(crate) fn working_memory(&self) -> &WorkingMemory {
+        &self.working_memory
+    }
+
+    pub(crate) fn memory_selection(&self) -> &MemorySelection {
+        &self.memory_selection
+    }
+
+    pub(crate) fn set_working(&mut self, key: String, value: String) -> Result<(), String> {
+        validate_working_entry(&key, &value)?;
+        if !self.working_memory.contains_key(&key)
+            && self.working_memory.len() >= MAX_WORKING_ENTRIES
+        {
+            return Err(format!(
+                "Допускается не более {MAX_WORKING_ENTRIES} записей рабочей памяти."
+            ));
+        }
+        self.working_memory.insert(key, value.trim().to_owned());
+        self.mark_changed();
+        Ok(())
+    }
+
+    pub(crate) fn delete_working(&mut self, key: &str) -> bool {
+        let changed = self.working_memory.remove(key).is_some();
+        if changed {
+            self.mark_changed();
+        }
+        changed
+    }
+
+    pub(crate) fn clear_working(&mut self) -> bool {
+        let changed = !self.working_memory.is_empty();
+        if changed {
+            self.working_memory.clear();
+            self.mark_changed();
+        }
+        changed
+    }
+
+    pub(crate) fn set_profile_enabled(&mut self, enabled: bool) -> bool {
+        let changed = self.memory_selection.profile != enabled;
+        if changed {
+            self.memory_selection.profile = enabled;
+            self.mark_changed();
+        }
+        changed
+    }
+
+    pub(crate) fn use_memory(&mut self, reference: MemoryRef) -> bool {
+        let changed = self.memory_selection.entries.insert(reference);
+        if changed {
+            self.mark_changed();
+        }
+        changed
+    }
+
+    pub(crate) fn unuse_memory(&mut self, reference: &MemoryRef) -> bool {
+        let changed = self.memory_selection.entries.remove(reference);
+        if changed {
+            self.mark_changed();
+        }
+        changed
+    }
+
     pub(crate) fn branch_group_id(&self) -> Uuid {
         self.branch_group_id.unwrap_or(self.id)
     }
@@ -160,6 +234,12 @@ impl Chat {
 
     pub(crate) fn has_completed_turn(&self) -> bool {
         self.summary.is_some() || !self.messages.is_empty()
+    }
+
+    pub(crate) fn has_persistable_state(&self) -> bool {
+        self.has_completed_turn()
+            || !self.working_memory.is_empty()
+            || self.memory_selection != MemorySelection::default()
     }
 
     pub(crate) fn is_persisted(&self) -> bool {
@@ -345,6 +425,10 @@ struct CheckpointSnapshot {
     messages: Vec<ChatMessage>,
     summary: Option<crate::summary::ConversationSummary>,
     facts: Facts,
+    #[serde(default)]
+    working_memory: WorkingMemory,
+    #[serde(default)]
+    memory_selection: MemorySelection,
 }
 
 #[derive(Debug)]
@@ -405,6 +489,14 @@ pub(crate) enum ChatStoreError {
 impl ChatStore {
     pub(crate) fn agents(&self) -> crate::agent_catalog::AgentStore<'_> {
         crate::agent_catalog::AgentStore::new(&self.connection)
+    }
+
+    pub(crate) fn memory(&self) -> MemoryStore {
+        MemoryStore::new(
+            self.database_path
+                .parent()
+                .expect("путь базы всегда содержит каталог"),
+        )
     }
 
     pub(crate) fn open() -> Result<Self, ChatStoreError> {
@@ -490,6 +582,67 @@ impl ChatStore {
                 source,
             })?;
         validate_facts(&facts).map_err(|_| ChatStoreError::InvalidConversation(id))?;
+        let mut working_memory = WorkingMemory::new();
+        {
+            let mut statement = self
+                .connection
+                .prepare("SELECT key, value FROM working_memory WHERE chat_id = ?1 ORDER BY key")
+                .map_err(|source| {
+                    self.database_error_with_source("прочитать рабочую память", source)
+                })?;
+            let rows = statement
+                .query_map(params![id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|source| {
+                    self.database_error_with_source("прочитать рабочую память", source)
+                })?;
+            for row in rows {
+                let (key, value) = row.map_err(|source| {
+                    self.database_error_with_source("прочитать рабочую память", source)
+                })?;
+                working_memory.insert(key, value);
+            }
+        }
+        validate_working_memory(&working_memory)
+            .map_err(|_| ChatStoreError::InvalidConversation(id))?;
+        let mut memory_selection = MemorySelection {
+            profile: self
+                .connection
+                .query_row(
+                    "SELECT profile_enabled FROM memory_settings WHERE chat_id = ?1",
+                    params![id.to_string()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .map_err(self.database_error("прочитать настройки памяти"))?
+                .unwrap_or(true),
+            ..MemorySelection::default()
+        };
+        {
+            let mut statement = self
+                .connection
+                .prepare("SELECT kind, name FROM memory_selections WHERE chat_id = ?1 ORDER BY kind, name")
+                .map_err(|source| self.database_error_with_source("прочитать подключения памяти", source))?;
+            let rows = statement
+                .query_map(params![id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|source| {
+                    self.database_error_with_source("прочитать подключения памяти", source)
+                })?;
+            for row in rows {
+                let (kind, name) = row.map_err(|source| {
+                    self.database_error_with_source("прочитать подключения памяти", source)
+                })?;
+                let kind = match kind.as_str() {
+                    "decision" => crate::memory::LongTermKind::Decision,
+                    "knowledge" => crate::memory::LongTermKind::Knowledge,
+                    _ => return Err(ChatStoreError::InvalidConversation(id)),
+                };
+                memory_selection.entries.insert(MemoryRef { kind, name });
+            }
+        }
         let branch_group_id = branch_group_id
             .as_deref()
             .map(Uuid::parse_str)
@@ -565,7 +718,7 @@ impl ChatStore {
                 metrics,
             });
         }
-        if !(valid_messages(&messages) || (messages.is_empty() && summary.is_some())) {
+        if !(valid_messages(&messages) || messages.is_empty()) {
             return Err(ChatStoreError::InvalidConversation(id));
         }
 
@@ -581,6 +734,8 @@ impl ChatStore {
             messages,
             summary,
             facts,
+            working_memory,
+            memory_selection,
             branch_group_id,
             branch_name: branch_name.or_else(|| Some("main".to_owned())),
             parent_checkpoint_id,
@@ -655,6 +810,8 @@ impl ChatStore {
             messages: chat.messages.clone(),
             summary: chat.summary.clone(),
             facts: chat.facts.clone(),
+            working_memory: chat.working_memory.clone(),
+            memory_selection: chat.memory_selection.clone(),
         };
         let snapshot_json =
             serde_json::to_string(&snapshot).map_err(|source| ChatStoreError::SettingsJson {
@@ -722,6 +879,8 @@ impl ChatStore {
             messages: snapshot.messages,
             summary: snapshot.summary,
             facts: snapshot.facts,
+            working_memory: snapshot.working_memory,
+            memory_selection: snapshot.memory_selection,
             branch_group_id: Some(group_id),
             branch_name: Some(branch_name.to_owned()),
             parent_checkpoint_id: Some(
@@ -840,14 +999,13 @@ impl ChatStore {
     }
 
     pub(crate) fn save(&self, chat: &mut Chat) -> Result<bool, ChatStoreError> {
-        if !chat.has_completed_turn() {
+        if !chat.has_persistable_state() && !chat.is_persisted() {
             return Ok(false);
         }
         if chat.is_persisted() && !chat.is_dirty() {
             return Ok(true);
         }
-        if !(valid_messages(&chat.messages) || (chat.messages.is_empty() && chat.summary.is_some()))
-        {
+        if !(valid_messages(&chat.messages) || chat.messages.is_empty()) {
             return Err(ChatStoreError::InvalidConversation(chat.id));
         }
 
@@ -1055,6 +1213,50 @@ fn write_chat(
                 .map_err(|source| database_error("записать сообщение", database_path, source))?;
         }
     }
+    transaction
+        .execute("DELETE FROM working_memory WHERE chat_id = ?1", params![id])
+        .map_err(|source| database_error("обновить рабочую память", database_path, source))?;
+    {
+        let mut statement = transaction
+            .prepare("INSERT INTO working_memory(chat_id, key, value) VALUES (?1, ?2, ?3)")
+            .map_err(|source| {
+                database_error("подготовить рабочую память", database_path, source)
+            })?;
+        for (key, value) in &chat.working_memory {
+            statement
+                .execute(params![id, key, value])
+                .map_err(|source| {
+                    database_error("записать рабочую память", database_path, source)
+                })?;
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO memory_settings(chat_id, profile_enabled) VALUES (?1, ?2)
+             ON CONFLICT(chat_id) DO UPDATE SET profile_enabled = excluded.profile_enabled",
+            params![id, chat.memory_selection.profile],
+        )
+        .map_err(|source| database_error("записать настройки памяти", database_path, source))?;
+    transaction
+        .execute(
+            "DELETE FROM memory_selections WHERE chat_id = ?1",
+            params![id],
+        )
+        .map_err(|source| database_error("обновить подключения памяти", database_path, source))?;
+    {
+        let mut statement = transaction
+            .prepare("INSERT INTO memory_selections(chat_id, kind, name) VALUES (?1, ?2, ?3)")
+            .map_err(|source| {
+                database_error("подготовить подключения памяти", database_path, source)
+            })?;
+        for reference in &chat.memory_selection.entries {
+            statement
+                .execute(params![id, reference.kind.to_string(), reference.name])
+                .map_err(|source| {
+                    database_error("записать подключения памяти", database_path, source)
+                })?;
+        }
+    }
     Ok(true)
 }
 
@@ -1103,7 +1305,7 @@ fn initialize_database(
                  COMMIT;",
             )
             .map_err(|source| database_error("обновить схему", database_path, source)),
-        2..=5 => Ok(()),
+        2..=DATABASE_SCHEMA_VERSION => Ok(()),
         value => Err(ChatStoreError::UnsupportedSchema(value)),
     }?;
     if version < 3 {
@@ -1128,7 +1330,7 @@ fn initialize_database(
         connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE chats ADD COLUMN summary_json TEXT; PRAGMA user_version = 4; COMMIT;")
             .map_err(|source| database_error("добавить резюме", database_path, source))?;
     }
-    if version < DATABASE_SCHEMA_VERSION {
+    if version < 5 {
         connection
             .execute_batch(
                 "BEGIN IMMEDIATE;
@@ -1155,6 +1357,31 @@ fn initialize_database(
             .map_err(|source| {
                 database_error("добавить стратегии контекста", database_path, source)
             })?;
+    }
+    if version < 6 {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS working_memory (
+                     chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                     key TEXT NOT NULL,
+                     value TEXT NOT NULL,
+                     PRIMARY KEY(chat_id, key)
+                 );
+                 CREATE TABLE IF NOT EXISTS memory_settings (
+                     chat_id TEXT PRIMARY KEY NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                     profile_enabled INTEGER NOT NULL DEFAULT 1 CHECK(profile_enabled IN (0, 1))
+                 );
+                 CREATE TABLE IF NOT EXISTS memory_selections (
+                     chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                     kind TEXT NOT NULL CHECK(kind IN ('decision', 'knowledge')),
+                     name TEXT NOT NULL,
+                     PRIMARY KEY(chat_id, kind, name)
+                 );
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )
+            .map_err(|source| database_error("добавить слои памяти", database_path, source))?;
     }
     Ok(())
 }
@@ -1801,12 +2028,26 @@ mod tests {
         main.settings_mut()
             .select_context_strategy(ContextStrategyKind::Branching);
         main.record_exchange("Основа".into(), "Принято".into());
+        main.set_working("step".into(), "planning".into())
+            .expect("working memory");
+        main.use_memory(MemoryRef {
+            kind: crate::memory::LongTermKind::Decision,
+            name: "architecture".into(),
+        });
         store.save(&mut main).expect("save main");
         store.create_checkpoint(&main, "base").expect("checkpoint");
 
         let mut first = store
             .create_branch(main.branch_group_id(), "base", "first")
             .expect("first branch");
+        assert_eq!(
+            first.working_memory().get("step").map(String::as_str),
+            Some("planning")
+        );
+        assert_eq!(first.memory_selection().entries.len(), 1);
+        first
+            .set_working("step".into(), "execution".into())
+            .expect("independent working memory");
         first.record_exchange("Путь A".into(), "Ответ A".into());
         store.save(&mut first).expect("save first");
         let mut second = store
@@ -1821,6 +2062,14 @@ mod tests {
         let second = store
             .load_branch(main.branch_group_id(), "second")
             .expect("load second");
+        assert_eq!(
+            first.working_memory().get("step").map(String::as_str),
+            Some("execution")
+        );
+        assert_eq!(
+            second.working_memory().get("step").map(String::as_str),
+            Some("planning")
+        );
         assert!(
             first
                 .messages()

@@ -81,6 +81,11 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                 .await?;
             } else if command.matches(&["/facts", "/факты"]) {
                 manage_facts(store, chat, command.argument, output)?;
+            } else if command.matches(&["/memory", "/память"]) {
+                match crate::memory::execute_command(store, chat, command.argument) {
+                    Ok(message) => writeln!(output, "{message}")?,
+                    Err(error) => writeln!(output, "Память не изменена: {error}")?,
+                }
             } else if command.matches(&["/checkpoint", "/чекпоинт"]) {
                 create_checkpoint(store, chat, command.argument, output)?;
             } else if command.matches(&["/branch", "/ветка"]) {
@@ -101,7 +106,7 @@ pub(crate) async fn run<I: LineInput, W: Write>(
 }
 
 fn start_new_chat<W: Write>(store: &ChatStore, chat: &mut Chat, output: &mut W) -> io::Result<()> {
-    if chat.has_completed_turn()
+    if chat.has_persistable_state()
         && chat.is_dirty()
         && let Err(error) = store.save(chat)
     {
@@ -177,10 +182,17 @@ async fn ask<W: Write>(
         Ok(agents) => agents,
         Err(error) => return writeln!(output, "Каталог агентов: {error}"),
     };
+    let memory = match store
+        .memory()
+        .load_context(chat.working_memory(), chat.memory_selection())
+    {
+        Ok(memory) => memory,
+        Err(error) => return writeln!(output, "Ошибка памяти: {error}\n"),
+    };
     let mut live_answer = ui.begin_answer(output);
     let result = client
         .respond_streaming(
-            AgentRequest::new(chat, question.to_owned(), agents),
+            AgentRequest::new(chat, question.to_owned(), agents).with_memory(memory),
             |event| live_answer.agent_event(event),
         )
         .await;
@@ -399,7 +411,7 @@ fn save_changed_chat<W: Write>(
     chat: &mut Chat,
     output: &mut W,
 ) -> io::Result<()> {
-    if chat.has_completed_turn()
+    if chat.has_persistable_state()
         && let Err(error) = store.save(chat)
     {
         writeln!(output, "Предупреждение: изменения не сохранены: {error}")?;
@@ -489,7 +501,7 @@ fn switch_chat<W: Write>(
         }
     };
 
-    if chat.has_completed_turn() && chat.is_dirty() {
+    if chat.has_persistable_state() && chat.is_dirty() {
         if let Err(error) = store.save(chat) {
             writeln!(
                 output,
@@ -506,7 +518,7 @@ fn switch_chat<W: Write>(
 }
 
 fn finish_session<W: Write>(store: &ChatStore, chat: &mut Chat, output: &mut W) -> io::Result<()> {
-    if chat.has_completed_turn() && chat.is_dirty() {
+    if chat.has_persistable_state() && chat.is_dirty() {
         match store.save(chat) {
             Ok(_) => {}
             Err(error) if chat.is_persisted() => {
@@ -640,6 +652,10 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(
         output,
         "  /facts, /факты           просмотреть или изменить Sticky Facts"
+    )?;
+    writeln!(
+        output,
+        "  /memory, /память         управлять short-term, working и long-term памятью"
     )?;
     writeln!(
         output,

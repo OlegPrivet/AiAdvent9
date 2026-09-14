@@ -60,6 +60,7 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     CommandOption::run("/exit", "сохранить чат и выйти", &["/quit", "/выход"]),
     CommandOption::run("/agents", "глобальный каталог агентов", &["/агенты"]),
     CommandOption::run("/facts", "память Sticky Facts", &["/факты"]),
+    CommandOption::run("/memory", "слои памяти агента", &["/память"]),
     CommandOption::run("/checkpoint", "сохранить точку ветвления", &["/чекпоинт"]),
     CommandOption::run("/branch", "управление ветками", &["/ветка"]),
 ];
@@ -249,13 +250,29 @@ fn spawn_request(
 ) -> RequestTask {
     let client = client.clone();
     let manual = crate::summary::is_command(&question);
-    let request = store.agents().list().map(|agents| {
-        AgentRequest::new(chat, if manual { String::new() } else { question }, agents)
-    });
+    let request = store
+        .agents()
+        .list()
+        .map_err(AgentError::from)
+        .and_then(|agents| {
+            let request =
+                AgentRequest::new(chat, if manual { String::new() } else { question }, agents);
+            if manual {
+                Ok(request)
+            } else {
+                let memory = store
+                    .memory()
+                    .load_context(chat.working_memory(), chat.memory_selection())
+                    .map_err(|error| {
+                        AgentError::InvalidRequest(format!("Ошибка памяти: {error}"))
+                    })?;
+                Ok(request.with_memory(memory))
+            }
+        });
     RequestTask(tokio::spawn(async move {
         let delta_tx = worker_tx.clone();
         let result = match request {
-            Err(error) => Err(AgentError::from(error)),
+            Err(error) => Err(error),
             Ok(request) => {
                 async {
                     if manual {
@@ -1059,6 +1076,8 @@ impl<'a> App<'a> {
             }
         } else if command.matches(&["/facts", "/факты"]) {
             self.handle_facts(command.argument);
+        } else if command.matches(&["/memory", "/память"]) {
+            self.handle_memory(command.argument);
         } else if command.matches(&["/checkpoint", "/чекпоинт"]) {
             self.handle_checkpoint(command.argument);
         } else if command.matches(&["/branch", "/ветка"]) {
@@ -1132,6 +1151,20 @@ impl<'a> App<'a> {
                         .into(),
                 );
             }
+        }
+    }
+
+    fn handle_memory(&mut self, argument: Option<&str>) {
+        match crate::memory::execute_command(self.store, self.chat, argument) {
+            Ok(message) if message.contains('\n') => {
+                self.modal = Some(Modal::Message {
+                    title: "Memory layers".into(),
+                    content: message,
+                });
+                self.notice = None;
+            }
+            Ok(message) => self.notice = Some(message),
+            Err(error) => self.notice = Some(format!("Память не изменена: {error}")),
         }
     }
 
@@ -1712,7 +1745,7 @@ impl<'a> App<'a> {
 
     fn settings_changed(&mut self) {
         self.chat.mark_changed();
-        if self.chat.has_completed_turn()
+        if self.chat.has_persistable_state()
             && let Err(error) = self.store.save(self.chat)
         {
             self.notice = Some(format!("Настройки не удалось сохранить: {error}"));
@@ -1720,7 +1753,7 @@ impl<'a> App<'a> {
     }
 
     fn start_new_chat(&mut self) {
-        if self.chat.has_completed_turn()
+        if self.chat.has_persistable_state()
             && self.chat.is_dirty()
             && let Err(error) = self.store.save(self.chat)
         {
@@ -1746,7 +1779,7 @@ impl<'a> App<'a> {
             self.modal = None;
             return;
         }
-        if self.chat.has_completed_turn()
+        if self.chat.has_persistable_state()
             && self.chat.is_dirty()
             && let Err(error) = self.store.save(self.chat)
         {
@@ -1770,7 +1803,7 @@ impl<'a> App<'a> {
     }
 
     fn finish_session(&mut self) -> Option<String> {
-        if self.chat.has_completed_turn()
+        if self.chat.has_persistable_state()
             && self.chat.is_dirty()
             && let Err(error) = self.store.save(self.chat)
         {
@@ -2069,6 +2102,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/settings, /настройки   настройки текущего чата",
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
                 "/facts ...              память Sticky Facts",
+                "/memory ...             short-term, working и long-term память",
                 "/checkpoint <имя>       сохранить точку ветвления",
                 "/branch ...             создать, показать или открыть ветку",
                 "/summarize, /суммаризация заменить историю резюме",
