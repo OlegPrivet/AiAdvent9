@@ -12,6 +12,7 @@ pub(crate) const MAX_WORKING_ENTRIES: usize = 50;
 pub(crate) const MAX_WORKING_KEY_CHARS: usize = 64;
 pub(crate) const MAX_WORKING_VALUE_CHARS: usize = 1000;
 pub(crate) const MAX_LONG_TERM_BYTES: usize = 32 * 1024;
+pub(crate) const DEFAULT_PROFILE_NAME: &str = "default";
 
 pub(crate) type WorkingMemory = BTreeMap<String, String>;
 
@@ -46,6 +47,7 @@ pub(crate) fn execute_command(
 ) -> Result<String, String> {
     let memory = store.memory();
     let Some(argument) = argument.map(str::trim).filter(|value| !value.is_empty()) else {
+        let profiles = memory.list_profiles().map_err(|error| error.to_string())?;
         let decisions = memory
             .list(LongTermKind::Decision)
             .map_err(|error| error.to_string())?;
@@ -59,7 +61,7 @@ pub(crate) fn execute_command(
             .map(|entry| format!("{}/{}", entry.kind, entry.name))
             .collect::<Vec<_>>();
         return Ok(format!(
-            "Слои памяти:\n  short-term: {} сообщений{}\n  working: {} записей\n  long-term: профиль {}, decisions {}, knowledge {}\n  подключено: профиль {}; {}\n  Markdown: {}",
+            "Слои памяти:\n  short-term: {} сообщений{}\n  working: {} записей\n  long-term: profiles {}, decisions {}, knowledge {}\n  активный профиль: {}\n  подключено записей: {}\n  Markdown: {}",
             chat.messages().len(),
             if chat.summary().is_some() {
                 " + резюме"
@@ -67,17 +69,13 @@ pub(crate) fn execute_command(
                 ""
             },
             chat.working_memory().len(),
-            if memory.profile_path().exists() {
-                "есть"
-            } else {
-                "не создан"
-            },
+            profiles.len(),
             decisions.len(),
             knowledge.len(),
             if chat.memory_selection().profile {
-                "да"
+                chat.memory_selection().profile_name.as_str()
             } else {
-                "нет"
+                "отключён"
             },
             if selected.is_empty() {
                 "нет выбранных записей".into()
@@ -150,42 +148,115 @@ pub(crate) fn execute_command(
             .initialize_profile()
             .map(|created| {
                 if created {
-                    format!("Шаблон профиля создан: {}", memory.profile_path().display())
+                    format!(
+                        "Профиль default создан: {}",
+                        memory
+                            .profile_path(DEFAULT_PROFILE_NAME)
+                            .expect("проверенное имя")
+                            .display()
+                    )
                 } else {
                     format!(
-                        "Профиль уже существует: {}",
-                        memory.profile_path().display()
+                        "Профиль default уже существует: {}",
+                        memory
+                            .profile_path(DEFAULT_PROFILE_NAME)
+                            .expect("проверенное имя")
+                            .display()
                     )
                 }
             })
             .map_err(|error| error.to_string());
     }
-    if argument == "profile show" {
-        return memory
-            .show_profile()
-            .map(|profile| {
-                profile.map_or_else(
-                    || format!("Профиль не создан: {}", memory.profile_path().display()),
-                    |content| {
-                        format!(
-                            "{}\n\nФайл: {}",
-                            content.trim(),
-                            memory.profile_path().display()
-                        )
-                    },
-                )
+    if argument == "profile list" {
+        let profiles = memory.list_profiles().map_err(|error| error.to_string())?;
+        if profiles.is_empty() {
+            return Ok("Профили не созданы.".into());
+        }
+        return Ok(profiles
+            .iter()
+            .map(|name| {
+                if chat.memory_selection().profile && chat.memory_selection().profile_name == *name
+                {
+                    format!("* {name}")
+                } else {
+                    format!("  {name}")
+                }
             })
-            .map_err(|error| error.to_string());
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    if let Some(name) = argument.strip_prefix("profile create ").map(str::trim) {
+        if name.is_empty() {
+            return Err("Использование: /memory profile create <имя>".into());
+        }
+        let created = memory
+            .create_profile(name)
+            .map_err(|error| error.to_string())?;
+        return if created {
+            Ok(format!("Профиль {name} создан."))
+        } else {
+            Err(format!("Профиль {name} уже существует и не изменён."))
+        };
+    }
+    if argument == "profile show" {
+        return display_profile(&memory, &chat.memory_selection().profile_name);
+    }
+    if let Some(name) = argument.strip_prefix("profile show ").map(str::trim) {
+        return display_profile(&memory, name);
     }
     if let Some(rest) = argument.strip_prefix("profile set ") {
-        let (section, value) = split_once_required(
+        let (first, rest) = split_once_required(
             rest,
-            "Использование: /memory profile set <style|constraints|context> <текст>",
+            "Использование: /memory profile set [имя] <style|constraints|context> <текст>",
         )?;
+        let (name, section, value, explicit_name) = if is_profile_section(first) {
+            (
+                chat.memory_selection().profile_name.as_str(),
+                first,
+                rest,
+                false,
+            )
+        } else {
+            let (section, value) = split_once_required(
+                rest,
+                "Использование: /memory profile set <имя> <style|constraints|context> <текст>",
+            )?;
+            (first, section, value, true)
+        };
+        if explicit_name
+            && memory
+                .show_profile(name)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            return Err(format!(
+                "Профиль {name} не найден. Сначала выполните /memory profile create {name}."
+            ));
+        }
         memory
-            .set_profile_section(section, value)
+            .set_profile_section(name, section, value)
             .map_err(|error| error.to_string())?;
-        return Ok(format!("Раздел профиля {section} обновлён."));
+        return Ok(format!("Раздел {section} профиля {name} обновлён."));
+    }
+    if let Some(name) = argument.strip_prefix("profile delete ").map(str::trim) {
+        if name.is_empty() {
+            return Err("Использование: /memory profile delete <имя>".into());
+        }
+        let deleted = memory
+            .delete_profile(name)
+            .map_err(|error| error.to_string())?;
+        if deleted
+            && chat.memory_selection().profile
+            && chat.memory_selection().profile_name == name
+        {
+            chat.set_profile_enabled(false);
+            store.save(chat).map_err(|error| error.to_string())?;
+        }
+        return Ok(if deleted {
+            format!("Профиль {name} удалён.")
+        } else {
+            format!("Профиль {name} не найден.")
+        });
     }
     if argument == "long" {
         let decisions = memory
@@ -242,20 +313,31 @@ pub(crate) fn execute_command(
             });
         }
     }
-    if argument == "use profile" || argument == "unuse profile" {
-        let enabled = argument.starts_with("use ");
-        let changed = chat.set_profile_enabled(enabled);
+    if argument == "use profile" || argument.starts_with("use profile ") {
+        let name = argument
+            .strip_prefix("use profile")
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(DEFAULT_PROFILE_NAME);
+        let exists = memory
+            .show_profile(name)
+            .map_err(|error| error.to_string())?
+            .is_some();
+        if !exists && name != DEFAULT_PROFILE_NAME {
+            return Err(format!("Профиль {name} не найден."));
+        }
+        let changed = chat.select_profile(name.into());
         if changed {
             store.save(chat).map_err(|error| error.to_string())?;
         }
-        return Ok(format!(
-            "Профиль {} для текущего чата.",
-            if enabled {
-                "подключён"
-            } else {
-                "отключён"
-            }
-        ));
+        return Ok(format!("Профиль {name} подключён для текущего чата."));
+    }
+    if argument == "unuse profile" {
+        let changed = chat.set_profile_enabled(false);
+        if changed {
+            store.save(chat).map_err(|error| error.to_string())?;
+        }
+        return Ok("Профиль отключён для текущего чата.".into());
     }
     for (prefix, enabled) in [("use ", true), ("unuse ", false)] {
         if let Some(rest) = argument.strip_prefix(prefix) {
@@ -326,6 +408,34 @@ fn display_names(names: &[String]) -> String {
     }
 }
 
+fn display_profile(memory: &MemoryStore, name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("Укажите имя профиля.".into());
+    }
+    let path = memory
+        .profile_path(name)
+        .map_err(|error| error.to_string())?;
+    memory
+        .show_profile(name)
+        .map(|profile| {
+            profile.map_or_else(
+                || format!("Профиль {name} не найден: {}", path.display()),
+                |content| {
+                    format!(
+                        "Профиль: {name}\n\n{}\n\nФайл: {}",
+                        content.trim(),
+                        path.display()
+                    )
+                },
+            )
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn is_profile_section(value: &str) -> bool {
+    matches!(value, "style" | "constraints" | "context")
+}
+
 impl fmt::Display for LongTermKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -344,6 +454,8 @@ pub(crate) struct MemoryRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MemorySelection {
     pub(crate) profile: bool,
+    #[serde(default = "default_profile_name")]
+    pub(crate) profile_name: String,
     pub(crate) entries: BTreeSet<MemoryRef>,
 }
 
@@ -351,14 +463,20 @@ impl Default for MemorySelection {
     fn default() -> Self {
         Self {
             profile: true,
+            profile_name: default_profile_name(),
             entries: BTreeSet::new(),
         }
     }
 }
 
+fn default_profile_name() -> String {
+    DEFAULT_PROFILE_NAME.to_owned()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MemoryContext {
     pub(crate) profile: Option<String>,
+    pub(crate) profile_name: Option<String>,
     pub(crate) long_term: Vec<(MemoryRef, String)>,
     pub(crate) working: WorkingMemory,
 }
@@ -367,7 +485,10 @@ impl MemoryContext {
     pub(crate) fn prompt_blocks(&self) -> Vec<String> {
         let mut blocks = Vec::new();
         if let Some(profile) = &self.profile {
-            blocks.push(format!("[ДОЛГОВРЕМЕННАЯ ПАМЯТЬ: ПРОФИЛЬ]\n{profile}"));
+            blocks.push(format!(
+                "[ДОЛГОВРЕМЕННАЯ ПАМЯТЬ: ПРОФИЛЬ / {}]\n{profile}",
+                self.profile_name.as_deref().unwrap_or(DEFAULT_PROFILE_NAME)
+            ));
         }
         for (reference, content) in &self.long_term {
             blocks.push(format!(
@@ -426,12 +547,22 @@ impl MemoryStore {
         &self.directory
     }
 
-    pub(crate) fn profile_path(&self) -> PathBuf {
-        self.directory.join("profile.md")
+    pub(crate) fn profiles_directory(&self) -> PathBuf {
+        self.directory.join("profiles")
+    }
+
+    pub(crate) fn profile_path(&self, name: &str) -> Result<PathBuf, MemoryError> {
+        validate_name(name)?;
+        Ok(self.profiles_directory().join(format!("{name}.md")))
     }
 
     pub(crate) fn initialize_profile(&self) -> Result<bool, MemoryError> {
-        let path = self.profile_path();
+        self.create_profile(DEFAULT_PROFILE_NAME)
+    }
+
+    pub(crate) fn create_profile(&self, name: &str) -> Result<bool, MemoryError> {
+        self.ensure_profile_layout()?;
+        let path = self.profile_path(name)?;
         if path.exists() {
             return Ok(false);
         }
@@ -439,13 +570,30 @@ impl MemoryStore {
         Ok(true)
     }
 
+    pub(crate) fn list_profiles(&self) -> Result<Vec<String>, MemoryError> {
+        self.ensure_profile_layout()?;
+        self.list_markdown_files(&self.profiles_directory())
+    }
+
     pub(crate) fn load_context(
         &self,
         working: &WorkingMemory,
         selection: &MemorySelection,
     ) -> Result<MemoryContext, MemoryError> {
+        self.ensure_profile_layout()?;
         let profile = if selection.profile {
-            self.read_optional(&self.profile_path())?
+            let path = self.profile_path(&selection.profile_name)?;
+            if selection.profile_name == DEFAULT_PROFILE_NAME {
+                self.read_optional(&path)?
+            } else {
+                Some(self.read_optional(&path)?.ok_or_else(|| {
+                    MemoryError::Invalid(format!(
+                        "Выбранный профиль {} не найден: {}",
+                        selection.profile_name,
+                        path.display()
+                    ))
+                })?)
+            }
         } else {
             None
         };
@@ -462,22 +610,25 @@ impl MemoryStore {
                 .sum::<usize>();
         if bytes > MAX_LONG_TERM_BYTES {
             return Err(MemoryError::Invalid(format!(
-                "Выбранная долговременная память занимает {bytes} байт; допустимо не более {MAX_LONG_TERM_BYTES}. Отключите часть записей через /memory unuse."
+                "Выбранная долговременная память занимает {bytes} байт; допустимо не более {MAX_LONG_TERM_BYTES}. Отключите профиль или часть записей через /memory unuse."
             )));
         }
         Ok(MemoryContext {
+            profile_name: profile.as_ref().map(|_| selection.profile_name.clone()),
             profile,
             long_term,
             working: working.clone(),
         })
     }
 
-    pub(crate) fn show_profile(&self) -> Result<Option<String>, MemoryError> {
-        self.read_optional(&self.profile_path())
+    pub(crate) fn show_profile(&self, name: &str) -> Result<Option<String>, MemoryError> {
+        self.ensure_profile_layout()?;
+        self.read_optional(&self.profile_path(name)?)
     }
 
     pub(crate) fn set_profile_section(
         &self,
+        name: &str,
         section: &str,
         value: &str,
     ) -> Result<(), MemoryError> {
@@ -497,10 +648,24 @@ impl MemoryStore {
             ));
         }
         let current = self
-            .show_profile()?
+            .show_profile(name)?
             .unwrap_or_else(|| profile_template().to_owned());
         let updated = replace_profile_section(&current, heading, value.trim())?;
-        self.write_atomic(&self.profile_path(), &updated)
+        self.write_atomic(&self.profile_path(name)?, &updated)
+    }
+
+    pub(crate) fn delete_profile(&self, name: &str) -> Result<bool, MemoryError> {
+        self.ensure_profile_layout()?;
+        let path = self.profile_path(name)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(MemoryError::Io {
+                action: "удалить",
+                path,
+                source,
+            }),
+        }
     }
 
     pub(crate) fn set_entry(
@@ -538,13 +703,17 @@ impl MemoryStore {
 
     pub(crate) fn list(&self, kind: LongTermKind) -> Result<Vec<String>, MemoryError> {
         let directory = self.directory.join(kind.directory());
-        let entries = match fs::read_dir(&directory) {
+        self.list_markdown_files(&directory)
+    }
+
+    fn list_markdown_files(&self, directory: &Path) -> Result<Vec<String>, MemoryError> {
+        let entries = match fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(source) => {
                 return Err(MemoryError::Io {
                     action: "прочитать каталог",
-                    path: directory,
+                    path: directory.to_owned(),
                     source,
                 });
             }
@@ -560,6 +729,28 @@ impl MemoryStore {
             .collect::<Vec<_>>();
         names.sort();
         Ok(names)
+    }
+
+    fn ensure_profile_layout(&self) -> Result<(), MemoryError> {
+        let legacy = self.directory.join("profile.md");
+        if !legacy.exists() {
+            return Ok(());
+        }
+        let profiles = self.profiles_directory();
+        fs::create_dir_all(&profiles).map_err(|source| MemoryError::Io {
+            action: "создать каталог профилей",
+            path: profiles.clone(),
+            source,
+        })?;
+        let default = profiles.join(format!("{DEFAULT_PROFILE_NAME}.md"));
+        if default.exists() {
+            return Ok(());
+        }
+        fs::rename(&legacy, &default).map_err(|source| MemoryError::Io {
+            action: "перенести старый профиль",
+            path: legacy,
+            source,
+        })
     }
 
     fn entry_path(&self, kind: LongTermKind, name: &str) -> Result<PathBuf, MemoryError> {
@@ -809,7 +1000,9 @@ mod tests {
         let memory = MemoryStore::new(&directory.0);
         memory.initialize_profile().expect("profile");
         fs::write(
-            memory.profile_path(),
+            memory
+                .profile_path(DEFAULT_PROFILE_NAME)
+                .expect("default profile path"),
             "# Профиль\n\n## Style\nНовый стиль\n\n## Constraints\n\n## Context\n",
         )
         .expect("manual edit");
@@ -817,6 +1010,169 @@ mod tests {
             .load_context(&WorkingMemory::new(), &MemorySelection::default())
             .expect("reload");
         assert!(context.profile.expect("profile").contains("Новый стиль"));
+    }
+
+    #[test]
+    fn named_profiles_are_isolated_and_selected_per_chat() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut beginner_chat = Chat::new();
+
+        execute_command(&store, &mut beginner_chat, Some("profile create beginner"))
+            .expect("beginner profile");
+        execute_command(&store, &mut beginner_chat, Some("profile create senior"))
+            .expect("senior profile");
+        execute_command(
+            &store,
+            &mut beginner_chat,
+            Some("profile set beginner style Объясняй простыми словами"),
+        )
+        .expect("beginner style");
+        execute_command(
+            &store,
+            &mut beginner_chat,
+            Some("profile set senior style Используй профессиональную терминологию"),
+        )
+        .expect("senior style");
+        assert!(
+            execute_command(&store, &mut beginner_chat, Some("profile create beginner")).is_err()
+        );
+        assert!(execute_command(&store, &mut beginner_chat, Some("use profile missing")).is_err());
+        assert_eq!(
+            beginner_chat.memory_selection().profile_name,
+            DEFAULT_PROFILE_NAME,
+            "создание и редактирование не должны переключать профиль"
+        );
+        execute_command(&store, &mut beginner_chat, Some("use profile beginner"))
+            .expect("select beginner");
+
+        let beginner_id = beginner_chat.id();
+        let beginner_context = store
+            .memory()
+            .load_context(
+                beginner_chat.working_memory(),
+                beginner_chat.memory_selection(),
+            )
+            .expect("beginner context");
+        assert_eq!(beginner_context.profile_name.as_deref(), Some("beginner"));
+        assert!(
+            beginner_context
+                .profile
+                .as_deref()
+                .is_some_and(|profile| profile.contains("простыми словами"))
+        );
+        assert!(beginner_context.display().contains("ПРОФИЛЬ / beginner"));
+
+        let mut senior_chat = Chat::new();
+        execute_command(&store, &mut senior_chat, Some("use profile senior"))
+            .expect("select senior");
+        let senior_id = senior_chat.id();
+        let senior_context = store
+            .memory()
+            .load_context(senior_chat.working_memory(), senior_chat.memory_selection())
+            .expect("senior context");
+        assert_eq!(senior_context.profile_name.as_deref(), Some("senior"));
+        assert!(
+            senior_context
+                .profile
+                .as_deref()
+                .is_some_and(|profile| profile.contains("профессиональную терминологию"))
+        );
+
+        let restored = store.load(beginner_id).expect("restore beginner chat");
+        assert!(restored.memory_selection().profile);
+        assert_eq!(restored.memory_selection().profile_name, "beginner");
+        assert_eq!(
+            store
+                .load(senior_id)
+                .expect("restore senior chat")
+                .memory_selection()
+                .profile_name,
+            "senior"
+        );
+        let list = execute_command(&store, &mut beginner_chat, Some("profile list"))
+            .expect("profile list");
+        assert!(list.contains("* beginner"));
+        assert!(list.contains("  senior"));
+
+        execute_command(&store, &mut beginner_chat, Some("profile delete beginner"))
+            .expect("delete active profile");
+        assert!(!beginner_chat.memory_selection().profile);
+        assert!(
+            !store
+                .load(beginner_id)
+                .expect("restore disabled profile")
+                .memory_selection()
+                .profile
+        );
+        assert!(
+            store
+                .memory()
+                .load_context(
+                    beginner_chat.working_memory(),
+                    beginner_chat.memory_selection(),
+                )
+                .expect("disabled profile context")
+                .profile
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_profile_to_named_default_without_overwriting() {
+        let directory = TestDirectory::new();
+        let memory = MemoryStore::new(&directory.0);
+        fs::create_dir_all(memory.directory()).expect("memory directory");
+        let legacy = memory.directory().join("profile.md");
+        fs::write(&legacy, "старый профиль").expect("legacy profile");
+
+        assert_eq!(
+            memory.list_profiles().expect("migrate profile"),
+            vec![DEFAULT_PROFILE_NAME]
+        );
+        assert!(!legacy.exists());
+        assert_eq!(
+            memory
+                .show_profile(DEFAULT_PROFILE_NAME)
+                .expect("default profile")
+                .as_deref(),
+            Some("старый профиль")
+        );
+
+        fs::write(&legacy, "резервная копия").expect("second legacy profile");
+        memory.list_profiles().expect("keep existing default");
+        assert!(legacy.exists());
+        assert_eq!(
+            memory
+                .show_profile(DEFAULT_PROFILE_NAME)
+                .expect("unchanged default")
+                .as_deref(),
+            Some("старый профиль")
+        );
+    }
+
+    #[test]
+    fn old_memory_selection_uses_default_profile_name() {
+        let selection: MemorySelection =
+            serde_json::from_str(r#"{"profile":true,"entries":[]}"#).expect("legacy selection");
+
+        assert!(selection.profile);
+        assert_eq!(selection.profile_name, DEFAULT_PROFILE_NAME);
+    }
+
+    #[test]
+    fn selected_missing_named_profile_is_reported() {
+        let directory = TestDirectory::new();
+        let memory = MemoryStore::new(&directory.0);
+        let selection = MemorySelection {
+            profile_name: "missing".into(),
+            ..MemorySelection::default()
+        };
+
+        let error = memory
+            .load_context(&WorkingMemory::new(), &selection)
+            .expect_err("missing named profile");
+        assert!(error.to_string().contains("missing.md"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 6;
+const DATABASE_SCHEMA_VERSION: i64 = 7;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -185,6 +185,16 @@ impl Chat {
         let changed = self.memory_selection.profile != enabled;
         if changed {
             self.memory_selection.profile = enabled;
+            self.mark_changed();
+        }
+        changed
+    }
+
+    pub(crate) fn select_profile(&mut self, name: String) -> bool {
+        let changed = !self.memory_selection.profile || self.memory_selection.profile_name != name;
+        if changed {
+            self.memory_selection.profile = true;
+            self.memory_selection.profile_name = name;
             self.mark_changed();
         }
         changed
@@ -606,17 +616,21 @@ impl ChatStore {
         }
         validate_working_memory(&working_memory)
             .map_err(|_| ChatStoreError::InvalidConversation(id))?;
+        let profile_settings = self
+            .connection
+            .query_row(
+                "SELECT profile_enabled, profile_name FROM memory_settings WHERE chat_id = ?1",
+                params![id.to_string()],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(self.database_error("прочитать настройки памяти"))?
+            .unwrap_or_else(|| (true, crate::memory::DEFAULT_PROFILE_NAME.into()));
+        crate::memory::validate_name(&profile_settings.1)
+            .map_err(|_| ChatStoreError::InvalidConversation(id))?;
         let mut memory_selection = MemorySelection {
-            profile: self
-                .connection
-                .query_row(
-                    "SELECT profile_enabled FROM memory_settings WHERE chat_id = ?1",
-                    params![id.to_string()],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()
-                .map_err(self.database_error("прочитать настройки памяти"))?
-                .unwrap_or(true),
+            profile: profile_settings.0,
+            profile_name: profile_settings.1,
             ..MemorySelection::default()
         };
         {
@@ -1232,9 +1246,15 @@ fn write_chat(
     }
     transaction
         .execute(
-            "INSERT INTO memory_settings(chat_id, profile_enabled) VALUES (?1, ?2)
-             ON CONFLICT(chat_id) DO UPDATE SET profile_enabled = excluded.profile_enabled",
-            params![id, chat.memory_selection.profile],
+            "INSERT INTO memory_settings(chat_id, profile_enabled, profile_name) VALUES (?1, ?2, ?3)
+             ON CONFLICT(chat_id) DO UPDATE SET
+                 profile_enabled = excluded.profile_enabled,
+                 profile_name = excluded.profile_name",
+            params![
+                id,
+                chat.memory_selection.profile,
+                chat.memory_selection.profile_name
+            ],
         )
         .map_err(|source| database_error("записать настройки памяти", database_path, source))?;
     transaction
@@ -1370,7 +1390,8 @@ fn initialize_database(
                  );
                  CREATE TABLE IF NOT EXISTS memory_settings (
                      chat_id TEXT PRIMARY KEY NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-                     profile_enabled INTEGER NOT NULL DEFAULT 1 CHECK(profile_enabled IN (0, 1))
+                     profile_enabled INTEGER NOT NULL DEFAULT 1 CHECK(profile_enabled IN (0, 1)),
+                     profile_name TEXT NOT NULL DEFAULT 'default'
                  );
                  CREATE TABLE IF NOT EXISTS memory_selections (
                      chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
@@ -1382,6 +1403,36 @@ fn initialize_database(
                  COMMIT;",
             )
             .map_err(|source| database_error("добавить слои памяти", database_path, source))?;
+    }
+    if version < 7 {
+        let has_profile_name = connection
+            .prepare("PRAGMA table_info(memory_settings)")
+            .and_then(|mut statement| {
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                for column in columns {
+                    if column.as_deref() == Ok("profile_name") {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+            .map_err(|source| database_error("проверить схему профилей", database_path, source))?;
+        if has_profile_name {
+            connection
+                .execute_batch("PRAGMA user_version = 7;")
+                .map_err(|source| {
+                    database_error("обновить версию профилей", database_path, source)
+                })?;
+        } else {
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE memory_settings ADD COLUMN profile_name TEXT NOT NULL DEFAULT 'default';
+                     PRAGMA user_version = 7;
+                     COMMIT;",
+                )
+                .map_err(|source| database_error("добавить именованные профили", database_path, source))?;
+        }
     }
     Ok(())
 }
@@ -1978,6 +2029,38 @@ mod tests {
     }
 
     #[test]
+    fn migrates_profile_selection_from_v6_to_named_default() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut chat = Chat::new();
+        chat.select_profile("senior".into());
+        store.save(&mut chat).expect("save profile selection");
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE memory_settings DROP COLUMN profile_name;
+                 PRAGMA user_version = 6;",
+            )
+            .expect("v6 fixture");
+        drop(store);
+
+        let migrated = ChatStore::for_tests(directory.0.clone()).expect("migrate v6");
+        let restored = migrated.load(chat.id()).expect("restore selection");
+        assert!(restored.memory_selection().profile);
+        assert_eq!(
+            restored.memory_selection().profile_name,
+            crate::memory::DEFAULT_PROFILE_NAME
+        );
+        assert_eq!(
+            migrated
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            DATABASE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
     fn shortens_long_title_on_character_boundary() {
         let question = "я".repeat(100);
         let title = title_from_question(&question);
@@ -2034,6 +2117,7 @@ mod tests {
             kind: crate::memory::LongTermKind::Decision,
             name: "architecture".into(),
         });
+        main.select_profile("senior".into());
         store.save(&mut main).expect("save main");
         store.create_checkpoint(&main, "base").expect("checkpoint");
 
@@ -2045,6 +2129,8 @@ mod tests {
             Some("planning")
         );
         assert_eq!(first.memory_selection().entries.len(), 1);
+        assert_eq!(first.memory_selection().profile_name, "senior");
+        first.select_profile("beginner".into());
         first
             .set_working("step".into(), "execution".into())
             .expect("independent working memory");
@@ -2070,6 +2156,8 @@ mod tests {
             second.working_memory().get("step").map(String::as_str),
             Some("planning")
         );
+        assert_eq!(first.memory_selection().profile_name, "beginner");
+        assert_eq!(second.memory_selection().profile_name, "senior");
         assert!(
             first
                 .messages()

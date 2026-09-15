@@ -179,6 +179,7 @@ fn memory_layers_are_injected_before_dialogue_as_separate_blocks() {
     working.insert("goal".into(), "Проверить prompt".into());
     let memory = crate::memory::MemoryContext {
         profile: Some("## Style\nКратко".into()),
+        profile_name: Some("default".into()),
         long_term: vec![(
             crate::memory::MemoryRef {
                 kind: crate::memory::LongTermKind::Decision,
@@ -246,7 +247,7 @@ async fn simple_agent_returns_streamed_answer_without_catalog_or_tools() {
 #[tokio::test]
 async fn selected_profile_changes_answer_for_the_same_question() {
     let server = MockServer::new(|request| {
-        let personalized = request["messages"]
+        let senior = request["messages"]
             .as_array()
             .expect("messages")
             .iter()
@@ -255,26 +256,41 @@ async fn selected_profile_changes_answer_for_the_same_question() {
                     .as_str()
                     .is_some_and(|content| content.contains("Senior Rust developer"))
             });
-        text_response(if personalized {
+        text_response(if senior {
             "Ответ для опытного Rust-разработчика"
         } else {
-            "Общее объяснение"
+            "Ответ для начинающего"
         })
     });
-    let plain = runner(&server)
-        .respond_streaming(request("Объясни DI", vec![]), |_| Ok(()))
+    let mut beginner_request = request("Объясни DI", vec![]);
+    beginner_request.memory.profile_name = Some("beginner".into());
+    beginner_request.memory.profile = Some("## Context\nBeginner developer".into());
+    let beginner = runner(&server)
+        .respond_streaming(beginner_request, |_| Ok(()))
         .await
-        .expect("plain answer");
-    let mut personalized_request = request("Объясни DI", vec![]);
-    personalized_request.memory.profile = Some("## Context\nSenior Rust developer".into());
-    let personalized = runner(&server)
-        .respond_streaming(personalized_request, |_| Ok(()))
+        .expect("beginner answer");
+    let mut senior_request = request("Объясни DI", vec![]);
+    senior_request.memory.profile_name = Some("senior".into());
+    senior_request.memory.profile = Some("## Context\nSenior Rust developer".into());
+    let senior = runner(&server)
+        .respond_streaming(senior_request, |_| Ok(()))
         .await
-        .expect("personalized answer");
+        .expect("senior answer");
 
-    assert_eq!(plain.content, "Общее объяснение");
-    assert_eq!(personalized.content, "Ответ для опытного Rust-разработчика");
-    assert_eq!(server.requests().len(), 2);
+    assert_eq!(beginner.content, "Ответ для начинающего");
+    assert_eq!(senior.content, "Ответ для опытного Rust-разработчика");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0]["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("ПРОФИЛЬ / beginner"))
+    );
+    assert!(
+        requests[1]["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("ПРОФИЛЬ / senior"))
+    );
 }
 
 #[tokio::test]
