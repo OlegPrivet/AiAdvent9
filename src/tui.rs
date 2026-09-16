@@ -61,6 +61,11 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     CommandOption::run("/agents", "глобальный каталог агентов", &["/агенты"]),
     CommandOption::run("/facts", "память Sticky Facts", &["/факты"]),
     CommandOption::run("/memory", "слои памяти агента", &["/память"]),
+    CommandOption::run("/task", "состояние задачи", &["/задача"]),
+    CommandOption::run("/task start", "начать задачу: добавьте описание", &[]),
+    CommandOption::run("/task approve", "утвердить план и выполнить", &[]),
+    CommandOption::run("/task pause", "приостановить задачу", &[]),
+    CommandOption::run("/task resume", "продолжить задачу", &[]),
     CommandOption::run("/checkpoint", "сохранить точку ветвления", &["/чекпоинт"]),
     CommandOption::run("/branch", "управление ветками", &["/ветка"]),
 ];
@@ -131,15 +136,21 @@ pub(crate) async fn run(
     app.price_refresh_started();
 
     if let Some(question) = initial_question.filter(|question| !question.trim().is_empty()) {
-        let question = app.begin_question(question)?;
-        request_task = Some(spawn_request(
-            client,
-            store,
-            app.chat,
-            question,
-            app.request_id,
-            worker_tx.clone(),
-        ));
+        app.set_input(&question);
+        match app.take_question() {
+            Ok(Some(question)) => {
+                request_task = Some(spawn_request(
+                    client,
+                    store,
+                    app.chat,
+                    question,
+                    app.request_id,
+                    worker_tx.clone(),
+                ))
+            }
+            Ok(None) => {}
+            Err(error) => app.notice = Some(error.to_string()),
+        }
     }
 
     let mut needs_draw = true;
@@ -157,6 +168,24 @@ pub(crate) async fn run(
                 request_task.take();
             }
             app.handle_worker_event(worker_event);
+            needs_draw = true;
+        }
+
+        if app.pending_question.is_none() && app.scheduled_task {
+            match app.take_scheduled_task() {
+                Ok(Some(question)) => {
+                    request_task = Some(spawn_request(
+                        client,
+                        store,
+                        app.chat,
+                        question,
+                        app.request_id,
+                        worker_tx.clone(),
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => app.pause_task(&error.to_string()),
+            }
             needs_draw = true;
         }
 
@@ -193,8 +222,15 @@ pub(crate) async fn run(
                     app.handle_key(key)
                 }
                 Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse.kind);
-                    Action::None
+                    if mouse.kind == MouseEventKind::Down(event::MouseButton::Left)
+                        && app.pause_button.contains((mouse.column, mouse.row).into())
+                        && app.modal.is_none()
+                    {
+                        Action::CancelRequest
+                    } else {
+                        app.handle_mouse(mouse.kind);
+                        Action::None
+                    }
                 }
                 Event::Paste(text) => {
                     app.handle_paste(&text);
@@ -297,6 +333,7 @@ fn spawn_request(
                             calls: Vec::new(),
                             already_counted_usage: None,
                             updated_facts: None,
+                            updated_task: None,
                         });
                     }
                     let mut pending_delta = String::new();
@@ -426,6 +463,9 @@ struct App<'a> {
     modal: Option<Modal>,
     exit_requested: bool,
     command_selection: usize,
+    task_budget: crate::task::RunBudget,
+    scheduled_task: bool,
+    pause_button: Rect,
 }
 
 impl<'a> App<'a> {
@@ -468,6 +508,9 @@ impl<'a> App<'a> {
             modal: None,
             exit_requested: false,
             command_selection: 0,
+            task_budget: crate::task::RunBudget::default(),
+            scheduled_task: false,
+            pause_button: Rect::default(),
         }
     }
 
@@ -486,7 +529,7 @@ impl<'a> App<'a> {
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),
+                Constraint::Length(if self.chat.task().is_some() { 3 } else { 2 }),
                 Constraint::Min(3),
                 Constraint::Length(input_height),
                 Constraint::Length(palette_height),
@@ -495,6 +538,21 @@ impl<'a> App<'a> {
             .split(area);
 
         self.render_header(frame, layout[0]);
+        self.pause_button = Rect::default();
+        if self.chat.task().is_some() && self.pending_question.is_some() {
+            let width = layout[0].width.min(24);
+            self.pause_button = Rect::new(
+                layout[0].right().saturating_sub(width),
+                layout[0].y,
+                width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new("[ ⏸ Пауза · Ctrl+C ]")
+                    .style(Style::default().fg(Color::Black).bg(Color::Yellow)),
+                self.pause_button,
+            );
+        }
         self.render_history(frame, layout[1]);
         self.render_input(frame, layout[2]);
         if !command_options.is_empty() {
@@ -516,7 +574,7 @@ impl<'a> App<'a> {
             .notice
             .as_deref()
             .unwrap_or("PgUp/PgDn или колесо: история · Ctrl+End: к последнему ответу");
-        let text = Text::from(vec![
+        let mut text = Text::from(vec![
             Line::styled(
                 title,
                 Style::default()
@@ -528,6 +586,12 @@ impl<'a> App<'a> {
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
+        if let Some(task) = self.chat.task() {
+            text.lines.push(Line::styled(
+                sanitize_terminal_text(&task.status()),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         frame.render_widget(Paragraph::new(text), area);
     }
 
@@ -559,7 +623,9 @@ impl<'a> App<'a> {
     }
 
     fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let title = if self.pending_question.is_some() {
+        let title = if self.pending_question.is_some() && self.chat.task().is_some() {
+            " Задача выполняется · Ctrl+C или /task pause: пауза "
+        } else if self.pending_question.is_some() {
             " Думаю… · Ctrl+C: отменить "
         } else if self.edit_mode == EditMode::Vim {
             match self.vim_mode {
@@ -817,6 +883,21 @@ impl<'a> App<'a> {
                 self.scroll_down(10);
                 Action::None
             }
+            _ if self.pending_question.is_some() && self.chat.task().is_some() => {
+                if key.code == KeyCode::Enter {
+                    if self.input_value().trim() == "/task pause" {
+                        self.set_input("");
+                        Action::CancelRequest
+                    } else {
+                        self.notice =
+                            Some("Во время выполнения доступна /task pause или Ctrl+C.".into());
+                        Action::None
+                    }
+                } else {
+                    self.input.input(key);
+                    Action::None
+                }
+            }
             _ if self.pending_question.is_some() => Action::None,
             _ if self.edit_mode == EditMode::Vim => self.handle_vim_key(key),
             _ => self.handle_emacs_key(key),
@@ -929,7 +1010,7 @@ impl<'a> App<'a> {
     }
 
     fn handle_paste(&mut self, text: &str) {
-        if self.modal.is_none() && self.pending_question.is_none() {
+        if self.modal.is_none() && (self.pending_question.is_none() || self.chat.task().is_some()) {
             self.command_selection = 0;
             self.input.insert_str(text);
         } else if let Some(Modal::Text { input, .. }) = &mut self.modal {
@@ -968,6 +1049,8 @@ impl<'a> App<'a> {
             self.handle_command(command);
             return Ok(None);
         }
+        crate::task::prepare_input(self.store, self.chat, &value).map_err(io::Error::other)?;
+        self.task_budget = crate::task::RunBudget::default();
         self.begin_question(value).map(Some)
     }
 
@@ -1011,6 +1094,10 @@ impl<'a> App<'a> {
                 self.set_input("");
                 match option.action {
                     CommandAction::Run(command) => {
+                        if command == "/task start" {
+                            self.set_input("/task start ");
+                            return Some(Action::None);
+                        }
                         if crate::summary::is_command(command) {
                             return Some(match self.begin_question("/summarize".into()) {
                                 Ok(question) => Action::Submit(question),
@@ -1052,6 +1139,19 @@ impl<'a> App<'a> {
         Ok(value)
     }
 
+    fn take_scheduled_task(&mut self) -> io::Result<Option<String>> {
+        if self.pending_question.is_some() || !std::mem::take(&mut self.scheduled_task) {
+            return Ok(None);
+        }
+        let Some(question) = crate::task::next_question(self.chat) else {
+            return Ok(None);
+        };
+        let unfinished_input = self.input_value();
+        let result = self.begin_question(question).map(Some);
+        self.set_input(&unfinished_input);
+        result
+    }
+
     fn handle_command(&mut self, command: ParsedCommand<'_>) {
         if self.pending_question.is_some() {
             self.notice = Some("Дождитесь завершения запроса или отмените его через Ctrl+C".into());
@@ -1078,6 +1178,22 @@ impl<'a> App<'a> {
             self.handle_facts(command.argument);
         } else if command.matches(&["/memory", "/память"]) {
             self.handle_memory(command.argument);
+        } else if command.matches(&["/task", "/задача"]) {
+            match crate::task::command(self.store, self.chat, command.argument) {
+                Ok(result) => {
+                    self.scheduled_task = result.run;
+                    self.task_budget = crate::task::RunBudget::default();
+                    if result.run {
+                        self.notice = Some(result.message);
+                    } else {
+                        self.modal = Some(Modal::Message {
+                            title: "Состояние задачи".into(),
+                            content: result.message,
+                        });
+                    }
+                }
+                Err(error) => self.notice = Some(error.to_string()),
+            }
         } else if command.matches(&["/checkpoint", "/чекпоинт"]) {
             self.handle_checkpoint(command.argument);
         } else if command.matches(&["/branch", "/ветка"]) {
@@ -1351,6 +1467,26 @@ impl<'a> App<'a> {
                             |summary| summary.report(),
                         ));
                     }
+                    Ok(answer) if self.chat.task().is_some() => {
+                        self.trace_question = None;
+                        self.streamed_answer.clear();
+                        self.transient_metrics = None;
+                        match crate::task::commit_answer(
+                            self.store,
+                            self.chat,
+                            question,
+                            answer,
+                            &self.prices,
+                            &mut self.task_budget,
+                        ) {
+                            Ok(()) => {
+                                self.scheduled_task =
+                                    crate::task::next_question(self.chat).is_some();
+                                self.notice = self.chat.task().map(crate::task::TaskState::status);
+                            }
+                            Err(error) => self.pause_task(&error.to_string()),
+                        }
+                    }
                     Ok(answer) => {
                         self.trace_question = None;
                         let truncated = answer.truncated;
@@ -1387,6 +1523,9 @@ impl<'a> App<'a> {
                         ));
                         self.streamed_answer.clear();
                         self.notice = Some(format!("Ошибка запроса: {error}"));
+                        if self.chat.task().is_some() {
+                            self.pause_task(&error.to_string());
+                        }
                     }
                 }
                 self.follow_tail = true;
@@ -1412,6 +1551,8 @@ impl<'a> App<'a> {
     }
 
     fn cancel_request(&mut self) {
+        self.scheduled_task = false;
+        self.request_id = Uuid::new_v4();
         let elapsed_ms = self
             .request_started_at
             .take()
@@ -1425,6 +1566,17 @@ impl<'a> App<'a> {
         self.streamed_answer.clear();
         self.transient_metrics = Some(ResponseMetrics::new(model, elapsed_ms, None, &self.prices));
         self.notice = Some("Запрос отменён".to_owned());
+        if self.chat.task().is_some() {
+            self.pause_task("Остановлено пользователем");
+        }
+    }
+
+    fn pause_task(&mut self, reason: &str) {
+        self.scheduled_task = false;
+        self.notice = Some(match crate::task::pause(self.store, self.chat, reason) {
+            Ok(()) => format!("Задача на паузе: {reason}. Продолжить: /task resume"),
+            Err(error) => format!("Выполнение остановлено: {reason}. {error}"),
+        });
     }
 
     fn price_refresh_started(&mut self) {
@@ -2103,6 +2255,9 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
                 "/facts ...              память Sticky Facts",
                 "/memory ...             short-term, working и long-term память",
+                "/task start <описание>   начать задачу; /task — статус",
+                "/task approve           утвердить план и запустить выполнение",
+                "/task pause | resume    пауза / продолжение; Ctrl+C: пауза",
                 "/checkpoint <имя>       сохранить точку ветвления",
                 "/branch ...             создать, показать или открыть ветку",
                 "/summarize, /суммаризация заменить историю резюме",
@@ -2326,6 +2481,108 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn task_pause_button_shortcut_and_command_keep_last_committed_step() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        app.set_input("/task start Описание проекта");
+        assert!(app.take_question().unwrap().is_none());
+        app.take_scheduled_task().unwrap().unwrap();
+        let cancelled = app.request_id;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(app.pause_button.width > 0);
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::CancelRequest
+        ));
+        app.set_input("/task pause");
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::CancelRequest
+        ));
+        app.cancel_request();
+        assert!(app.chat.task().unwrap().paused);
+        assert!(app.pending_question.is_none());
+        assert!(app.take_scheduled_task().unwrap().is_none());
+        app.handle_worker_event(WorkerEvent::Agent(
+            cancelled,
+            AgentEvent::MainDelta("Поздний ответ".into()),
+        ));
+        app.handle_worker_event(WorkerEvent::Finished(
+            cancelled,
+            Err(AgentError::InvalidRequest("Поздняя ошибка".into())),
+        ));
+        assert!(app.streamed_answer.is_empty());
+        assert!(app.chat.messages().is_empty());
+        assert!(store.load(app.chat.id()).unwrap().task().unwrap().paused);
+        app.set_input("/task resume");
+        app.take_question().unwrap();
+        assert!(app.take_scheduled_task().unwrap().is_some());
+        assert_ne!(app.request_id, cancelled);
+    }
+
+    #[tokio::test]
+    async fn task_worker_commits_each_step_before_scheduling_next() {
+        let server = crate::test_http::MockServer::new(crate::test_http::task_response);
+        let client = Agent::new(
+            crate::api::NeuralDeepClient::new("test-key".into(), server.url.clone()).unwrap(),
+        );
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.set_input("/task start Описание проекта");
+        app.take_question().unwrap();
+        for iteration in 0..4 {
+            let question = app.take_scheduled_task().unwrap().expect("next step");
+            let worker = spawn_request(
+                &client,
+                &store,
+                app.chat,
+                question,
+                app.request_id,
+                tx.clone(),
+            );
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let finished = matches!(event, WorkerEvent::Finished(_, _));
+                app.handle_worker_event(event);
+                if finished {
+                    break;
+                }
+            }
+            drop(worker);
+            let saved = store.load(app.chat.id()).unwrap();
+            assert_eq!(saved.messages().len(), (iteration + 1) * 2);
+            if iteration == 0 {
+                assert!(!app.scheduled_task, "wait for approval");
+                assert!(app.take_scheduled_task().unwrap().is_none());
+                app.set_input("/task approve");
+                app.take_question().unwrap();
+            }
+        }
+        assert_eq!(app.chat.task().unwrap().stage, crate::task::TaskStage::Done);
+        assert!(!app.scheduled_task);
+        assert_eq!(server.requests().len(), 8);
     }
 
     #[test]
@@ -2718,6 +2975,7 @@ mod tests {
                 }],
                 already_counted_usage: None,
                 updated_facts: None,
+                updated_task: None,
             }),
         ));
         let trace = app.transcript_markdown();

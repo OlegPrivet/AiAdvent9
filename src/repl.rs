@@ -86,6 +86,16 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                     Ok(message) => writeln!(output, "{message}")?,
                     Err(error) => writeln!(output, "Память не изменена: {error}")?,
                 }
+            } else if command.matches(&["/task", "/задача"]) {
+                match crate::task::command(store, chat, command.argument) {
+                    Ok(result) => {
+                        writeln!(output, "{}", result.message)?;
+                        if result.run {
+                            run_task(client, store, chat, output, ui, prices).await?;
+                        }
+                    }
+                    Err(error) => writeln!(output, "{error}")?,
+                }
             } else if command.matches(&["/checkpoint", "/чекпоинт"]) {
                 create_checkpoint(store, chat, command.argument, output)?;
             } else if command.matches(&["/branch", "/ветка"]) {
@@ -178,6 +188,26 @@ async fn ask<W: Write>(
     ui: &TerminalUi,
     prices: &PriceCatalog,
 ) -> io::Result<()> {
+    if let Some(command) = ParsedCommand::parse(question)
+        && command.matches(&["/task", "/задача"])
+    {
+        match crate::task::command(store, chat, command.argument) {
+            Ok(result) => {
+                writeln!(output, "{}", result.message)?;
+                if result.run {
+                    run_task(client, store, chat, output, ui, prices).await?;
+                }
+            }
+            Err(error) => writeln!(output, "{error}")?,
+        }
+        return Ok(());
+    }
+    if chat.task().is_some() {
+        if let Err(error) = crate::task::prepare_input(store, chat, question) {
+            return writeln!(output, "{error}");
+        }
+        return run_task(client, store, chat, output, ui, prices).await;
+    }
     let agents = match store.agents().list() {
         Ok(agents) => agents,
         Err(error) => return writeln!(output, "Каталог агентов: {error}"),
@@ -234,6 +264,91 @@ async fn ask<W: Write>(
             writeln!(output, "Ошибка запроса: {error}\n")
         }
     }
+}
+
+async fn run_task<W: Write>(
+    client: &Agent,
+    store: &ChatStore,
+    chat: &mut Chat,
+    output: &mut W,
+    ui: &TerminalUi,
+    prices: &PriceCatalog,
+) -> io::Result<()> {
+    run_task_until(
+        client,
+        store,
+        chat,
+        output,
+        ui,
+        prices,
+        tokio::signal::ctrl_c(),
+    )
+    .await
+}
+
+async fn run_task_until<W: Write>(
+    client: &Agent,
+    store: &ChatStore,
+    chat: &mut Chat,
+    output: &mut W,
+    ui: &TerminalUi,
+    prices: &PriceCatalog,
+    cancellation: impl std::future::Future<Output = io::Result<()>>,
+) -> io::Result<()> {
+    tokio::pin!(cancellation);
+    let mut budget = crate::task::RunBudget::default();
+    while let Some(question) = crate::task::next_question(chat) {
+        if let Some(task) = chat.task() {
+            writeln!(output, "{} · Ctrl+C: пауза", task.status())?;
+        }
+        let request = (|| {
+            let agents = store.agents().list().map_err(|e| e.to_string())?;
+            let memory = store
+                .memory()
+                .load_context(chat.working_memory(), chat.memory_selection())
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(AgentRequest::new(chat, question.clone(), agents).with_memory(memory))
+        })();
+        let result = match request {
+            Ok(request) => {
+                let mut live = ui.begin_answer(output);
+                let result = tokio::select! {
+                    biased;
+                    signal = &mut cancellation => Err(signal.err().map_or_else(|| "Остановлено пользователем".into(), |e| format!("Ошибка обработчика паузы: {e}"))),
+                    result = client.respond_streaming(request, |event| live.agent_event(event)) => result.map_err(|e| e.to_string()),
+                };
+                match &result {
+                    Ok(answer) => live.finish(&answer.content)?,
+                    Err(_) => live.abort()?,
+                }
+                result
+            }
+            Err(error) => Err(error),
+        };
+        let error = match result {
+            Ok(answer) => {
+                crate::task::commit_answer(store, chat, question, answer, prices, &mut budget)
+                    .err()
+                    .map(|e| e.to_string())
+            }
+            Err(error) => Some(error),
+        };
+        if let Some(error) = error {
+            if let Err(save_error) = crate::task::pause(store, chat, &error) {
+                writeln!(output, "{save_error}")?;
+            }
+            writeln!(
+                output,
+                "Задача остановлена: {error}\nПродолжить: /task resume"
+            )?;
+            break;
+        }
+        ui.print_metrics(output, chat.last_response_metrics())?;
+    }
+    if let Some(task) = chat.task() {
+        writeln!(output, "{}", task.display())?;
+    }
+    Ok(())
 }
 
 fn configure_settings<I: LineInput, W: Write>(
@@ -634,6 +749,10 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(output, "Доступные команды:")?;
     writeln!(
         output,
+        "  /task [start <описание> | approve | pause | resume] — состояние задачи; Ctrl+C во время выполнения: пауза"
+    )?;
+    writeln!(
+        output,
         "  /summarize, /суммаризация заменить всю историю кратким резюме"
     )?;
     writeln!(
@@ -723,6 +842,90 @@ mod tests {
         let directory = TestDirectory::new();
         let store = ChatStore::for_tests(directory.0.clone()).expect("store should open");
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn task_commands_approve_then_automatically_run_to_done() {
+        let server = crate::test_http::MockServer::new(crate::test_http::task_response);
+        let client =
+            Agent::new(NeuralDeepClient::new("test-key".into(), server.url.clone()).unwrap());
+        let (_directory, store) = test_store();
+        let mut chat = Chat::new();
+        let mut input = BufferedInput::new(Cursor::new(
+            "/task start Описание проекта\n/task\n/task approve\n/exit\n",
+        ));
+        let mut output = Vec::new();
+        run(
+            &client,
+            &store,
+            &mut chat,
+            None,
+            &mut input,
+            &mut output,
+            ReplDisplay {
+                ui: &TerminalUi::plain(),
+                prices: &PriceCatalog::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(chat.task().unwrap().stage, crate::task::TaskStage::Done);
+        assert_eq!(server.requests().len(), 8);
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("утверждение: /task approve"));
+        assert!(text.contains("execution · шаг 2/2"));
+        assert!(text.contains("validation"));
+        assert!(text.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn task_cancellation_stops_inflight_request_and_keeps_pending_input() {
+        let server = crate::test_http::MockServer::new(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            crate::test_http::text_response("Поздний ответ")
+        });
+        let client =
+            Agent::new(NeuralDeepClient::new("test-key".into(), server.url.clone()).unwrap());
+        let (_directory, store) = test_store();
+        let mut chat = Chat::new();
+        crate::task::command(&store, &mut chat, Some("start Описание проекта")).unwrap();
+        crate::task::prepare_input(&store, &mut chat, "Уточнение, которое нельзя потерять")
+            .unwrap();
+        let cancellation = async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while server.requests().is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            Ok(())
+        };
+        let mut output = Vec::new();
+        run_task_until(
+            &client,
+            &store,
+            &mut chat,
+            &mut output,
+            &TerminalUi::plain(),
+            &PriceCatalog::default(),
+            cancellation,
+        )
+        .await
+        .unwrap();
+        assert!(chat.task().unwrap().paused);
+        assert!(chat.messages().is_empty());
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "no metadata or next step after cancellation"
+        );
+        let loaded = store.load(chat.id()).unwrap();
+        assert_eq!(
+            loaded.task().unwrap().pending_input.as_deref(),
+            Some("Уточнение, которое нельзя потерять")
+        );
+        assert!(String::from_utf8(output).unwrap().contains("/task resume"));
     }
 
     #[tokio::test]

@@ -69,6 +69,9 @@ impl TerminalUi {
     }
 
     pub(crate) fn print_chat<W: Write>(&self, output: &mut W, chat: &Chat) -> io::Result<()> {
+        if let Some(task) = chat.task() {
+            writeln!(output, "{}", task.display())?;
+        }
         writeln!(output, "\nЧат: {} [{}]", chat.title(), chat.id())?;
 
         if let Some(summary) = chat.summary() {

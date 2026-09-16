@@ -13,6 +13,7 @@ mod pricing;
 mod repl;
 mod settings;
 mod summary;
+mod task;
 #[cfg(test)]
 mod test_http;
 mod tui;

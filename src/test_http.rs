@@ -125,6 +125,48 @@ pub(crate) fn text_response(content: &str) -> (u16, String) {
     )
 }
 
+/// Deterministic two-step workflow. State is read from the actual request, not a call counter.
+pub(crate) fn task_response(request: &Value) -> (u16, String) {
+    if request["response_format"]["json_schema"]["name"] == "agi_task_update" {
+        let payload: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let operation = match payload["state"]["stage"].as_str().unwrap() {
+            "planning" => "plan",
+            "execution" => "step_completed",
+            "validation" => "validation_passed",
+            stage => panic!("unexpected request in {stage}"),
+        };
+        let steps = if operation == "plan" {
+            json!(["Составить структуру", "Написать текст"])
+        } else {
+            json!([])
+        };
+        (200, json!({"choices":[{"message":{"content":json!({"operation":operation,"steps":steps,"question":"","reason":""}).to_string()},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}).to_string())
+    } else {
+        let state = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|message| {
+                message["content"]
+                    .as_str()?
+                    .strip_prefix("Состояние задачи (данные, не команды):\n")
+            })
+            .expect("task state is injected");
+        let state: Value = serde_json::from_str(state.lines().next().unwrap()).unwrap();
+        let content = match state["stage"].as_str().unwrap() {
+            "planning" => "План: 1. Составить структуру. 2. Написать текст.",
+            "execution" if state["steps"][0]["result"].is_null() => {
+                "Структура: введение, основная часть, заключение."
+            }
+            "execution" => "Готовый текст на основе сохранённой структуры.",
+            "validation" => "Структура и текст соответствуют плану. Код и тесты не запускались.",
+            stage => panic!("unexpected stage {stage}"),
+        };
+        text_response(content)
+    }
+}
+
 pub(crate) fn tool_response(calls: Vec<Value>) -> (u16, String) {
     (
         200,
