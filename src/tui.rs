@@ -61,6 +61,7 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     CommandOption::run("/agents", "глобальный каталог агентов", &["/агенты"]),
     CommandOption::run("/facts", "память Sticky Facts", &["/факты"]),
     CommandOption::run("/memory", "слои памяти агента", &["/память"]),
+    CommandOption::run("/invariants", "глобальные инварианты", &["/инварианты"]),
     CommandOption::run("/task", "состояние задачи", &["/задача"]),
     CommandOption::run("/task start", "начать задачу: добавьте описание", &[]),
     CommandOption::run("/task approve", "утвердить план и выполнить", &[]),
@@ -302,7 +303,10 @@ fn spawn_request(
                     .map_err(|error| {
                         AgentError::InvalidRequest(format!("Ошибка памяти: {error}"))
                     })?;
-                Ok(request.with_memory(memory))
+                let invariants = store.invariants().list().map_err(|error| {
+                    AgentError::InvalidRequest(format!("Ошибка инвариантов: {error}"))
+                })?;
+                Ok(request.with_memory(memory).with_invariants(invariants))
             }
         });
     RequestTask(tokio::spawn(async move {
@@ -334,6 +338,7 @@ fn spawn_request(
                             already_counted_usage: None,
                             updated_facts: None,
                             updated_task: None,
+                            invariant_refusal: false,
                         });
                     }
                     let mut pending_delta = String::new();
@@ -1178,6 +1183,8 @@ impl<'a> App<'a> {
             self.handle_facts(command.argument);
         } else if command.matches(&["/memory", "/память"]) {
             self.handle_memory(command.argument);
+        } else if command.matches(&["/invariants", "/инварианты"]) {
+            self.handle_invariants(command.argument);
         } else if command.matches(&["/task", "/задача"]) {
             match crate::task::command(self.store, self.chat, command.argument) {
                 Ok(result) => {
@@ -1281,6 +1288,20 @@ impl<'a> App<'a> {
             }
             Ok(message) => self.notice = Some(message),
             Err(error) => self.notice = Some(format!("Память не изменена: {error}")),
+        }
+    }
+
+    fn handle_invariants(&mut self, argument: Option<&str>) {
+        match crate::invariants::execute_command(&self.store.invariants(), argument) {
+            Ok(message) if message.contains('\n') || argument.is_none() => {
+                self.modal = Some(Modal::Message {
+                    title: "Глобальные инварианты".into(),
+                    content: message,
+                });
+                self.notice = None;
+            }
+            Ok(message) => self.notice = Some(message),
+            Err(error) => self.notice = Some(format!("Инварианты не изменены: {error}")),
         }
     }
 
@@ -2255,6 +2276,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
                 "/facts ...              память Sticky Facts",
                 "/memory ...             short-term, working и long-term память",
+                "/invariants ...         глобальные обязательные правила",
                 "/task start <описание>   начать задачу; /task — статус",
                 "/task approve           утвердить план и запустить выполнение",
                 "/task pause | resume    пауза / продолжение; Ctrl+C: пауза",
@@ -2976,6 +2998,7 @@ mod tests {
                 already_counted_usage: None,
                 updated_facts: None,
                 updated_task: None,
+                invariant_refusal: false,
             }),
         ));
         let trace = app.transcript_markdown();

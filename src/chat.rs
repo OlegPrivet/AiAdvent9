@@ -21,7 +21,7 @@ use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 8;
+const DATABASE_SCHEMA_VERSION: i64 = 9;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -525,6 +525,10 @@ impl ChatStore {
                 .parent()
                 .expect("путь базы всегда содержит каталог"),
         )
+    }
+
+    pub(crate) fn invariants(&self) -> crate::invariants::InvariantStore<'_> {
+        crate::invariants::InvariantStore::new(&self.connection)
     }
 
     pub(crate) fn open() -> Result<Self, ChatStoreError> {
@@ -1506,6 +1510,19 @@ fn initialize_database(
             .execute_batch(migration)
             .map_err(|source| database_error("добавить состояние задачи", database_path, source))?;
     }
+    if version < 9 {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS invariants (
+                     name TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+                     rule TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 9;
+                 COMMIT;",
+            )
+            .map_err(|source| database_error("добавить инварианты", database_path, source))?;
+    }
     Ok(())
 }
 
@@ -1667,6 +1684,58 @@ mod tests {
     }
 
     #[test]
+    fn global_invariants_survive_reopen_and_are_shared_by_chats() {
+        let directory = TestDirectory::new();
+        let first = ChatStore::for_tests(directory.0.clone()).expect("store");
+        first
+            .invariants()
+            .set("stack", "Только Rust")
+            .expect("set invariant");
+        let one = Chat::new();
+        let two = Chat::new();
+        assert_ne!(one.id(), two.id());
+        assert_eq!(first.invariants().list().expect("list").len(), 1);
+        drop(first);
+
+        let reopened = ChatStore::for_tests(directory.0.clone()).expect("reopen");
+        assert_eq!(
+            reopened.invariants().list().expect("list"),
+            vec![crate::invariants::Invariant {
+                name: "stack".into(),
+                rule: "Только Rust".into(),
+            }]
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            DATABASE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migrates_v8_database_to_global_invariants() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        store
+            .connection
+            .execute_batch("DROP TABLE invariants; PRAGMA user_version = 8;")
+            .expect("v8 fixture");
+        drop(store);
+
+        let migrated = ChatStore::for_tests(directory.0.clone()).expect("migrate");
+        assert!(migrated.invariants().list().expect("list").is_empty());
+        assert_eq!(
+            migrated
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            DATABASE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
     fn migrates_v7_and_preserves_task_only_chats() {
         let directory = TestDirectory::new();
         let store = ChatStore::for_tests(directory.0.clone()).unwrap();
@@ -1703,7 +1772,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            8
+            DATABASE_SCHEMA_VERSION
         );
     }
 
@@ -1739,6 +1808,7 @@ mod tests {
                 already_counted_usage: None,
                 updated_facts: None,
                 updated_task: Some(planned),
+                invariant_refusal: false,
             },
             &PriceCatalog::default(),
             &mut crate::task::RunBudget::default(),

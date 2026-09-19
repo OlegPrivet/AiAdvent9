@@ -530,7 +530,11 @@ pub(crate) fn commit_answer(
     budget: &mut RunBudget,
 ) -> Result<(), TaskError> {
     let mut candidate = chat.clone();
+    let invariant_refusal = answer.invariant_refusal;
     if let Some(mut state) = answer.updated_task {
+        if invariant_refusal {
+            state.pause("Запрос конфликтует с глобальными инвариантами");
+        }
         let before = chat
             .task()
             .ok_or_else(|| TaskError("Задача исчезла до сохранения ответа.".into()))?;

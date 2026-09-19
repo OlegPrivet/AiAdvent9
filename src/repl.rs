@@ -86,6 +86,11 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                     Ok(message) => writeln!(output, "{message}")?,
                     Err(error) => writeln!(output, "Память не изменена: {error}")?,
                 }
+            } else if command.matches(&["/invariants", "/инварианты"]) {
+                match crate::invariants::execute_command(&store.invariants(), command.argument) {
+                    Ok(message) => writeln!(output, "{message}")?,
+                    Err(error) => writeln!(output, "Инварианты не изменены: {error}")?,
+                }
             } else if command.matches(&["/task", "/задача"]) {
                 match crate::task::command(store, chat, command.argument) {
                     Ok(result) => {
@@ -219,10 +224,16 @@ async fn ask<W: Write>(
         Ok(memory) => memory,
         Err(error) => return writeln!(output, "Ошибка памяти: {error}\n"),
     };
+    let invariants = match store.invariants().list() {
+        Ok(invariants) => invariants,
+        Err(error) => return writeln!(output, "Ошибка инвариантов: {error}\n"),
+    };
     let mut live_answer = ui.begin_answer(output);
     let result = client
         .respond_streaming(
-            AgentRequest::new(chat, question.to_owned(), agents).with_memory(memory),
+            AgentRequest::new(chat, question.to_owned(), agents)
+                .with_memory(memory)
+                .with_invariants(invariants),
             |event| live_answer.agent_event(event),
         )
         .await;
@@ -307,7 +318,12 @@ async fn run_task_until<W: Write>(
                 .memory()
                 .load_context(chat.working_memory(), chat.memory_selection())
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>(AgentRequest::new(chat, question.clone(), agents).with_memory(memory))
+            let invariants = store.invariants().list().map_err(|e| e.to_string())?;
+            Ok::<_, String>(
+                AgentRequest::new(chat, question.clone(), agents)
+                    .with_memory(memory)
+                    .with_invariants(invariants),
+            )
         })();
         let result = match request {
             Ok(request) => {
@@ -775,6 +791,10 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(
         output,
         "  /memory, /память         управлять short-term, working и long-term памятью"
+    )?;
+    writeln!(
+        output,
+        "  /invariants              глобальные правила: set <имя> <правило>, delete <имя>"
     )?;
     writeln!(
         output,
