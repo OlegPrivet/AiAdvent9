@@ -290,7 +290,8 @@ impl Agent {
                     &request.settings,
                     tools,
                     |delta| {
-                        if request.invariants.is_empty()
+                        if request.task.is_none()
+                            && request.invariants.is_empty()
                             && !request.settings.response_format_enabled()
                         {
                             on_event(AgentEvent::MainDelta(delta.into()))
@@ -339,7 +340,9 @@ impl Agent {
                 let result = self
                     .enforce_invariants(&request, &answer.content, &mut calls)
                     .await?;
-                on_event(AgentEvent::MainDelta(result.0.clone()))?;
+                if request.task.is_none() {
+                    on_event(AgentEvent::MainDelta(result.0.clone()))?;
+                }
                 result
             };
             let updated_task = if let Some(task) = &request.task {
@@ -689,7 +692,7 @@ impl Agent {
                 Ok(answer) => {
                     on_event(AgentEvent::ChildCompleted {
                         id: id.clone(),
-                        content: if request.invariants.is_empty() {
+                        content: if request.task.is_none() && request.invariants.is_empty() {
                             answer.content.clone()
                         } else {
                             "Результат получен и передан главному агенту для проверки.".into()

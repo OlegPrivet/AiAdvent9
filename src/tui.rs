@@ -2586,6 +2586,10 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
+                assert!(
+                    !matches!(event, WorkerEvent::Agent(_, AgentEvent::MainDelta(_))),
+                    "TUI must not receive task text before the transition is accepted"
+                );
                 let finished = matches!(event, WorkerEvent::Finished(_, _));
                 app.handle_worker_event(event);
                 if finished {
@@ -2605,6 +2609,79 @@ mod tests {
         assert_eq!(app.chat.task().unwrap().stage, crate::task::TaskStage::Done);
         assert!(!app.scheduled_task);
         assert_eq!(server.requests().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn rejected_task_transition_pauses_tui_without_exposing_answer() {
+        const UNVERIFIED: &str = "СКРЫТЫЙ НЕПРОВЕРЕННЫЙ ОТВЕТ";
+        let server = crate::test_http::MockServer::new(|request| {
+            if request["stream"] == true {
+                crate::test_http::text_response(UNVERIFIED)
+            } else {
+                (
+                    200,
+                    serde_json::json!({
+                        "choices":[{
+                            "message":{"content":serde_json::json!({
+                                "operation":"validation_passed",
+                                "steps":[],
+                                "question":"",
+                                "reason":""
+                            }).to_string()},
+                            "finish_reason":"stop"
+                        }]
+                    })
+                    .to_string(),
+                )
+            }
+        });
+        let client = Agent::new(
+            crate::api::NeuralDeepClient::new("test-key".into(), server.url.clone()).unwrap(),
+        );
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.set_input("/task start Описание проекта");
+        app.take_question().unwrap();
+        let question = app.take_scheduled_task().unwrap().unwrap();
+        let worker = spawn_request(&client, &store, app.chat, question, app.request_id, tx);
+
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!matches!(
+                &event,
+                WorkerEvent::Agent(_, AgentEvent::MainDelta(text)) if text.contains(UNVERIFIED)
+            ));
+            let finished = matches!(event, WorkerEvent::Finished(_, _));
+            app.handle_worker_event(event);
+            if finished {
+                break;
+            }
+        }
+        drop(worker);
+
+        assert!(app.streamed_answer.is_empty());
+        assert!(app.chat.messages().is_empty());
+        assert!(app.chat.task().unwrap().paused);
+        assert_eq!(
+            app.chat.task().unwrap().stage,
+            crate::task::TaskStage::Planning
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Запрещённый переход"))
+        );
     }
 
     #[test]

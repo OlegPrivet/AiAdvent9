@@ -325,29 +325,36 @@ async fn run_task_until<W: Write>(
                     .with_invariants(invariants),
             )
         })();
+        let mut live = ui.begin_answer(output);
         let result = match request {
             Ok(request) => {
-                let mut live = ui.begin_answer(output);
-                let result = tokio::select! {
+                tokio::select! {
                     biased;
                     signal = &mut cancellation => Err(signal.err().map_or_else(|| "Остановлено пользователем".into(), |e| format!("Ошибка обработчика паузы: {e}"))),
                     result = client.respond_streaming(request, |event| live.agent_event(event)) => result.map_err(|e| e.to_string()),
-                };
-                match &result {
-                    Ok(answer) => live.finish(&answer.content)?,
-                    Err(_) => live.abort()?,
                 }
-                result
             }
             Err(error) => Err(error),
         };
         let error = match result {
             Ok(answer) => {
-                crate::task::commit_answer(store, chat, question, answer, prices, &mut budget)
-                    .err()
-                    .map(|e| e.to_string())
+                let content = answer.content.clone();
+                match crate::task::commit_answer(store, chat, question, answer, prices, &mut budget)
+                {
+                    Ok(()) => {
+                        live.finish(&content)?;
+                        None
+                    }
+                    Err(error) => {
+                        live.abort()?;
+                        Some(error.to_string())
+                    }
+                }
             }
-            Err(error) => Some(error),
+            Err(error) => {
+                live.abort()?;
+                Some(error)
+            }
         };
         if let Some(error) = error {
             if let Err(save_error) = crate::task::pause(store, chat, &error) {
@@ -896,6 +903,58 @@ mod tests {
         assert!(text.contains("execution · шаг 2/2"));
         assert!(text.contains("validation"));
         assert!(text.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn rejected_task_transition_is_paused_without_printing_unverified_answer() {
+        const UNVERIFIED: &str = "ЭТОТ ОТВЕТ НЕЛЬЗЯ ПОКАЗЫВАТЬ";
+        let server = crate::test_http::MockServer::new(|request| {
+            if request["stream"] == true {
+                crate::test_http::text_response(UNVERIFIED)
+            } else {
+                (
+                    200,
+                    serde_json::json!({
+                        "choices":[{
+                            "message":{"content":serde_json::json!({
+                                "operation":"validation_passed",
+                                "steps":[],
+                                "question":"",
+                                "reason":""
+                            }).to_string()},
+                            "finish_reason":"stop"
+                        }]
+                    })
+                    .to_string(),
+                )
+            }
+        });
+        let client =
+            Agent::new(NeuralDeepClient::new("test-key".into(), server.url.clone()).unwrap());
+        let (_directory, store) = test_store();
+        let mut chat = Chat::new();
+        crate::task::command(&store, &mut chat, Some("start Описание проекта")).unwrap();
+        let mut output = Vec::new();
+
+        run_task_until(
+            &client,
+            &store,
+            &mut chat,
+            &mut output,
+            &TerminalUi::plain(),
+            &PriceCatalog::default(),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+
+        let text = String::from_utf8(output).unwrap();
+        assert!(!text.contains(UNVERIFIED));
+        assert!(text.contains("Запрещённый переход"));
+        assert!(text.contains("/task resume"));
+        assert!(chat.task().unwrap().paused);
+        assert_eq!(chat.task().unwrap().stage, crate::task::TaskStage::Planning);
+        assert!(chat.messages().is_empty());
     }
 
     #[tokio::test]

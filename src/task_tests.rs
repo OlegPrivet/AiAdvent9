@@ -22,6 +22,65 @@ fn execution() -> TaskState {
 }
 
 #[test]
+fn transition_table_allows_only_operations_of_the_current_stage() {
+    use TaskOperation::*;
+
+    let operations = [
+        Plan,
+        Clarify,
+        StepCompleted,
+        ValidationPassed,
+        ValidationFailed,
+        Replan,
+        Continue,
+    ];
+    let cases = [
+        (
+            TaskStage::Planning,
+            [true, true, false, false, false, false, true],
+        ),
+        (
+            TaskStage::Execution,
+            [false, true, true, false, false, true, true],
+        ),
+        (
+            TaskStage::Validation,
+            [false, true, false, true, true, false, true],
+        ),
+        (TaskStage::Done, [false; 7]),
+    ];
+
+    for (stage, expected) in cases {
+        for (index, operation) in operations.into_iter().enumerate() {
+            assert_eq!(
+                stage.allows(operation),
+                expected[index],
+                "{} must handle {} according to the transition table",
+                stage.label(),
+                operation.label()
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_transition_explains_the_rejected_operation_and_next_action() {
+    let task = TaskState::new("Описание проекта").unwrap();
+    let error = task
+        .apply(
+            update(TaskOperation::ValidationPassed, &[]),
+            "Попытка пропустить этапы",
+        )
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("этап planning"));
+    assert!(error.contains("операция validation_passed"));
+    assert!(error.contains("Следующее действие: составление плана"));
+    assert_eq!(task, TaskState::new("Описание проекта").unwrap());
+}
+
+#[test]
 fn requires_approval_and_completes_only_after_validation() {
     let task = TaskState::new("Описание проекта").unwrap();
     assert!(
@@ -285,13 +344,23 @@ async fn invalid_updates_and_service_errors_do_not_change_task() {
         let mut chat = Chat::new();
         chat.set_task(TaskState::new("Задача").unwrap());
         let before = chat.task().cloned();
+        let mut events = Vec::new();
         let result = agent
             .respond_streaming(
                 AgentRequest::new(&chat, "Составь план".into(), vec![]),
-                |_| Ok(()),
+                |event| {
+                    events.push(event);
+                    Ok(())
+                },
             )
             .await;
         assert!(result.is_err());
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, crate::agent::AgentEvent::MainDelta(_))),
+            "unverified task text must stay buffered"
+        );
         assert_eq!(chat.task(), before.as_ref());
         assert!(chat.messages().is_empty());
     }
