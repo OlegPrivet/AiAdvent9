@@ -8,6 +8,9 @@ mod config;
 mod context;
 mod input;
 mod invariants;
+mod mcp;
+mod mcp_demo;
+mod mcp_ui;
 mod memory;
 mod metrics;
 mod pricing;
@@ -47,6 +50,9 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    if cli.mcp_demo_server {
+        return mcp_demo::run().await;
+    }
     let config = Config::from_env()?;
     let client = Agent::new(NeuralDeepClient::new(config.api_key, config.base_url)?);
     let store = ChatStore::open()?;

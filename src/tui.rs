@@ -29,6 +29,8 @@ use crate::chat::{Chat, ChatStore, ChatSummary, MessageRole};
 use crate::cli::EditMode;
 use crate::context::ContextStrategyKind;
 use crate::input::CommandHistory;
+use crate::mcp::McpError;
+use crate::mcp_ui::{McpAction, McpManager, McpPage};
 use crate::metrics::{ResponseMetrics, format_duration, metric_lines};
 use crate::pricing::PriceCatalog;
 use crate::repl::ParsedCommand;
@@ -59,6 +61,7 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     CommandOption::run("/help", "показать справку", &["/помощь"]),
     CommandOption::run("/exit", "сохранить чат и выйти", &["/quit", "/выход"]),
     CommandOption::run("/agents", "глобальный каталог агентов", &["/агенты"]),
+    CommandOption::run("/mcp", "MCP-серверы и инструменты AI", &["/мсп"]),
     CommandOption::run("/facts", "память Sticky Facts", &["/факты"]),
     CommandOption::run("/memory", "слои памяти агента", &["/память"]),
     CommandOption::run("/invariants", "глобальные инварианты", &["/инварианты"]),
@@ -159,6 +162,11 @@ pub(crate) async fn run(
     let exit_message = loop {
         if let Some(Modal::Agents(agents)) = &mut app.modal
             && agents.poll_generation()
+        {
+            needs_draw = true;
+        }
+        if let Some(Modal::Mcp(mcp)) = &mut app.modal
+            && mcp.poll_inspection()
         {
             needs_draw = true;
         }
@@ -293,7 +301,10 @@ fn spawn_request(
         .map_err(AgentError::from)
         .and_then(|agents| {
             let request =
-                AgentRequest::new(chat, if manual { String::new() } else { question }, agents);
+                AgentRequest::new(chat, if manual { String::new() } else { question }, agents)
+                    .with_mcp(store.mcp().enabled().map_err(|error| {
+                        AgentError::InvalidRequest(format!("Ошибка каталога MCP: {error}"))
+                    })?);
             if manual {
                 Ok(request)
             } else {
@@ -521,6 +532,7 @@ impl<'a> App<'a> {
 
     fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        frame.render_widget(Clear, area);
         let input_height = (self.input.lines().len() as u16 + 2).clamp(3, MAX_INPUT_HEIGHT);
         let command_options = self.command_palette_options();
         let palette_height = if command_options.is_empty() {
@@ -818,6 +830,49 @@ impl<'a> App<'a> {
                 {
                     trace.push_str(&format!("{}\n\n", sanitize_terminal_text(&event.display())))
                 }
+                AgentEvent::McpStarted {
+                    id,
+                    server,
+                    tool,
+                    arguments,
+                } => {
+                    trace.push_str(&format!(
+                        "**MCP {} · {}**\n\nАргументы: `{}`\n\n",
+                        sanitize_terminal_text(server),
+                        sanitize_terminal_text(tool),
+                        sanitize_terminal_text(arguments)
+                    ));
+                    let result = self.agent_events.iter().rev().find(|event| {
+                        matches!(
+                            event,
+                            AgentEvent::McpCompleted { id: other, .. }
+                                | AgentEvent::McpFailed { id: other, .. }
+                                if other == id
+                        )
+                    });
+                    match result {
+                        Some(AgentEvent::McpCompleted { content, .. }) => trace.push_str(&format!(
+                            "Статус: завершён\n\n{}\n\n",
+                            sanitize_terminal_text(content)
+                        )),
+                        Some(AgentEvent::McpFailed { error, .. }) => trace.push_str(&format!(
+                            "Статус: ошибка — {}\n\n",
+                            sanitize_terminal_text(error)
+                        )),
+                        _ => trace.push_str(if self.pending_question.is_some() {
+                            "Статус: выполняется…\n\n"
+                        } else {
+                            "Статус: прерван\n\n"
+                        }),
+                    }
+                }
+                AgentEvent::McpFailed { id, .. }
+                    if !self.agent_events.iter().any(
+                        |event| matches!(event,AgentEvent::McpStarted{id:other,..} if other==id),
+                    ) =>
+                {
+                    trace.push_str(&format!("{}\n\n", sanitize_terminal_text(&event.display())))
+                }
                 _ => {}
             }
         }
@@ -1007,6 +1062,13 @@ impl<'a> App<'a> {
     }
 
     fn handle_mouse(&mut self, kind: MouseEventKind) {
+        if let Some(Modal::Mcp(mcp)) = &mut self.modal {
+            mcp.handle_mouse(kind);
+            return;
+        }
+        if self.modal.is_some() {
+            return;
+        }
         match kind {
             MouseEventKind::ScrollUp => self.scroll_up(3),
             MouseEventKind::ScrollDown => self.scroll_down(3),
@@ -1025,6 +1087,11 @@ impl<'a> App<'a> {
             && agents.generation.is_none()
         {
             agents.input.insert_str(text);
+        } else if let Some(Modal::Mcp(mcp)) = &mut self.modal
+            && matches!(mcp.manager.page(), McpPage::Text { .. })
+            && mcp.inspection.is_none()
+        {
+            mcp.input.insert_str(text);
         }
     }
 
@@ -1177,6 +1244,11 @@ impl<'a> App<'a> {
                 Ok(manager) => {
                     self.modal = Some(Modal::Agents(Box::new(AgentsModal::new(manager))))
                 }
+                Err(error) => self.notice = Some(error.to_string()),
+            }
+        } else if command.matches(&["/mcp", "/мсп"]) {
+            match McpManager::new(&self.store.mcp()) {
+                Ok(manager) => self.modal = Some(Modal::Mcp(Box::new(McpModal::new(manager)))),
                 Err(error) => self.notice = Some(error.to_string()),
             }
         } else if command.matches(&["/facts", "/факты"]) {
@@ -1669,6 +1741,11 @@ impl<'a> App<'a> {
         match &mut modal {
             Modal::Agents(agents) => {
                 if agents.handle_key(key, &self.store.agents()) {
+                    return;
+                }
+            }
+            Modal::Mcp(mcp) => {
+                if mcp.handle_key(key, &self.store.mcp()) {
                     return;
                 }
             }
@@ -2237,6 +2314,250 @@ impl AgentsModal {
     }
 }
 
+struct McpModal {
+    manager: McpManager,
+    input: TextArea<'static>,
+    selected: usize,
+    read_scroll: usize,
+    read_max_scroll: usize,
+    read_page_size: usize,
+    inspection: Option<JoinHandle<()>>,
+    inspected: Option<oneshot::Receiver<Result<Vec<crate::mcp::McpTool>, McpError>>>,
+}
+
+impl McpModal {
+    fn new(manager: McpManager) -> Self {
+        let mut modal = Self {
+            manager,
+            input: new_textarea(vec![], "MCP"),
+            selected: 0,
+            read_scroll: 0,
+            read_max_scroll: 0,
+            read_page_size: 1,
+            inspection: None,
+            inspected: None,
+        };
+        modal.refresh();
+        modal
+    }
+
+    fn refresh(&mut self) {
+        self.selected = 0;
+        self.read_scroll = 0;
+        self.read_max_scroll = 0;
+        if let McpPage::Text { title, value, .. } = self.manager.page() {
+            self.input = new_textarea(vec![sanitize_terminal_text(&value)], &title);
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, store: &crate::mcp::McpStore<'_>) -> bool {
+        if self.inspection.is_some() {
+            if key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                if let Some(task) = self.inspection.take() {
+                    task.abort();
+                }
+                self.inspected = None;
+                self.manager.notice = Some("Проверка MCP отменена".into());
+            }
+            return false;
+        }
+        let result = if key.code == KeyCode::Esc {
+            Some(self.manager.cancel(store).map(|close| {
+                if close {
+                    McpAction::Close
+                } else {
+                    McpAction::None
+                }
+            }))
+        } else {
+            match self.manager.page() {
+                McpPage::List { items, .. } => match key.code {
+                    KeyCode::Up => {
+                        self.selected = self.selected.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::Down => {
+                        self.selected = (self.selected + 1).min(items.len().saturating_sub(1));
+                        None
+                    }
+                    KeyCode::Enter => Some(self.manager.select(self.selected, store)),
+                    _ => None,
+                },
+                McpPage::Read { .. } => match key.code {
+                    KeyCode::Up => {
+                        self.read_scroll = self.read_scroll.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::Down => {
+                        self.scroll_read_down(1);
+                        None
+                    }
+                    KeyCode::PageUp => {
+                        self.read_scroll = self.read_scroll.saturating_sub(self.read_page_size);
+                        None
+                    }
+                    KeyCode::PageDown => {
+                        self.scroll_read_down(self.read_page_size);
+                        None
+                    }
+                    KeyCode::Home => {
+                        self.read_scroll = 0;
+                        None
+                    }
+                    KeyCode::End => {
+                        self.read_scroll = self.read_max_scroll;
+                        None
+                    }
+                    KeyCode::Enter => Some(self.manager.select(0, store)),
+                    _ => None,
+                },
+                McpPage::Text { .. } => {
+                    if key.code == KeyCode::Enter {
+                        Some(
+                            self.manager
+                                .submit(self.input.lines().join("\n"), store)
+                                .map(|()| McpAction::None),
+                        )
+                    } else {
+                        self.input.input(key);
+                        None
+                    }
+                }
+            }
+        };
+        match result {
+            Some(Ok(McpAction::Close)) => true,
+            Some(Ok(McpAction::None)) => {
+                self.refresh();
+                false
+            }
+            Some(Ok(McpAction::Inspect(definition))) => {
+                let (tx, rx) = oneshot::channel();
+                self.inspection = Some(tokio::spawn(async move {
+                    let _ = tx.send(crate::mcp::inspect_server(&definition).await);
+                }));
+                self.inspected = Some(rx);
+                false
+            }
+            Some(Err(error)) => {
+                self.manager.notice = Some(error.to_string());
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn handle_mouse(&mut self, kind: MouseEventKind) {
+        if self.inspection.is_some() || !matches!(self.manager.page(), McpPage::Read { .. }) {
+            return;
+        }
+        match kind {
+            MouseEventKind::ScrollUp => {
+                self.read_scroll = self.read_scroll.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => self.scroll_read_down(3),
+            _ => {}
+        }
+    }
+
+    fn scroll_read_down(&mut self, lines: usize) {
+        self.read_scroll = self
+            .read_scroll
+            .saturating_add(lines)
+            .min(self.read_max_scroll);
+    }
+
+    fn poll_inspection(&mut self) -> bool {
+        let Some(receiver) = &mut self.inspected else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(oneshot::error::TryRecvError::Empty) => return false,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                Err(McpError::Connection("проверка прервана".into()))
+            }
+        };
+        self.inspection = None;
+        self.inspected = None;
+        self.manager.inspection_finished(result);
+        self.refresh();
+        true
+    }
+
+    fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let notice = self
+            .manager
+            .notice
+            .as_deref()
+            .map(sanitize_terminal_text)
+            .unwrap_or_default();
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(if notice.is_empty() { 0 } else { 3 }),
+                Constraint::Min(1),
+            ])
+            .split(area);
+        if !notice.is_empty() {
+            frame.render_widget(
+                Paragraph::new(notice)
+                    .style(Style::default().fg(Color::Yellow))
+                    .wrap(Wrap { trim: false }),
+                layout[0],
+            );
+        }
+        let area = layout[1];
+        match self.manager.page() {
+            McpPage::List { title, items } => {
+                let list = List::new(
+                    items
+                        .into_iter()
+                        .map(|item| ListItem::new(sanitize_terminal_text(&item)))
+                        .collect::<Vec<_>>(),
+                )
+                .block(Block::default().borders(Borders::ALL).title(format!(
+                    " {} · Enter: выбрать · Esc: назад ",
+                    sanitize_terminal_text(&title)
+                )))
+                .highlight_symbol("› ")
+                .highlight_style(Style::default().fg(Color::Cyan));
+                let mut state = ListState::default().with_selected(Some(self.selected));
+                frame.render_stateful_widget(list, area, &mut state);
+            }
+            McpPage::Text { title, hint, .. } => {
+                self.input.set_block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" {title} · Enter: далее · Esc: отмена "))
+                        .title_bottom(format!(" {hint} ")),
+                );
+                frame.render_widget(&self.input, area);
+            }
+            McpPage::Read { title, content } => {
+                let text = Text::from(sanitize_terminal_text(&content));
+                self.read_page_size = usize::from(area.height.saturating_sub(2).max(1));
+                self.read_max_scroll = wrapped_text_height(&text, area.width.saturating_sub(2))
+                    .saturating_sub(self.read_page_size)
+                    .min(u16::MAX as usize);
+                self.read_scroll = self.read_scroll.min(self.read_max_scroll);
+                frame.render_widget(
+                    Paragraph::new(text)
+                        .wrap(Wrap { trim: false })
+                        .scroll((self.read_scroll as u16, 0))
+                        .block(Block::default().borders(Borders::ALL).title(format!(
+                            " {} · ↑/↓ PgUp/PgDn колесо: прокрутка · Esc: назад ",
+                            sanitize_terminal_text(&title)
+                        ))),
+                    area,
+                );
+            }
+        }
+    }
+}
+
 fn submits_text_field(key: KeyEvent, multiline: bool) -> bool {
     key.code == KeyCode::F(4)
         || (key.code == KeyCode::Enter
@@ -2245,6 +2566,7 @@ fn submits_text_field(key: KeyEvent, multiline: bool) -> bool {
 
 enum Modal {
     Agents(Box<AgentsModal>),
+    Mcp(Box<McpModal>),
     Help,
     Message {
         title: String,
@@ -2268,12 +2590,14 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
     frame.render_widget(Clear, area);
     match modal {
         Modal::Agents(agents) => agents.render(frame, area),
+        Modal::Mcp(mcp) => mcp.render(frame, area),
         Modal::Help => {
             let help = [
                 "/chat, /чаты             выбрать сохранённый чат",
                 "/restore <UUID>          восстановить чат",
                 "/settings, /настройки   настройки текущего чата",
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
+                "/mcp, /мсп             MCP-серверы и инструменты AI",
                 "/facts ...              память Sticky Facts",
                 "/memory ...             short-term, working и long-term память",
                 "/invariants ...         глобальные обязательные правила",
@@ -3025,6 +3349,165 @@ mod tests {
                 .as_deref()
                 .is_some_and(|notice| notice.contains("Ctrl+C"))
         );
+    }
+
+    #[test]
+    fn mcp_menu_renders_global_catalog_and_is_blocked_during_request() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let definition = crate::mcp::McpServerDefinition {
+            id: Uuid::new_v4(),
+            name: "filesystem".into(),
+            transport: crate::mcp::McpTransport::Stdio {
+                command: "server".into(),
+                args: vec![],
+                working_directory: directory.0.clone(),
+            },
+            enabled: true,
+        };
+        store.mcp().save(&definition, true).expect("save");
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        app.handle_command(ParsedCommand::parse("/mcp").expect("command"));
+        assert!(matches!(app.modal, Some(Modal::Mcp(_))));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let screen = (0..30)
+            .map(|row| buffer_row(terminal.backend().buffer(), row))
+            .collect::<String>();
+        assert!(screen.contains("MCP-серверы"));
+        assert!(screen.contains("filesystem"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.begin_question("Вопрос".into()).expect("question");
+        app.handle_command(ParsedCommand::parse("/mcp").expect("command"));
+        assert!(app.modal.is_none());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Дождитесь завершения"))
+        );
+    }
+
+    #[test]
+    fn mcp_tools_page_scrolls_to_the_last_tool() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let definition = crate::mcp::McpServerDefinition {
+            id: Uuid::new_v4(),
+            name: "many-tools".into(),
+            transport: crate::mcp::McpTransport::Stdio {
+                command: "server".into(),
+                args: vec![],
+                working_directory: directory.0.clone(),
+            },
+            enabled: true,
+        };
+        store.mcp().save(&definition, true).expect("save");
+        let mut manager = McpManager::new(&store.mcp()).expect("manager");
+        manager.select(3, &store.mcp()).expect("open server");
+        let tools = (0..30)
+            .map(|index| crate::mcp::McpTool {
+                function_name: format!("many_tools__tool_{index:02}"),
+                server_id: definition.id,
+                server_name: definition.name.clone(),
+                name: format!("tool_{index:02}"),
+                description: format!("Описание инструмента {index:02}"),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}}
+                }),
+            })
+            .collect();
+        manager.inspection_finished(Ok(tools));
+        let mut modal = McpModal::new(manager);
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("terminal");
+
+        terminal
+            .draw(|frame| modal.render(frame, frame.area()))
+            .expect("first render");
+        let first_screen = (0..20)
+            .map(|row| buffer_row(terminal.backend().buffer(), row))
+            .collect::<String>();
+        assert!(first_screen.contains("tool_00"));
+        assert!(!first_screen.contains("tool_29"));
+        assert!(modal.read_max_scroll > 0);
+
+        modal.handle_mouse(MouseEventKind::ScrollDown);
+        assert_eq!(modal.read_scroll, 3);
+        modal.handle_key(
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            &store.mcp(),
+        );
+        assert_eq!(modal.read_scroll, 0);
+
+        modal.handle_key(
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            &store.mcp(),
+        );
+        terminal
+            .draw(|frame| modal.render(frame, frame.area()))
+            .expect("scrolled render");
+        let last_screen = (0..20)
+            .map(|row| buffer_row(terminal.backend().buffer(), row))
+            .collect::<String>();
+        assert!(last_screen.contains("tool_29"));
+        assert!(!last_screen.contains("tool_00"));
+    }
+
+    #[test]
+    fn mcp_modal_input_and_mouse_do_not_leak_into_chat() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        app.set_input("/mcp");
+        assert!(app.take_question().expect("command").is_none());
+        assert!(matches!(app.modal, Some(Modal::Mcp(_))));
+        assert!(app.input_value().is_empty());
+
+        app.max_history_scroll = 10;
+        app.history_scroll = 5;
+        app.handle_mouse(MouseEventKind::ScrollDown);
+        assert_eq!(app.history_scroll, 5);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_paste("MCP_ONLY_UNIQUE_TEXT");
+        assert!(app.input_value().is_empty());
+        let Some(Modal::Mcp(mcp)) = &app.modal else {
+            panic!("MCP modal must remain open");
+        };
+        assert_eq!(mcp.input.lines().join("\n"), "MCP_ONLY_UNIQUE_TEXT");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render form");
+        let modal_screen = (0..30)
+            .map(|row| buffer_row(terminal.backend().buffer(), row))
+            .collect::<String>();
+        assert!(modal_screen.contains("MCP_ONLY_UNIQUE_TEXT"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert!(app.input_value().is_empty());
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render chat");
+        let chat_screen = (0..30)
+            .map(|row| buffer_row(terminal.backend().buffer(), row))
+            .collect::<String>();
+        assert!(!chat_screen.contains("MCP_ONLY_UNIQUE_TEXT"));
     }
 
     #[test]

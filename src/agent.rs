@@ -19,6 +19,7 @@ use crate::context::{
     ContextStrategyKind, Facts, MAX_FACT_KEY_CHARS, MAX_FACT_VALUE_CHARS, MAX_FACTS, validate_facts,
 };
 use crate::invariants::Invariants;
+use crate::mcp::{McpRuntime, McpServerDefinition, McpTool};
 use crate::memory::MemoryContext;
 use crate::metrics::CallUsage;
 use crate::settings::Settings;
@@ -53,6 +54,7 @@ pub(crate) struct AgentRequest {
     pub(crate) memory: MemoryContext,
     pub(crate) task: Option<crate::task::TaskState>,
     pub(crate) invariants: Invariants,
+    pub(crate) mcp_servers: Vec<McpServerDefinition>,
 }
 
 impl AgentRequest {
@@ -68,6 +70,7 @@ impl AgentRequest {
             memory: MemoryContext::default(),
             task: chat.task().cloned(),
             invariants: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -78,6 +81,11 @@ impl AgentRequest {
 
     pub(crate) fn with_invariants(mut self, invariants: Invariants) -> Self {
         self.invariants = invariants;
+        self
+    }
+
+    pub(crate) fn with_mcp(mut self, servers: Vec<McpServerDefinition>) -> Self {
+        self.mcp_servers = servers;
         self
     }
 }
@@ -114,6 +122,23 @@ pub(crate) enum AgentEvent {
         id: String,
         error: String,
     },
+    McpStarted {
+        id: String,
+        server: String,
+        tool: String,
+        arguments: String,
+    },
+    McpCompleted {
+        id: String,
+        server: String,
+        tool: String,
+        content: String,
+    },
+    McpFailed {
+        id: String,
+        server: String,
+        error: String,
+    },
 }
 
 impl AgentEvent {
@@ -143,6 +168,23 @@ impl AgentEvent {
                 }
             ),
             Self::ChildFailed { id, error } => format!("Агент {id}: ошибка — {error}"),
+            Self::McpStarted {
+                id,
+                server,
+                tool,
+                arguments,
+            } => format!(
+                "MCP {server} · {tool} · {id}\nАргументы: {arguments}\nСтатус: выполняется…"
+            ),
+            Self::McpCompleted {
+                id,
+                server,
+                tool,
+                content,
+            } => format!("MCP {server} · {tool} · {id}: завершён\n{content}"),
+            Self::McpFailed { id, server, error } => {
+                format!("MCP {server} · {id}: ошибка — {error}")
+            }
         }
     }
 }
@@ -233,12 +275,23 @@ impl Agent {
             ));
         }
         let explicit = explicit_handles(&request.question, &request.agents)?;
-        if !request.agents.is_empty() && !supports_tools(request.settings.model()) {
+        let wants_tools =
+            !request.agents.is_empty() || request.mcp_servers.iter().any(|server| server.enabled);
+        if wants_tools && !supports_tools(request.settings.model()) {
             return Err(AgentError::InvalidRequest(format!(
                 "Модель {} не заявлена как tools-совместимая. Выберите qwen3.8-27b, qwen3.6-35b-a3b, gpt-oss-120b или gemma-4-31b в /settings",
                 request.settings.model()
             )));
         }
+        let (mcp_runtime, mcp_errors) = McpRuntime::connect(&request.mcp_servers).await;
+        for (server, error) in mcp_errors {
+            on_event(AgentEvent::McpFailed {
+                id: "подключение".into(),
+                server,
+                error,
+            })?;
+        }
+        let has_tools = !request.agents.is_empty() || !mcp_runtime.tools().is_empty();
         let mut calls = Vec::new();
         let mut updated_facts = None;
         if request.settings.context_strategy().kind == ContextStrategyKind::StickyFacts {
@@ -274,14 +327,15 @@ impl Agent {
             );
             waves += 1;
         }
-        let mut force_final = request.agents.is_empty();
+        let mut force_final = !has_tools;
         loop {
             let final_only = force_final || waves >= MAX_WAVES;
-            if final_only && !request.agents.is_empty() {
-                messages.push(ApiMessage::text("system", "Сформируй окончательный ответ пользователю по собранным результатам. Новые делегирования запрещены. Если результаты неполны или содержат ошибки, укажи это. Соблюдай настройки формата и завершения ответа."));
+            if final_only && has_tools {
+                messages.push(ApiMessage::text("system", "Сформируй окончательный ответ пользователю по собранным результатам. Новые делегирования запрещены. Новые вызовы MCP-инструментов запрещены. Если результаты неполны или содержат ошибки, укажи это. Соблюдай настройки формата и завершения ответа."));
             }
             on_event(AgentEvent::MainStarted)?;
-            let tools = (!final_only).then(|| delegation_tool(&request.agents));
+            let tools =
+                (!final_only).then(|| available_tools(&request.agents, mcp_runtime.tools()));
             let turn = self
                 .client
                 .complete_streaming(
@@ -309,13 +363,19 @@ impl Agent {
             if !turn.tool_calls.is_empty() {
                 if final_only {
                     return Err(AgentError::InvalidRequest(
-                        "Модель вернула tool-call при запрещённом делегировании".into(),
+                        "Модель вернула tool-call после исчерпания лимита инструментов".into(),
                     ));
                 }
                 messages.push(tool_message(turn.content, turn.tool_calls.clone()));
                 messages.extend(
-                    self.delegate_wave(&request, turn.tool_calls, &mut calls, &mut on_event)
-                        .await?,
+                    self.execute_tool_wave(
+                        &request,
+                        &mcp_runtime,
+                        turn.tool_calls,
+                        &mut calls,
+                        &mut on_event,
+                    )
+                    .await?,
                 );
                 waves += 1;
                 continue;
@@ -405,6 +465,106 @@ impl Agent {
                 invariant_refusal,
             });
         }
+    }
+
+    async fn execute_tool_wave<F>(
+        &self,
+        request: &AgentRequest,
+        mcp: &McpRuntime,
+        tool_calls: Vec<ToolCall>,
+        usage: &mut Vec<CallUsage>,
+        on_event: &mut F,
+    ) -> Result<Vec<ApiMessage>, AgentError>
+    where
+        F: FnMut(AgentEvent) -> io::Result<()>,
+    {
+        let mut results = vec![None; tool_calls.len()];
+        let mut delegations = Vec::new();
+        for (index, call) in tool_calls.into_iter().enumerate() {
+            if index >= MAX_PARALLEL {
+                let error = "Превышен лимит: до трёх вызовов за одну волну";
+                on_event(AgentEvent::ChildFailed {
+                    id: call.id.clone(),
+                    error: error.into(),
+                })?;
+                results[index] = Some(tool_result(call.id, json!({"ok":false, "error":error})));
+            } else if call.function.name == "delegate_task" {
+                delegations.push((index, call));
+            } else {
+                let arguments = serde_json::from_str::<Value>(&call.function.arguments);
+                let tool = mcp
+                    .tools()
+                    .iter()
+                    .find(|tool| tool.function_name == call.function.name)
+                    .cloned();
+                let Some(tool) = tool else {
+                    let error = "Неизвестный инструмент";
+                    on_event(AgentEvent::ChildFailed {
+                        id: call.id.clone(),
+                        error: error.into(),
+                    })?;
+                    results[index] = Some(tool_result(call.id, json!({"ok":false, "error":error})));
+                    continue;
+                };
+                on_event(AgentEvent::McpStarted {
+                    id: call.id.clone(),
+                    server: tool.server_name.clone(),
+                    tool: tool.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                })?;
+                let result = match arguments {
+                    Ok(arguments) => mcp.call(&call.function.name, arguments).await,
+                    Err(error) => Err(crate::mcp::McpError::Validation(format!(
+                        "некорректные аргументы: {error}"
+                    ))),
+                };
+                match result {
+                    Ok((tool, payload)) => {
+                        let failed = payload
+                            .get("isError")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if failed {
+                            on_event(AgentEvent::McpFailed {
+                                id: call.id.clone(),
+                                server: tool.server_name.clone(),
+                                error: "инструмент вернул ошибку".into(),
+                            })?;
+                        } else {
+                            on_event(AgentEvent::McpCompleted {
+                                id: call.id.clone(),
+                                server: tool.server_name.clone(),
+                                tool: tool.name.clone(),
+                                content: mcp_result_preview(&payload),
+                            })?;
+                        }
+                        results[index] = Some(tool_result(call.id, payload));
+                    }
+                    Err(error) => {
+                        on_event(AgentEvent::McpFailed {
+                            id: call.id.clone(),
+                            server: tool.server_name,
+                            error: error.to_string(),
+                        })?;
+                        results[index] = Some(tool_result(
+                            call.id,
+                            json!({"ok":false, "error":error.to_string()}),
+                        ));
+                    }
+                }
+            }
+        }
+        if !delegations.is_empty() {
+            let calls = delegations
+                .iter()
+                .map(|(_, call)| call.clone())
+                .collect::<Vec<_>>();
+            let messages = self.delegate_wave(request, calls, usage, on_event).await?;
+            for ((index, _), message) in delegations.into_iter().zip(messages) {
+                results[index] = Some(message);
+            }
+        }
+        Ok(results.into_iter().flatten().collect())
     }
 
     async fn enforce_invariants(
@@ -869,6 +1029,30 @@ pub(crate) fn delegation_tool(agents: &[AgentDefinition]) -> Value {
             }, "required":["handle","task"], "additionalProperties":false
         }
     }}])
+}
+
+fn available_tools(agents: &[AgentDefinition], mcp_tools: &[McpTool]) -> Value {
+    let mut tools = Vec::new();
+    if !agents.is_empty() {
+        tools.extend(
+            delegation_tool(agents)
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+    tools.extend(mcp_tools.iter().map(McpTool::openai_definition));
+    Value::Array(tools)
+}
+
+fn mcp_result_preview(value: &Value) -> String {
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    const MAX_CHARS: usize = 2_000;
+    if text.chars().count() <= MAX_CHARS {
+        text
+    } else {
+        format!("{}…", text.chars().take(MAX_CHARS).collect::<String>())
+    }
 }
 
 fn tool_message(content: String, tool_calls: Vec<ToolCall>) -> ApiMessage {

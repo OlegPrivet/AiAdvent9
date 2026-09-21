@@ -21,7 +21,7 @@ use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 9;
+const DATABASE_SCHEMA_VERSION: i64 = 10;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -517,6 +517,10 @@ pub(crate) enum ChatStoreError {
 impl ChatStore {
     pub(crate) fn agents(&self) -> crate::agent_catalog::AgentStore<'_> {
         crate::agent_catalog::AgentStore::new(&self.connection)
+    }
+
+    pub(crate) fn mcp(&self) -> crate::mcp::McpStore<'_> {
+        crate::mcp::McpStore::new(&self.connection)
     }
 
     pub(crate) fn memory(&self) -> MemoryStore {
@@ -1522,6 +1526,21 @@ fn initialize_database(
                  COMMIT;",
             )
             .map_err(|source| database_error("добавить инварианты", database_path, source))?;
+    }
+    if version < 10 {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS mcp_servers (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                     transport_json TEXT NOT NULL,
+                     enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1))
+                 );
+                 PRAGMA user_version = 10;
+                 COMMIT;",
+            )
+            .map_err(|source| database_error("добавить каталог MCP", database_path, source))?;
     }
     Ok(())
 }

@@ -149,6 +149,72 @@ async fn final_service_error_is_propagated_after_successful_child() {
     );
     assert_eq!(server.requests().len(), 2);
 }
+
+#[tokio::test]
+async fn main_agent_calls_mcp_tool_and_uses_its_result() {
+    let server = MockServer::new(|request| {
+        let messages = request["messages"].as_array().expect("messages");
+        if messages.iter().any(|message| message["role"] == "tool") {
+            return text_response("Итог с результатом MCP");
+        }
+        let tools = request["tools"].as_array().expect("MCP tools");
+        assert_eq!(tools.len(), 1);
+        let function_name = tools[0]["function"]["name"]
+            .as_str()
+            .expect("function name");
+        assert!(function_name.starts_with("mcp__demo__echo"));
+        tool_response(vec![json!({
+            "index": 0,
+            "id": "mcp_call",
+            "type": "function",
+            "function": {
+                "name": function_name,
+                "arguments": "{\"text\":\"через MCP\"}"
+            }
+        })])
+    });
+    let mcp = crate::mcp::McpServerDefinition {
+        id: Uuid::new_v4(),
+        name: "demo".into(),
+        transport: crate::mcp::McpTransport::InMemoryDemo,
+        enabled: true,
+    };
+    let mut events = Vec::new();
+    let answer = runner(&server)
+        .respond_streaming(
+            request("Повтори текст через MCP", vec![]).with_mcp(vec![mcp]),
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .expect("MCP answer");
+    assert_eq!(answer.content, "Итог с результатом MCP");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::McpStarted { tool, .. } if tool == "echo"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::McpCompleted { tool, .. } if tool == "echo"))
+    );
+    let requests = server.requests();
+    let tool_message = requests[1]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("tool result");
+    assert_eq!(tool_message["tool_call_id"], "mcp_call");
+    assert!(
+        tool_message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("через MCP"))
+    );
+}
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},

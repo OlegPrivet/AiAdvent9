@@ -24,6 +24,10 @@ pub(crate) struct Cli {
     /// Восстановить сохранённый чат по полному UUID.
     #[arg(long, value_name = "ID")]
     pub(crate) restore: Option<Uuid>,
+
+    /// Внутренний stdio MCP-сервер для демонстрации.
+    #[arg(long, hide = true)]
+    pub(crate) mcp_demo_server: bool,
 }
 
 #[cfg(test)]
@@ -38,6 +42,7 @@ mod tests {
         assert_eq!(cli.question.as_deref(), Some("Объясни ownership в Rust"));
         assert_eq!(cli.edit_mode, EditMode::Emacs);
         assert_eq!(cli.restore, None);
+        assert!(!cli.mcp_demo_server);
     }
 
     #[test]
@@ -47,6 +52,7 @@ mod tests {
         assert_eq!(cli.question, None);
         assert_eq!(cli.edit_mode, EditMode::Emacs);
         assert_eq!(cli.restore, None);
+        assert!(!cli.mcp_demo_server);
     }
 
     #[test]

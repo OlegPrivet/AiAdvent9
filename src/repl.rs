@@ -79,6 +79,8 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                     output,
                 )
                 .await?;
+            } else if command.matches(&["/mcp", "/мсп"]) {
+                crate::mcp_ui::run(&store.mcp(), input, output).await?;
             } else if command.matches(&["/facts", "/факты"]) {
                 manage_facts(store, chat, command.argument, output)?;
             } else if command.matches(&["/memory", "/память"]) {
@@ -156,7 +158,8 @@ async fn compact<W: Write>(
         chat,
         question.into(),
         store.agents().list().map_err(|error| error.to_string())?,
-    );
+    )
+    .with_mcp(store.mcp().enabled().map_err(|error| error.to_string())?);
     let Some(target) =
         crate::summary::prepare(&request, manual).map_err(|error| error.to_string())?
     else {
@@ -228,12 +231,17 @@ async fn ask<W: Write>(
         Ok(invariants) => invariants,
         Err(error) => return writeln!(output, "Ошибка инвариантов: {error}\n"),
     };
+    let mcp_servers = match store.mcp().enabled() {
+        Ok(servers) => servers,
+        Err(error) => return writeln!(output, "Каталог MCP: {error}\n"),
+    };
     let mut live_answer = ui.begin_answer(output);
     let result = client
         .respond_streaming(
             AgentRequest::new(chat, question.to_owned(), agents)
                 .with_memory(memory)
-                .with_invariants(invariants),
+                .with_invariants(invariants)
+                .with_mcp(mcp_servers),
             |event| live_answer.agent_event(event),
         )
         .await;
@@ -319,10 +327,12 @@ async fn run_task_until<W: Write>(
                 .load_context(chat.working_memory(), chat.memory_selection())
                 .map_err(|e| e.to_string())?;
             let invariants = store.invariants().list().map_err(|e| e.to_string())?;
+            let mcp_servers = store.mcp().enabled().map_err(|e| e.to_string())?;
             Ok::<_, String>(
                 AgentRequest::new(chat, question.clone(), agents)
                     .with_memory(memory)
-                    .with_invariants(invariants),
+                    .with_invariants(invariants)
+                    .with_mcp(mcp_servers),
             )
         })();
         let mut live = ui.begin_answer(output);
@@ -781,6 +791,10 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(
         output,
         "  /agents, /агенты        глобальный каталог агентов (вызов: @handle задача)"
+    )?;
+    writeln!(
+        output,
+        "  /mcp, /мсп              MCP-серверы и инструменты AI"
     )?;
     writeln!(output, "  /chat, /чаты             выбрать сохранённый чат")?;
     writeln!(
