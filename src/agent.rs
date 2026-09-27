@@ -25,7 +25,7 @@ use crate::metrics::CallUsage;
 use crate::settings::Settings;
 
 const MAX_PARALLEL: usize = 3;
-const MAX_WAVES: usize = 2;
+const MAX_WAVES: usize = 8;
 const MAX_TASK_CHARS: usize = 16_000;
 
 #[derive(Debug, Clone)]

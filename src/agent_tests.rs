@@ -215,6 +215,73 @@ async fn main_agent_calls_mcp_tool_and_uses_its_result() {
             .is_some_and(|content| content.contains("через MCP"))
     );
 }
+
+#[tokio::test]
+async fn main_agent_composes_three_sequential_mcp_calls_and_passes_results_forward() {
+    let call_index = Arc::new(AtomicUsize::new(0));
+    let observed_index = call_index.clone();
+    let server = MockServer::new(move |request| {
+        if request.get("tools").is_none() {
+            return text_response("Цепочка завершена");
+        }
+        let index = observed_index.load(Ordering::SeqCst);
+        if index >= 3 {
+            return text_response("Цепочка завершена");
+        }
+        observed_index.fetch_add(1, Ordering::SeqCst);
+        let text = match index {
+            0 => "первый шаг".to_owned(),
+            1 => "результат: первый шаг".to_owned(),
+            2 => "подтверждение: результат: первый шаг".to_owned(),
+            _ => unreachable!("checked above"),
+        };
+        let name = request["tools"][0]["function"]["name"]
+            .as_str()
+            .expect("MCP tool name");
+        tool_response(vec![json!({
+            "index": 0,
+            "id": format!("call_{index}"),
+            "type": "function",
+            "function": {"name": name, "arguments": json!({"text": text}).to_string()}
+        })])
+    });
+    let mcp = crate::mcp::McpServerDefinition {
+        id: Uuid::new_v4(),
+        name: "demo".into(),
+        transport: crate::mcp::McpTransport::InMemoryDemo,
+        enabled: true,
+    };
+    let answer = runner(&server)
+        .respond_streaming(
+            request("Выполни последовательную цепочку", vec![]).with_mcp(vec![mcp]),
+            |_| Ok(()),
+        )
+        .await
+        .expect("composed MCP answer");
+
+    assert_eq!(answer.content, "Цепочка завершена");
+    assert_eq!(call_index.load(Ordering::SeqCst), 3);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    for (index, expected) in [
+        "первый шаг",
+        "результат: первый шаг",
+        "подтверждение: результат: первый шаг",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let messages = requests[index + 1]["messages"]
+            .as_array()
+            .expect("messages");
+        assert!(messages.iter().any(|message| {
+            message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(expected))
+        }));
+    }
+}
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -738,7 +805,7 @@ async fn explicit_agents_run_concurrently_with_own_settings_and_deduplicated_han
 }
 
 #[tokio::test]
-async fn stops_after_two_waves_and_forces_final_without_tools() {
+async fn stops_after_wave_limit_and_forces_final_without_tools() {
     let main_count = Arc::new(AtomicUsize::new(0));
     let count = main_count.clone();
     let server = MockServer::new(move |req| {
@@ -753,8 +820,8 @@ async fn stops_after_two_waves_and_forces_final_without_tools() {
         .respond_streaming(request("Проверь", vec![definition("editor")]), |_| Ok(()))
         .await
         .expect("answer");
-    assert_eq!(main_count.load(Ordering::SeqCst), 2);
-    assert_eq!(answer.calls.len(), 5);
+    assert_eq!(main_count.load(Ordering::SeqCst), MAX_WAVES);
+    assert_eq!(answer.calls.len(), MAX_WAVES * 2 + 1);
     let requests = server.requests();
     let final_request = requests.last().expect("final");
     assert!(final_request.get("tools").is_none());
