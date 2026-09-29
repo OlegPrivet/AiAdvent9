@@ -82,6 +82,13 @@ pub(crate) async fn run<I: LineInput, W: Write>(
             } else if command.matches(&["/mcp", "/мсп"]) {
                 crate::mcp_ui::run(&store.mcp(), input, output).await?;
             } else if command.matches(&["/rag", "/раг"]) {
+                if command
+                    .argument
+                    .is_some_and(|value| value.trim_start().starts_with("evaluate"))
+                {
+                    writeln!(output, "RAG: сравниваю ответы на 10 вопросах…")?;
+                    output.flush()?;
+                }
                 match crate::rag_cli::slash(command.argument, chat, store).await {
                     Ok(message) => writeln!(output, "{message}")?,
                     Err(error) => writeln!(output, "RAG: {error}")?,
@@ -819,6 +826,14 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(
         output,
         "  /rag ...                документы, поиск и RAG для чата"
+    )?;
+    writeln!(
+        output,
+        "  /rag evaluate           сравнить ответы на 10 вопросах"
+    )?;
+    writeln!(
+        output,
+        "  /rag report             открыть сохранённый отчёт"
     )?;
     writeln!(
         output,

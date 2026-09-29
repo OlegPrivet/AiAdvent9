@@ -142,8 +142,10 @@ pub(crate) async fn slash(
                 .join("\n"))
         }
         "compare" => compare(&service, None, None).await,
+        "evaluate" => evaluate_inside_agi(&service, tail).await,
+        "report" if tail.is_empty() => read_answer_report(),
         _ => Err(RagError::Document(
-            "Команды: /rag add|list|remove|refresh|reindex|search|compare|embeddings|on|off|status|strategy".into(),
+            "Команды: /rag add|list|remove|refresh|reindex|search|compare|evaluate|report|embeddings|on|off|status|strategy".into(),
         )),
     }
 }
@@ -216,10 +218,40 @@ pub(crate) async fn background(input: String, strategy: Strategy) -> Result<Stri
                 .join("\n"))
         }
         "compare" => compare(&service, None, None).await,
+        "evaluate" => evaluate_inside_agi(&service, tail).await,
+        "report" if tail.is_empty() => read_answer_report(),
         _ => Err(RagError::Document(
-            "Команды: add|refresh|reindex|search|compare|embeddings".into(),
+            "Команды: add|refresh|reindex|search|compare|evaluate|report|embeddings".into(),
         )),
     }
+}
+
+async fn evaluate_inside_agi(service: &RagService, input: &str) -> Result<String, RagError> {
+    let path = if input.is_empty() {
+        PathBuf::from(crate::rag_eval::DEFAULT_EVAL_PATH)
+    } else {
+        expand_tilde(input)
+    };
+    if !path.is_file() {
+        return Err(RagError::Document(format!(
+            "Набор вопросов {} не найден. Откройте agi из корня проекта или укажите /rag evaluate <путь>",
+            path.display()
+        )));
+    }
+    let report = crate::rag_eval::evaluate(service, &path).await?;
+    fs::write(crate::rag_eval::default_report_path()?, &report)?;
+    Ok(report)
+}
+
+fn read_answer_report() -> Result<String, RagError> {
+    let path = crate::rag_eval::default_report_path()?;
+    fs::read_to_string(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            RagError::Document("Отчёт ещё не создан. Выполните /rag evaluate".into())
+        } else {
+            RagError::Io(error)
+        }
+    })
 }
 
 async fn embeddings_slash(service: &mut RagService, input: &str) -> Result<String, RagError> {
@@ -428,6 +460,11 @@ pub(crate) async fn run(root: RootCommand) -> Result<(), RagError> {
                 fs::write(&path, text)?;
                 println!("Отчёт: {}", path.display());
             }
+        }
+        RagCommand::Evaluate { eval, report } => {
+            let text = crate::rag_eval::evaluate(&service, &eval).await?;
+            fs::write(&report, text)?;
+            println!("Отчёт: {}", report.display());
         }
     }
     Ok(())

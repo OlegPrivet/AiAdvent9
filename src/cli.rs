@@ -80,6 +80,13 @@ pub(crate) enum RagCommand {
         #[arg(long)]
         report: Option<PathBuf>,
     },
+    /// Сравнить ответы модели с RAG и без RAG на контрольных вопросах.
+    Evaluate {
+        #[arg(long)]
+        eval: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]

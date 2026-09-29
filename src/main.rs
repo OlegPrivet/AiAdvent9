@@ -17,6 +17,7 @@ mod pricing;
 mod rag;
 mod rag_chunk;
 mod rag_cli;
+mod rag_eval;
 mod rag_extract;
 mod repl;
 mod settings;

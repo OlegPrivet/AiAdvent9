@@ -783,8 +783,18 @@ pub(crate) async fn context(question: &str, strategy: Strategy) -> Result<Vec<Hi
         std::env::var("NEURALDEEP_API_KEY").ok(),
         crate::config::DEFAULT_BASE_URL.into(),
     )?;
-    let hits = service.search(question, strategy, 12).await?;
-    Ok(select_context(hits))
+    service.context(question, strategy).await
+}
+
+impl RagService {
+    pub(crate) async fn context(
+        &self,
+        question: &str,
+        strategy: Strategy,
+    ) -> Result<Vec<Hit>, RagError> {
+        let hits = self.search(question, strategy, 12).await?;
+        Ok(select_context(hits))
+    }
 }
 
 fn select_context(hits: Vec<Hit>) -> Vec<Hit> {

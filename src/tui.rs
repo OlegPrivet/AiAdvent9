@@ -75,6 +75,16 @@ const COMMAND_PALETTE: &[CommandOption] = &[
         "сравнить стратегии поиска",
         &["/раг compare"],
     ),
+    CommandOption::run(
+        "/rag evaluate",
+        "сравнить ответы с RAG и без RAG",
+        &["/раг evaluate"],
+    ),
+    CommandOption::run(
+        "/rag report",
+        "открыть отчёт проверки RAG",
+        &["/раг report"],
+    ),
     CommandOption::run("/rag on", "включить RAG в чате", &["/раг on"]),
     CommandOption::run("/rag off", "выключить RAG в чате", &["/раг off"]),
     CommandOption::run(
@@ -353,6 +363,7 @@ pub(crate) async fn run(
         if let Some(command) = app.pending_rag_command.take() {
             let id = app.rag_command_id;
             let strategy = app.chat.settings().rag_strategy();
+            let evaluating = command == "evaluate" || command.starts_with("evaluate ");
             let tx = worker_tx.clone();
             rag_task = Some(tokio::spawn(async move {
                 let result = crate::rag_cli::background(command, strategy)
@@ -361,7 +372,11 @@ pub(crate) async fn run(
                 let _ = tx.send(WorkerEvent::RagResult(id, result));
             }));
             app.rag_busy = true;
-            app.notice = Some("RAG: обрабатываю документы… Ctrl+C: отменить".into());
+            app.notice = Some(if evaluating {
+                "RAG: сравниваю ответы на 10 вопросах… Ctrl+C: отменить".into()
+            } else {
+                "RAG: обрабатываю документы… Ctrl+C: отменить".into()
+            });
         }
 
         if app.pending_question.is_none() && app.scheduled_task {
@@ -1549,7 +1564,8 @@ impl<'a> App<'a> {
                 }
                 Err(error) => self.notice = Some(error),
             },
-            "add" | "refresh" | "reindex" | "search" | "compare" => {
+            "add" | "refresh" | "reindex" | "search" | "compare" | "evaluate"
+            | "report" => {
                 self.pending_rag_command = Some(input.to_owned());
                 self.rag_command_id = Uuid::new_v4();
             }
@@ -1600,7 +1616,7 @@ impl<'a> App<'a> {
             }
             _ => {
                 self.notice = Some(
-                    "/rag add|list|remove|refresh|reindex|search|compare|embeddings|on|off|status|strategy".into(),
+                    "/rag add|list|remove|refresh|reindex|search|compare|evaluate|report|embeddings|on|off|status|strategy".into(),
                 )
             }
         }
@@ -1960,9 +1976,13 @@ impl<'a> App<'a> {
                 self.rag_busy = false;
                 match result {
                     Ok(content) => {
-                        self.modal = Some(Modal::Message {
-                            title: "RAG".into(),
-                            content,
+                        self.modal = Some(if content.starts_with("# День 22 —") {
+                            Modal::Report { content, scroll: 0 }
+                        } else {
+                            Modal::Message {
+                                title: "RAG".into(),
+                                content,
+                            }
                         })
                     }
                     Err(error) => self.notice = Some(format!("RAG: {error}")),
@@ -2087,6 +2107,26 @@ impl<'a> App<'a> {
                     return;
                 }
             }
+            Modal::Report { content, scroll } => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => return,
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *scroll = scroll
+                        .saturating_add(1)
+                        .min(u16::try_from(content.lines().count()).unwrap_or(u16::MAX))
+                }
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                KeyCode::PageDown => {
+                    *scroll = scroll
+                        .saturating_add(10)
+                        .min(u16::try_from(content.lines().count()).unwrap_or(u16::MAX))
+                }
+                KeyCode::Home => *scroll = 0,
+                KeyCode::End => {
+                    *scroll = u16::try_from(content.lines().count()).unwrap_or(u16::MAX)
+                }
+                _ => {}
+            },
             Modal::List {
                 selected,
                 items,
@@ -2900,6 +2940,10 @@ enum Modal {
         title: String,
         content: String,
     },
+    Report {
+        content: String,
+        scroll: u16,
+    },
     List {
         title: String,
         items: Vec<String>,
@@ -2926,6 +2970,8 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/settings, /настройки   настройки текущего чата",
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
                 "/mcp, /мсп             MCP-серверы и инструменты AI",
+                "/rag evaluate          ответы с RAG и без RAG на 10 вопросах",
+                "/rag report            открыть сохранённый отчёт",
                 "/rag ...               документы; embeddings set URL MODEL",
                 "/facts ...              память Sticky Facts",
                 "/memory ...             short-term, working и long-term память",
@@ -2962,6 +3008,17 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                         .borders(Borders::ALL)
                         .title(format!(" {title} · Esc/Enter: закрыть ")),
                 )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, area);
+        }
+        Modal::Report { content, scroll } => {
+            let paragraph = Paragraph::new(content.as_str())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Проверка RAG · ↑/↓/PgUp/PgDn: прокрутка · Esc: закрыть "),
+                )
+                .scroll((*scroll, 0))
                 .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, area);
         }
@@ -4056,6 +4113,36 @@ mod tests {
         assert!(app.command_palette_options().is_empty());
         app.set_input("/task start Описание");
         assert!(app.command_palette_options().is_empty());
+        app.set_input("/rag eva");
+        assert!(
+            app.command_palette_options()
+                .iter()
+                .any(|option| option.syntax == "/rag evaluate")
+        );
+    }
+
+    #[test]
+    fn rag_evaluation_opens_scrollable_report_in_tui() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("test store should open");
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        app.handle_rag(Some("evaluate"));
+        assert_eq!(app.pending_rag_command.as_deref(), Some("evaluate"));
+        let id = app.rag_command_id;
+        app.rag_busy = true;
+        let report = format!("# День 22 — сравнение\n{}", "строка\n".repeat(30));
+        app.handle_worker_event(WorkerEvent::RagResult(id, Ok(report)));
+        assert!(matches!(app.modal, Some(Modal::Report { scroll: 0, .. })));
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::Report { scroll: 10, .. })));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
     }
 
     #[test]

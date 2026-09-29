@@ -1,0 +1,72 @@
+[
+  {
+    "question": "Какая переменная окружения нужна для API-ключа agi?",
+    "expected": "Нужно задать непустую переменную NEURALDEEP_API_KEY перед запуском agi.",
+    "expected_sources": ["README.md"],
+    "source": "README.md",
+    "anchor": "NEURALDEEP_API_KEY"
+  },
+  {
+    "question": "Как восстановить сохранённый чат по UUID при запуске?",
+    "expected": "Запустить agi --restore <UUID>; при желании можно сразу добавить вопрос. После восстановления прежняя переписка остаётся контекстом.",
+    "expected_sources": ["README.md"],
+    "source": "README.md",
+    "anchor": "Восстановить диалог при запуске"
+  },
+  {
+    "question": "Как подключить локальный stdio MCP-сервер?",
+    "expected": "В каталоге /mcp добавить локальный stdio-сервер, указав исполняемый файл, аргументы JSON-массивом строк и рабочий каталог; запуск идёт напрямую без shell.",
+    "expected_sources": ["README.md"],
+    "source": "README.md",
+    "anchor": "Для stdio-сервера задаются исполняемый файл"
+  },
+  {
+    "question": "Какие три слоя памяти есть у агента?",
+    "expected": "Краткосрочный слой хранит сообщения текущего чата, рабочий — состояние задачи, долговременный — профиль, решения и знания. Перенос между слоями не происходит автоматически.",
+    "expected_sources": ["projetcDocs/memory_layers.md"],
+    "source": "projetcDocs/memory_layers.md",
+    "anchor": "память разделена на три слоя"
+  },
+  {
+    "question": "Что происходит при недопустимом переходе состояния задачи?",
+    "expected": "Переход отклоняется, непроверенный ответ не записывается, последний корректный прогресс сохраняется, задача ставится на паузу; /task resume продолжает с той же границы.",
+    "expected_sources": ["projetcDocs/task_transitions_testing.md"],
+    "source": "projetcDocs/task_transitions_testing.md",
+    "anchor": "Сохранить последний корректный прогресс"
+  },
+  {
+    "question": "Как ассистент должен реагировать на конфликт с глобальными инвариантами?",
+    "expected": "Он должен отказаться от конфликтующих частей, назвать нарушенные правила, объяснить причину и предложить допустимый вариант; конфликтующий ответ не должен считаться выполненным шагом.",
+    "expected_sources": ["projetcDocs/invariants_testing.md"],
+    "source": "projetcDocs/invariants_testing.md",
+    "anchor": "Ассистент должен отказаться от конфликтующих частей"
+  },
+  {
+    "question": "Какой API и модель используются для векторизации документов?",
+    "expected": "OpenAI-совместимый POST /v1/embeddings с моделью bge-m3; возвращаются 1024-мерные векторы.",
+    "expected_sources": ["projetcDocs/llm_docs.md"],
+    "source": "projetcDocs/llm_docs.md",
+    "anchor": "OpenAI-совместимый `/v1/embeddings`"
+  },
+  {
+    "question": "Где хранятся долгосрочные знания агента?",
+    "expected": "В Markdown-файлах каталога memory рядом с chats.sqlite3; краткосрочные и рабочие данные хранятся в SQLite.",
+    "expected_sources": ["projetcDocs/memory_layers.md"],
+    "source": "projetcDocs/memory_layers.md",
+    "anchor": "Markdown-файлы находятся в каталоге `memory`"
+  },
+  {
+    "question": "Где хранится локальный индекс RAG и отделён ли он от истории чатов?",
+    "expected": "Индекс документов хранится в rag.sqlite3 в каталоге состояния agi, отдельно от истории чатов.",
+    "expected_sources": ["README.md"],
+    "source": "README.md",
+    "anchor": "локальный индекс документов отдельно от истории чатов"
+  },
+  {
+    "question": "Что нужно сделать с индексом RAG после смены модели эмбеддингов или URL сервиса?",
+    "expected": "Старые векторы не используются; нужно выполнить agi rag reindex или /rag reindex, затем проверить статус индекса.",
+    "expected_sources": ["README.md"],
+    "source": "README.md",
+    "anchor": "При смене модели или URL старые векторы не используются"
+  }
+]
