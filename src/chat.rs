@@ -21,7 +21,7 @@ use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 10;
+const DATABASE_SCHEMA_VERSION: i64 = 11;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -266,6 +266,8 @@ impl Chat {
             || self.task.is_some()
             || !self.working_memory.is_empty()
             || self.memory_selection != MemorySelection::default()
+            || self.settings.rag_enabled()
+            || self.settings.rag_strategy() != crate::rag_chunk::Strategy::Structure
     }
 
     pub(crate) fn is_persisted(&self) -> bool {
@@ -665,7 +667,7 @@ impl ChatStore {
             )
             .optional()
             .map_err(self.database_error("прочитать настройки памяти"))?
-            .unwrap_or_else(|| (true, crate::memory::DEFAULT_PROFILE_NAME.into()));
+            .unwrap_or_else(|| (false, crate::memory::DEFAULT_PROFILE_NAME.into()));
         crate::memory::validate_name(&profile_settings.1)
             .map_err(|_| ChatStoreError::InvalidConversation(id))?;
         let mut memory_selection = MemorySelection {
@@ -1457,7 +1459,7 @@ fn initialize_database(
                  );
                  CREATE TABLE IF NOT EXISTS memory_settings (
                      chat_id TEXT PRIMARY KEY NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-                     profile_enabled INTEGER NOT NULL DEFAULT 1 CHECK(profile_enabled IN (0, 1)),
+                     profile_enabled INTEGER NOT NULL DEFAULT 0 CHECK(profile_enabled IN (0, 1)),
                      profile_name TEXT NOT NULL DEFAULT 'default'
                  );
                  CREATE TABLE IF NOT EXISTS memory_selections (
@@ -1542,6 +1544,31 @@ fn initialize_database(
             )
             .map_err(|source| database_error("добавить каталог MCP", database_path, source))?;
     }
+    if version < 11 {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE memory_settings_new (
+                     chat_id TEXT PRIMARY KEY NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                     profile_enabled INTEGER NOT NULL DEFAULT 0 CHECK(profile_enabled IN (0, 1)),
+                     profile_name TEXT NOT NULL DEFAULT 'default'
+                 );
+                 INSERT INTO memory_settings_new(chat_id, profile_enabled, profile_name)
+                     SELECT chats.id, 0, COALESCE(memory_settings.profile_name, 'default')
+                     FROM chats LEFT JOIN memory_settings ON memory_settings.chat_id = chats.id;
+                 DROP TABLE memory_settings;
+                 ALTER TABLE memory_settings_new RENAME TO memory_settings;
+                 UPDATE checkpoints SET snapshot_json =
+                     CASE WHEN json_valid(snapshot_json)
+                         THEN json_set(snapshot_json, '$.memory_selection.profile', json('false'))
+                         ELSE snapshot_json END;
+                 PRAGMA user_version = 11;
+                 COMMIT;",
+            )
+            .map_err(|source| {
+                database_error("отключить профили для всех чатов", database_path, source)
+            })?;
+    }
     Ok(())
 }
 
@@ -1616,7 +1643,7 @@ fn now_millis() -> u64 {
     millis.min(u128::from(u64::MAX)) as u64
 }
 
-fn state_directory() -> Option<PathBuf> {
+pub(crate) fn state_directory() -> Option<PathBuf> {
     state_directory_from_lookup(|name| env::var_os(name))
 }
 
@@ -2327,7 +2354,7 @@ mod tests {
 
         let migrated = ChatStore::for_tests(directory.0.clone()).expect("migrate v6");
         let restored = migrated.load(chat.id()).expect("restore selection");
-        assert!(restored.memory_selection().profile);
+        assert!(!restored.memory_selection().profile);
         assert_eq!(
             restored.memory_selection().profile_name,
             crate::memory::DEFAULT_PROFILE_NAME
@@ -2339,6 +2366,55 @@ mod tests {
                 .expect("schema version"),
             DATABASE_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn disables_profiles_in_existing_chats_and_checkpoints() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut selected = Chat::new();
+        selected
+            .settings_mut()
+            .select_context_strategy(ContextStrategyKind::Branching);
+        selected.select_profile("senior".into());
+        selected.record_exchange("Вопрос".into(), "Ответ".into());
+        store.save(&mut selected).expect("save selected chat");
+        store
+            .create_checkpoint(&selected, "before")
+            .expect("save checkpoint");
+
+        let mut implicit = Chat::new();
+        implicit.record_exchange("Другой вопрос".into(), "Другой ответ".into());
+        store.save(&mut implicit).expect("save implicit chat");
+        store
+            .connection
+            .execute(
+                "DELETE FROM memory_settings WHERE chat_id = ?1",
+                [implicit.id().to_string()],
+            )
+            .expect("simulate legacy chat without memory settings");
+        store
+            .connection
+            .execute_batch("PRAGMA user_version = 10;")
+            .expect("v10 fixture");
+        drop(store);
+
+        let migrated = ChatStore::for_tests(directory.0.clone()).expect("migrate profiles");
+        let selected = migrated.load(selected.id()).expect("restore selected chat");
+        assert!(!selected.memory_selection().profile);
+        assert_eq!(selected.memory_selection().profile_name, "senior");
+        assert!(
+            !migrated
+                .load(implicit.id())
+                .expect("restore implicit chat")
+                .memory_selection()
+                .profile
+        );
+        let branch = migrated
+            .create_branch(selected.branch_group_id(), "before", "after")
+            .expect("branch from old checkpoint");
+        assert!(!branch.memory_selection().profile);
+        assert!(!Chat::new().memory_selection().profile);
     }
 
     #[test]

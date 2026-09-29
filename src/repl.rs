@@ -81,6 +81,11 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                 .await?;
             } else if command.matches(&["/mcp", "/мсп"]) {
                 crate::mcp_ui::run(&store.mcp(), input, output).await?;
+            } else if command.matches(&["/rag", "/раг"]) {
+                match crate::rag_cli::slash(command.argument, chat, store).await {
+                    Ok(message) => writeln!(output, "{message}")?,
+                    Err(error) => writeln!(output, "RAG: {error}")?,
+                }
             } else if command.matches(&["/facts", "/факты"]) {
                 manage_facts(store, chat, command.argument, output)?;
             } else if command.matches(&["/memory", "/память"]) {
@@ -235,13 +240,22 @@ async fn ask<W: Write>(
         Ok(servers) => servers,
         Err(error) => return writeln!(output, "Каталог MCP: {error}\n"),
     };
+    let rag_hits = if chat.settings().rag_enabled() {
+        match crate::rag::context(question, chat.settings().rag_strategy()).await {
+            Ok(hits) => hits,
+            Err(error) => return writeln!(output, "RAG: {error}\n"),
+        }
+    } else {
+        Vec::new()
+    };
     let mut live_answer = ui.begin_answer(output);
     let result = client
         .respond_streaming(
             AgentRequest::new(chat, question.to_owned(), agents)
                 .with_memory(memory)
                 .with_invariants(invariants)
-                .with_mcp(mcp_servers),
+                .with_mcp(mcp_servers)
+                .with_rag(rag_hits),
             |event| live_answer.agent_event(event),
         )
         .await;
@@ -341,7 +355,13 @@ async fn run_task_until<W: Write>(
                 tokio::select! {
                     biased;
                     signal = &mut cancellation => Err(signal.err().map_or_else(|| "Остановлено пользователем".into(), |e| format!("Ошибка обработчика паузы: {e}"))),
-                    result = client.respond_streaming(request, |event| live.agent_event(event)) => result.map_err(|e| e.to_string()),
+                    result = async {
+                        let request = if request.settings.rag_enabled() {
+                            let hits = crate::rag::context(&request.question, request.settings.rag_strategy()).await.map_err(|e| e.to_string())?;
+                            request.with_rag(hits)
+                        } else { request };
+                        client.respond_streaming(request, |event| live.agent_event(event)).await.map_err(|e| e.to_string())
+                    } => result,
                 }
             }
             Err(error) => Err(error),
@@ -795,6 +815,14 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(
         output,
         "  /mcp, /мсп              MCP-серверы и инструменты AI"
+    )?;
+    writeln!(
+        output,
+        "  /rag ...                документы, поиск и RAG для чата"
+    )?;
+    writeln!(
+        output,
+        "  /rag embeddings set URL MODEL [KEY_ENV]  своя модель эмбеддингов"
     )?;
     writeln!(output, "  /chat, /чаты             выбрать сохранённый чат")?;
     writeln!(

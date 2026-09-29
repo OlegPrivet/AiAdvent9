@@ -178,6 +178,11 @@ impl<W: Write> LiveAnswer<'_, W> {
     pub(crate) fn finish(mut self, answer: &str) -> io::Result<()> {
         self.status.clear();
         let answer = sanitize_terminal_text(answer);
+        if let Some(suffix) = answer.strip_prefix(&self.source)
+            && !suffix.is_empty()
+        {
+            self.push(suffix)?;
+        }
 
         if self.renderer.is_some() {
             if self.source.is_empty() {
@@ -493,6 +498,40 @@ mod tests {
         answer.finish("Привет, мир!").expect("answer should finish");
 
         assert_eq!(String::from_utf8(output).unwrap(), "Привет, мир!\n\n");
+    }
+
+    #[test]
+    fn plain_output_prints_references_added_after_streaming() {
+        let ui = TerminalUi::plain();
+        let mut output = Vec::new();
+        let mut answer = ui.begin_answer(&mut output);
+
+        answer.push("Ответ [1].").expect("answer should stream");
+        answer
+            .finish("Ответ [1].\n\nНайденные источники:\n[1] readme.md · RAG")
+            .expect("answer should finish");
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Ответ [1].\n\nНайденные источники:\n[1] readme.md · RAG\n\n"
+        );
+    }
+
+    #[test]
+    fn rendered_output_prints_references_added_after_streaming() {
+        let ui = TerminalUi::rendered_for_test();
+        let mut output = Vec::new();
+        let mut answer = ui.begin_answer(&mut output);
+
+        answer.push("Ответ [1].").expect("answer should stream");
+        answer
+            .finish("Ответ [1].\n\nНайденные источники:\n[1] readme.md · RAG")
+            .expect("answer should finish");
+
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        assert_eq!(output.matches("Ответ").count(), 1);
+        assert_eq!(output.matches("Найденные источники").count(), 1);
+        assert_eq!(output.matches("readme.md").count(), 1);
     }
 
     #[test]

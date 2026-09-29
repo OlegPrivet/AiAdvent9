@@ -45,12 +45,8 @@ const STREAM_BATCH_BYTES: usize = 1024;
 const PRICE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_INPUT_HEIGHT: u16 = 8;
 const COMMAND_PALETTE: &[CommandOption] = &[
-    CommandOption::run("/chat", "выбрать сохранённый чат", &["/чаты"]),
-    CommandOption::open_chats(
-        "/restore <UUID>",
-        "восстановить сохранённый чат",
-        &["/восстановить"],
-    ),
+    CommandOption::run("/chat", "выбрать сохранённый чат", &["/chats", "/чаты"]),
+    CommandOption::open_chats("/restore", "восстановить чат по UUID", &["/восстановить"]),
     CommandOption::run(
         "/settings",
         "настройки текущего чата",
@@ -62,16 +58,168 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     CommandOption::run("/exit", "сохранить чат и выйти", &["/quit", "/выход"]),
     CommandOption::run("/agents", "глобальный каталог агентов", &["/агенты"]),
     CommandOption::run("/mcp", "MCP-серверы и инструменты AI", &["/мсп"]),
+    CommandOption::run("/rag", "документы и RAG", &["/раг"]),
+    CommandOption::run("/rag status", "состояние RAG", &["/раг status"]),
+    CommandOption::run("/rag list", "список документов", &["/раг list"]),
+    CommandOption::argument("/rag add", "добавить файл или каталог", &["/раг add"]),
+    CommandOption::argument("/rag remove", "удалить документ по ID", &["/раг remove"]),
+    CommandOption::run("/rag refresh", "обновить документы", &["/раг refresh"]),
+    CommandOption::run(
+        "/rag reindex",
+        "переиндексировать документы",
+        &["/раг reindex"],
+    ),
+    CommandOption::argument("/rag search", "поиск по документам", &["/раг search"]),
+    CommandOption::run(
+        "/rag compare",
+        "сравнить стратегии поиска",
+        &["/раг compare"],
+    ),
+    CommandOption::run("/rag on", "включить RAG в чате", &["/раг on"]),
+    CommandOption::run("/rag off", "выключить RAG в чате", &["/раг off"]),
+    CommandOption::run(
+        "/rag strategy fixed",
+        "фиксированное разбиение",
+        &["/раг strategy fixed"],
+    ),
+    CommandOption::run(
+        "/rag strategy structure",
+        "разбиение по структуре",
+        &["/раг strategy structure"],
+    ),
+    CommandOption::run(
+        "/rag embeddings",
+        "настройки эмбеддингов",
+        &["/раг embeddings"],
+    ),
+    CommandOption::run(
+        "/rag embeddings show",
+        "показать модель эмбеддингов",
+        &["/раг embeddings show"],
+    ),
+    CommandOption::run(
+        "/rag embeddings reset",
+        "сбросить модель эмбеддингов",
+        &["/раг embeddings reset"],
+    ),
+    CommandOption::argument(
+        "/rag embeddings set",
+        "указать URL и модель эмбеддингов",
+        &["/раг embeddings set"],
+    ),
     CommandOption::run("/facts", "память Sticky Facts", &["/факты"]),
+    CommandOption::argument("/facts set", "сохранить факт", &["/факты set"]),
+    CommandOption::argument("/facts delete", "удалить факт", &["/факты delete"]),
     CommandOption::run("/memory", "слои памяти агента", &["/память"]),
+    CommandOption::run("/memory short", "краткосрочная память", &["/память short"]),
+    CommandOption::run("/memory context", "текущий контекст", &["/память context"]),
+    CommandOption::run("/memory working", "рабочая память", &["/память working"]),
+    CommandOption::argument(
+        "/memory working set",
+        "сохранить рабочую запись",
+        &["/память working set"],
+    ),
+    CommandOption::argument(
+        "/memory working delete",
+        "удалить рабочую запись",
+        &["/память working delete"],
+    ),
+    CommandOption::run(
+        "/memory working clear",
+        "очистить рабочую память",
+        &["/память working clear"],
+    ),
+    CommandOption::run(
+        "/memory profile init",
+        "создать профиль default",
+        &["/память profile init"],
+    ),
+    CommandOption::run(
+        "/memory profile list",
+        "список профилей",
+        &["/память profile list"],
+    ),
+    CommandOption::argument(
+        "/memory profile create",
+        "создать профиль",
+        &["/память profile create"],
+    ),
+    CommandOption::run(
+        "/memory profile show",
+        "показать профиль (имя необязательно)",
+        &["/память profile show"],
+    ),
+    CommandOption::argument(
+        "/memory profile set",
+        "изменить раздел профиля",
+        &["/память profile set"],
+    ),
+    CommandOption::argument(
+        "/memory profile delete",
+        "удалить профиль",
+        &["/память profile delete"],
+    ),
+    CommandOption::run("/memory long", "долговременная память", &["/память long"]),
+    CommandOption::argument(
+        "/memory long set",
+        "сохранить запись",
+        &["/память long set"],
+    ),
+    CommandOption::argument(
+        "/memory long show",
+        "показать запись",
+        &["/память long show"],
+    ),
+    CommandOption::argument(
+        "/memory long delete",
+        "удалить запись",
+        &["/память long delete"],
+    ),
+    CommandOption::argument("/memory use", "подключить запись", &["/память use"]),
+    CommandOption::run(
+        "/memory use profile",
+        "подключить профиль (имя необязательно)",
+        &["/память use profile"],
+    ),
+    CommandOption::argument("/memory unuse", "отключить запись", &["/память unuse"]),
+    CommandOption::run(
+        "/memory unuse profile",
+        "отключить профиль",
+        &["/память unuse profile"],
+    ),
     CommandOption::run("/invariants", "глобальные инварианты", &["/инварианты"]),
+    CommandOption::argument("/invariants set", "сохранить правило", &["/инварианты set"]),
+    CommandOption::argument(
+        "/invariants delete",
+        "удалить правило",
+        &["/инварианты delete"],
+    ),
     CommandOption::run("/task", "состояние задачи", &["/задача"]),
-    CommandOption::run("/task start", "начать задачу: добавьте описание", &[]),
-    CommandOption::run("/task approve", "утвердить план и выполнить", &[]),
-    CommandOption::run("/task pause", "приостановить задачу", &[]),
-    CommandOption::run("/task resume", "продолжить задачу", &[]),
-    CommandOption::run("/checkpoint", "сохранить точку ветвления", &["/чекпоинт"]),
+    CommandOption::argument(
+        "/task start",
+        "начать задачу с описанием",
+        &["/задача start"],
+    ),
+    CommandOption::run(
+        "/task approve",
+        "утвердить план и выполнить",
+        &["/задача approve"],
+    ),
+    CommandOption::run("/task pause", "приостановить задачу", &["/задача pause"]),
+    CommandOption::run("/task resume", "продолжить задачу", &["/задача resume"]),
+    CommandOption::argument("/checkpoint", "сохранить точку ветвления", &["/чекпоинт"]),
     CommandOption::run("/branch", "управление ветками", &["/ветка"]),
+    CommandOption::run("/branch list", "список веток", &["/ветка list"]),
+    CommandOption::argument(
+        "/branch create",
+        "создать ветку от checkpoint",
+        &["/ветка create"],
+    ),
+    CommandOption::argument(
+        "/branch switch",
+        "переключиться на ветку",
+        &["/ветка switch"],
+    ),
 ];
 
 #[derive(Clone, Copy)]
@@ -109,14 +257,35 @@ impl CommandOption {
         }
     }
 
+    const fn argument(
+        syntax: &'static str,
+        description: &'static str,
+        aliases: &'static [&'static str],
+    ) -> Self {
+        Self {
+            syntax,
+            description,
+            aliases,
+            action: CommandAction::Insert,
+        }
+    }
+
     fn matches(self, query: &str) -> bool {
         self.syntax.starts_with(query) || self.aliases.iter().any(|alias| alias.starts_with(query))
+    }
+
+    fn completion(self) -> String {
+        match self.action {
+            CommandAction::Run(_) => self.syntax.to_owned(),
+            CommandAction::Insert | CommandAction::OpenChats => format!("{} ", self.syntax),
+        }
     }
 }
 
 #[derive(Clone, Copy)]
 enum CommandAction {
     Run(&'static str),
+    Insert,
     OpenChats,
 }
 
@@ -135,6 +304,7 @@ pub(crate) async fn run(
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
     let mut app = App::new(store, chat, edit_mode);
     let mut request_task = None;
+    let mut rag_task: Option<JoinHandle<()>> = None;
 
     spawn_price_refresh(worker_tx.clone());
     app.price_refresh_started();
@@ -178,6 +348,20 @@ pub(crate) async fn run(
             }
             app.handle_worker_event(worker_event);
             needs_draw = true;
+        }
+
+        if let Some(command) = app.pending_rag_command.take() {
+            let id = app.rag_command_id;
+            let strategy = app.chat.settings().rag_strategy();
+            let tx = worker_tx.clone();
+            rag_task = Some(tokio::spawn(async move {
+                let result = crate::rag_cli::background(command, strategy)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(WorkerEvent::RagResult(id, result));
+            }));
+            app.rag_busy = true;
+            app.notice = Some("RAG: обрабатываю документы… Ctrl+C: отменить".into());
         }
 
         if app.pending_question.is_none() && app.scheduled_task {
@@ -269,6 +453,11 @@ pub(crate) async fn run(
                     if let Some(task) = request_task.take() {
                         task.0.abort();
                         app.cancel_request();
+                    } else if let Some(task) = rag_task.take() {
+                        task.abort();
+                        app.rag_busy = false;
+                        app.rag_command_id = Uuid::new_v4();
+                        app.notice = Some("Операция RAG отменена".into());
                     }
                 }
                 Action::Exit => {
@@ -279,6 +468,10 @@ pub(crate) async fn run(
             }
         }
     };
+
+    if let Some(task) = rag_task {
+        task.abort();
+    }
 
     drop(session);
     println!("{exit_message}");
@@ -352,6 +545,17 @@ fn spawn_request(
                             invariant_refusal: false,
                         });
                     }
+                    let request = if request.settings.rag_enabled() {
+                        let hits =
+                            crate::rag::context(&request.question, request.settings.rag_strategy())
+                                .await
+                                .map_err(|error| {
+                                    AgentError::InvalidRequest(format!("RAG: {error}"))
+                                })?;
+                        request.with_rag(hits)
+                    } else {
+                        request
+                    };
                     let mut pending_delta = String::new();
                     let mut last_delta_flush = Instant::now() - STREAM_BATCH_INTERVAL;
                     let answer = {
@@ -437,6 +641,7 @@ enum WorkerEvent {
     Agent(Uuid, AgentEvent),
     Finished(Uuid, Result<AgentAnswer, AgentError>),
     Prices(Result<PriceCatalog, String>),
+    RagResult(Uuid, Result<String, String>),
 }
 
 enum Action {
@@ -482,6 +687,9 @@ struct App<'a> {
     task_budget: crate::task::RunBudget,
     scheduled_task: bool,
     pause_button: Rect,
+    pending_rag_command: Option<String>,
+    rag_command_id: Uuid,
+    rag_busy: bool,
 }
 
 impl<'a> App<'a> {
@@ -527,6 +735,9 @@ impl<'a> App<'a> {
             task_budget: crate::task::RunBudget::default(),
             scheduled_task: false,
             pause_button: Rect::default(),
+            pending_rag_command: None,
+            rag_command_id: Uuid::nil(),
+            rag_busy: false,
         }
     }
 
@@ -704,7 +915,7 @@ impl<'a> App<'a> {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Команды · ↑/↓: выбрать · Enter: выполнить · Esc: закрыть "),
+                    .title(" Команды · ↑/↓: выбрать · Tab: подставить · Enter: выполнить "),
             )
             .highlight_symbol("› ")
             .highlight_style(
@@ -902,7 +1113,7 @@ impl<'a> App<'a> {
                     self.history_scroll = self.max_history_scroll;
                     return Action::None;
                 }
-                KeyCode::Char('c') if self.pending_question.is_some() => {
+                KeyCode::Char('c') if self.pending_question.is_some() || self.rag_busy => {
                     return Action::CancelRequest;
                 }
                 KeyCode::Char('c') => {
@@ -1108,6 +1319,10 @@ impl<'a> App<'a> {
     }
 
     fn take_question(&mut self) -> io::Result<Option<String>> {
+        if self.rag_busy {
+            self.notice = Some("Дождитесь завершения RAG или отмените через Ctrl+C".into());
+            return Ok(None);
+        }
         let value = self.input_value();
         if value.trim().is_empty() || value.trim() == "/" {
             self.set_input("");
@@ -1131,8 +1346,11 @@ impl<'a> App<'a> {
             return Vec::new();
         }
         let value = self.input_value();
-        let query = value.trim();
-        if !query.starts_with('/') || query.chars().any(char::is_whitespace) {
+        if value.contains(['\n', '\r']) {
+            return Vec::new();
+        }
+        let query = value.trim_start();
+        if !query.starts_with('/') {
             return Vec::new();
         }
         COMMAND_PALETTE
@@ -1152,9 +1370,17 @@ impl<'a> App<'a> {
                 self.command_selection = self.command_selection.saturating_sub(1);
                 Some(Action::None)
             }
-            KeyCode::Down | KeyCode::Tab => {
+            KeyCode::Down => {
                 self.command_selection =
                     (self.command_selection + 1).min(options.len().saturating_sub(1));
+                Some(Action::None)
+            }
+            KeyCode::Tab => {
+                let option = options[self.command_selection.min(options.len() - 1)];
+                self.set_input(&option.completion());
+                if self.edit_mode == EditMode::Vim {
+                    self.vim_mode = VimMode::Insert;
+                }
                 Some(Action::None)
             }
             KeyCode::Esc => {
@@ -1166,10 +1392,6 @@ impl<'a> App<'a> {
                 self.set_input("");
                 match option.action {
                     CommandAction::Run(command) => {
-                        if command == "/task start" {
-                            self.set_input("/task start ");
-                            return Some(Action::None);
-                        }
                         if crate::summary::is_command(command) {
                             return Some(match self.begin_question("/summarize".into()) {
                                 Ok(question) => Action::Submit(question),
@@ -1183,6 +1405,7 @@ impl<'a> App<'a> {
                             self.handle_command(command);
                         }
                     }
+                    CommandAction::Insert => self.set_input(&option.completion()),
                     CommandAction::OpenChats => self.open_chats(),
                 }
                 Some(if std::mem::take(&mut self.exit_requested) {
@@ -1229,6 +1452,11 @@ impl<'a> App<'a> {
             self.notice = Some("Дождитесь завершения запроса или отмените его через Ctrl+C".into());
             return;
         }
+        if self.rag_busy {
+            self.notice =
+                Some("Дождитесь завершения индексации или отмените её через Ctrl+C".into());
+            return;
+        }
         if command.matches(&["/exit", "/quit", "/выход"]) {
             self.exit_requested = true;
         } else if command.matches(&["/clear", "/очистить"]) {
@@ -1251,6 +1479,8 @@ impl<'a> App<'a> {
                 Ok(manager) => self.modal = Some(Modal::Mcp(Box::new(McpModal::new(manager)))),
                 Err(error) => self.notice = Some(error.to_string()),
             }
+        } else if command.matches(&["/rag", "/раг"]) {
+            self.handle_rag(command.argument);
         } else if command.matches(&["/facts", "/факты"]) {
             self.handle_facts(command.argument);
         } else if command.matches(&["/memory", "/память"]) {
@@ -1290,6 +1520,89 @@ impl<'a> App<'a> {
                 "Неизвестная команда: {}. Используйте /help.",
                 command.name
             ));
+        }
+    }
+
+    fn handle_rag(&mut self, argument: Option<&str>) {
+        let input = argument.unwrap_or("status").trim();
+        let (action, tail) = input
+            .split_once(char::is_whitespace)
+            .map_or((input, ""), |(action, tail)| (action, tail.trim()));
+        match action {
+            "on" | "off" => {
+                self.chat.settings_mut().set_rag_enabled(action == "on");
+                self.settings_changed();
+                self.notice = Some(format!(
+                    "RAG {}",
+                    if action == "on" {
+                        "включён"
+                    } else {
+                        "выключен"
+                    }
+                ));
+            }
+            "strategy" => match tail.parse::<crate::rag_chunk::Strategy>() {
+                Ok(strategy) => {
+                    self.chat.settings_mut().set_rag_strategy(strategy);
+                    self.settings_changed();
+                    self.notice = Some(format!("Стратегия RAG: {}", strategy.as_str()));
+                }
+                Err(error) => self.notice = Some(error),
+            },
+            "add" | "refresh" | "reindex" | "search" | "compare" => {
+                self.pending_rag_command = Some(input.to_owned());
+                self.rag_command_id = Uuid::new_v4();
+            }
+            "embeddings" if !tail.is_empty() && tail != "show" => {
+                self.pending_rag_command = Some(input.to_owned());
+                self.rag_command_id = Uuid::new_v4();
+            }
+            "status" | "list" | "remove" | "embeddings" => {
+                let result = crate::rag::RagService::open(
+                    std::env::var("NEURALDEEP_API_KEY").ok(),
+                    crate::config::DEFAULT_BASE_URL.into(),
+                );
+                match result {
+                    Err(error) => self.notice = Some(format!("RAG: {error}")),
+                    Ok(service) => {
+                        let content = match action {
+                            "status" => service.stats().and_then(|stats| crate::rag_cli::embedding_status(&service).map(|embeddings| format!(
+                                "RAG: {}; стратегия: {}; источников: {}; слов: {}; чанков fixed/structure: {}/{}\n{}",
+                                if self.chat.settings().rag_enabled() { "включён" } else { "выключен" },
+                                self.chat.settings().rag_strategy().as_str(),
+                                stats.sources, stats.words, stats.fixed, stats.structure,
+                                embeddings
+                            ))),
+                            "embeddings" => crate::rag_cli::embedding_status(&service),
+                            "list" => service.list().map(|sources| {
+                                if sources.is_empty() { return "Документов нет. /rag add <путь>".into(); }
+                                sources.into_iter().map(|source| format!(
+                                    "{} · {} · {} · {} слов",
+                                    source.id, source.path, source.title, source.words
+                                )).collect::<Vec<_>>().join("\n")
+                            }),
+                            _ => service.remove(tail).map(|removed| {
+                                if removed { format!("Источник {tail} удалён") }
+                                else { format!("Источник {tail} не найден") }
+                            }),
+                        };
+                        match content {
+                            Ok(content) => {
+                                self.modal = Some(Modal::Message {
+                                    title: "RAG".into(),
+                                    content,
+                                })
+                            }
+                            Err(error) => self.notice = Some(format!("RAG: {error}")),
+                        }
+                    }
+                }
+            }
+            _ => {
+                self.notice = Some(
+                    "/rag add|list|remove|refresh|reindex|search|compare|embeddings|on|off|status|strategy".into(),
+                )
+            }
         }
     }
 
@@ -1638,6 +1951,21 @@ impl<'a> App<'a> {
                         self.notice = Some(format!("Прайс временно недоступен: {error}"));
                     }
                     Err(_) => {}
+                }
+            }
+            WorkerEvent::RagResult(id, result) => {
+                if id != self.rag_command_id || !self.rag_busy {
+                    return;
+                }
+                self.rag_busy = false;
+                match result {
+                    Ok(content) => {
+                        self.modal = Some(Modal::Message {
+                            title: "RAG".into(),
+                            content,
+                        })
+                    }
+                    Err(error) => self.notice = Some(format!("RAG: {error}")),
                 }
             }
         }
@@ -2598,6 +2926,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/settings, /настройки   настройки текущего чата",
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
                 "/mcp, /мсп             MCP-серверы и инструменты AI",
+                "/rag ...               документы; embeddings set URL MODEL",
                 "/facts ...              память Sticky Facts",
                 "/memory ...             short-term, working и long-term память",
                 "/invariants ...         глобальные обязательные правила",
@@ -2613,6 +2942,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "PgUp/PgDn, колесо        прокрутить историю",
                 "Ctrl+Home/Ctrl+End       начало/конец истории",
                 "Shift/Alt+Enter          новая строка",
+                "/, затем ↑/↓ и Tab       выбрать и подставить команду",
                 "/, затем ↑/↓ и Enter     выбрать и выполнить команду",
                 "Ctrl+R                   найти запрос в истории",
                 "Ctrl+D                   выход на пустой строке",
@@ -2827,6 +3157,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn embedding_setup_inside_tui_is_queued_for_background_work() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        let command = "embeddings set http://127.0.0.1:8000/v1/embeddings local-model";
+        app.handle_rag(Some(command));
+        assert_eq!(app.pending_rag_command.as_deref(), Some(command));
     }
 
     #[test]
@@ -3676,6 +4022,111 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn command_palette_filters_roots_subcommands_and_aliases() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("test store should open");
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+
+        app.set_input("/");
+        assert!(app.command_palette_options().len() > 40);
+        app.set_input("/task ");
+        let options = app.command_palette_options();
+        assert!(options.iter().any(|option| option.syntax == "/task start"));
+        assert!(
+            options
+                .iter()
+                .all(|option| option.syntax.starts_with("/task "))
+        );
+        app.set_input("/раг emb");
+        assert!(
+            app.command_palette_options()
+                .iter()
+                .any(|option| option.syntax == "/rag embeddings set")
+        );
+        app.set_input("/task start ");
+        assert!(app.command_palette_options().is_empty());
+        app.set_input("/task start Описание");
+        assert!(app.command_palette_options().is_empty());
+    }
+
+    #[test]
+    fn tab_inserts_selected_command_without_executing_it() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("test store should open");
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        let chat_id = app.chat.id();
+
+        app.set_input("/cl");
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert_eq!(app.input_value(), "/clear");
+        assert_eq!(app.chat.id(), chat_id);
+
+        app.set_input("/задача st");
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert_eq!(app.input_value(), "/task start ");
+        assert!(app.command_palette_options().is_empty());
+        assert!(app.chat.task().is_none());
+
+        app.set_input("/task ");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input_value(), "/task approve");
+        assert!(app.chat.task().is_none());
+
+        app.set_input("/restore");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input_value(), "/restore ");
+        assert!(app.modal.is_none());
+
+        app.set_input("/rag add");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input_value(), "/rag add ");
+        assert!(app.pending_rag_command.is_none());
+    }
+
+    #[test]
+    fn command_palette_scrolls_to_last_option() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("test store should open");
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        app.set_input("/");
+        app.command_selection = app.command_palette_options().len() - 1;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal should open");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("command palette should render");
+        assert!(
+            (12..19)
+                .any(|row| buffer_row(terminal.backend().buffer(), row).contains("/branch switch"))
+        );
     }
 
     #[test]

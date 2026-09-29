@@ -1,0 +1,42 @@
+[
+  {
+    "question": "Какая переменная окружения нужна для API-ключа agi?",
+    "source": "README.md",
+    "anchor": "NEURALDEEP_API_KEY"
+  },
+  {
+    "question": "Как восстановить сохранённый чат по UUID при запуске?",
+    "source": "README.md",
+    "anchor": "Восстановить диалог при запуске"
+  },
+  {
+    "question": "Как подключить локальный stdio MCP-сервер?",
+    "source": "README.md",
+    "anchor": "Для stdio-сервера задаются исполняемый файл"
+  },
+  {
+    "question": "Какие три слоя памяти есть у агента?",
+    "source": "projetcDocs/memory_layers.md",
+    "anchor": "память разделена на три слоя"
+  },
+  {
+    "question": "Что происходит при недопустимом переходе состояния задачи?",
+    "source": "projetcDocs/task_transitions_testing.md",
+    "anchor": "Сохранить последний корректный прогресс"
+  },
+  {
+    "question": "Как ассистент должен реагировать на конфликт с глобальными инвариантами?",
+    "source": "projetcDocs/invariants_testing.md",
+    "anchor": "Ассистент должен отказаться от конфликтующих частей"
+  },
+  {
+    "question": "Какой API и модель используются для векторизации документов?",
+    "source": "projetcDocs/llm_docs.md",
+    "anchor": "OpenAI-совместимый `/v1/embeddings`"
+  },
+  {
+    "question": "Где хранятся долгосрочные знания агента?",
+    "source": "projetcDocs/memory_layers.md",
+    "anchor": "Markdown-файлы находятся в каталоге `memory`"
+  }
+]

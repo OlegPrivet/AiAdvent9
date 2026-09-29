@@ -8,21 +8,26 @@ clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
 dialoguer = { version = "0.12", default-features = false }
 indicatif = "0.18"
+html2text = "0.17"
+pdf-extract = "0.12"
+quick-xml = "0.41"
 ratatui = "0.30"
 ratatui-textarea = "0.9"
 reedline = { version = "0.51", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 rmcp = { version = "3.4", features = ["client", "macros", "reqwest", "server", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 termimad = "0.35"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 tui-markdown = "0.3"
 uuid = { version = "1.26", features = ["serde", "v4"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 axum = "0.8"

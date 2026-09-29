@@ -462,7 +462,7 @@ pub(crate) struct MemorySelection {
 impl Default for MemorySelection {
     fn default() -> Self {
         Self {
-            profile: true,
+            profile: false,
             profile_name: default_profile_name(),
             entries: BTreeSet::new(),
         }
@@ -946,6 +946,7 @@ mod tests {
         execute_command(&store, &mut chat, Some("profile init")).expect("profile init");
         execute_command(&store, &mut chat, Some("profile set style Отвечай кратко"))
             .expect("profile update");
+        execute_command(&store, &mut chat, Some("use profile")).expect("enable profile");
         execute_command(
             &store,
             &mut chat,
@@ -1007,7 +1008,13 @@ mod tests {
         )
         .expect("manual edit");
         let context = memory
-            .load_context(&WorkingMemory::new(), &MemorySelection::default())
+            .load_context(
+                &WorkingMemory::new(),
+                &MemorySelection {
+                    profile: true,
+                    ..MemorySelection::default()
+                },
+            )
             .expect("reload");
         assert!(context.profile.expect("profile").contains("Новый стиль"));
     }
@@ -1165,6 +1172,7 @@ mod tests {
         let directory = TestDirectory::new();
         let memory = MemoryStore::new(&directory.0);
         let selection = MemorySelection {
+            profile: true,
             profile_name: "missing".into(),
             ..MemorySelection::default()
         };

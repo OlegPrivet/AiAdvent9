@@ -99,6 +99,8 @@ pub(crate) struct Settings {
     system_prompt: Option<String>,
     #[serde(default = "ContextStrategy::legacy_branching")]
     context_strategy: ContextStrategy,
+    rag_enabled: bool,
+    rag_strategy: crate::rag_chunk::Strategy,
 }
 
 impl Default for Settings {
@@ -113,6 +115,8 @@ impl Default for Settings {
             completion_condition: CompletionCondition::None,
             system_prompt: None,
             context_strategy: ContextStrategy::sliding_default(),
+            rag_enabled: false,
+            rag_strategy: crate::rag_chunk::Strategy::Structure,
         }
     }
 }
@@ -130,6 +134,22 @@ impl Settings {
 
     pub(crate) fn model(&self) -> &str {
         &self.model
+    }
+
+    pub(crate) fn rag_enabled(&self) -> bool {
+        self.rag_enabled
+    }
+
+    pub(crate) fn rag_strategy(&self) -> crate::rag_chunk::Strategy {
+        self.rag_strategy
+    }
+
+    pub(crate) fn set_rag_enabled(&mut self, enabled: bool) {
+        self.rag_enabled = enabled;
+    }
+
+    pub(crate) fn set_rag_strategy(&mut self, strategy: crate::rag_chunk::Strategy) {
+        self.rag_strategy = strategy;
     }
 
     pub(crate) fn response_format_enabled(&self) -> bool {

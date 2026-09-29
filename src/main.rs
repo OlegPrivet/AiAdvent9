@@ -14,6 +14,10 @@ mod mcp_ui;
 mod memory;
 mod metrics;
 mod pricing;
+mod rag;
+mod rag_chunk;
+mod rag_cli;
+mod rag_extract;
 mod repl;
 mod settings;
 mod summary;
@@ -52,6 +56,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     if cli.mcp_demo_server {
         return mcp_demo::run().await;
+    }
+    if let Some(command) = cli.rag {
+        return rag_cli::run(command).await.map_err(Into::into);
     }
     let config = Config::from_env()?;
     let client = Agent::new(NeuralDeepClient::new(config.api_key, config.base_url)?);
