@@ -119,7 +119,8 @@ impl NeuralDeepClient {
         messages: &[ApiMessage],
         model: &str,
     ) -> Result<ApiAnswer, ApiError> {
-        self.complete_auxiliary(messages, model, None).await
+        self.complete_auxiliary(messages, model, None, 4096, 0.1)
+            .await
     }
 
     pub(crate) async fn complete_json_schema(
@@ -128,8 +129,39 @@ impl NeuralDeepClient {
         model: &str,
         response_format: Value,
     ) -> Result<ApiAnswer, ApiError> {
-        self.complete_auxiliary(messages, model, Some(response_format))
+        self.complete_auxiliary(messages, model, Some(response_format), 4096, 0.1)
             .await
+    }
+
+    pub(crate) async fn complete_rag_json(
+        &self,
+        messages: &[ApiMessage],
+        response_format: Value,
+        max_tokens: u32,
+    ) -> Result<ApiAnswer, ApiError> {
+        self.complete_auxiliary(
+            messages,
+            crate::config::DEFAULT_MODEL,
+            Some(response_format),
+            max_tokens,
+            0.0,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_rag_text(
+        &self,
+        messages: &[ApiMessage],
+        max_tokens: u32,
+    ) -> Result<ApiAnswer, ApiError> {
+        self.complete_auxiliary(
+            messages,
+            crate::config::DEFAULT_MODEL,
+            None,
+            max_tokens,
+            0.0,
+        )
+        .await
     }
 
     async fn complete_auxiliary(
@@ -137,11 +169,13 @@ impl NeuralDeepClient {
         messages: &[ApiMessage],
         model: &str,
         response_format: Option<Value>,
+        max_tokens: u32,
+        temperature: f32,
     ) -> Result<ApiAnswer, ApiError> {
         let started_at = Instant::now();
         let mut request = json!({
-            "model": model, "messages": messages, "max_tokens": 4096,
-            "temperature": 0.1, "stream": false,
+            "model": model, "messages": messages, "max_tokens": max_tokens,
+            "temperature": temperature, "stream": false,
             "user": Uuid::new_v4().to_string(),
             "chat_template_kwargs": {"enable_thinking": false}
         });

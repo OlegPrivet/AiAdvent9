@@ -247,6 +247,7 @@ mod tests {
             chunk_id: "chunk-1".into(),
             text: "Факт из документа".into(),
             score: 0.9,
+            rerank_score: None,
         };
         let (without, with) = answer_pair(&agent, "Вопрос?", vec![hit])
             .await

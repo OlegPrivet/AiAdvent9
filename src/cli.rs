@@ -67,6 +67,16 @@ pub(crate) enum RagCommand {
     Refresh,
     Search {
         query: String,
+        #[arg(long, value_enum, default_value_t = crate::rag_pipeline::RelevanceMode::Off)]
+        filter: crate::rag_pipeline::RelevanceMode,
+        #[arg(long)]
+        rewrite: bool,
+        #[arg(long, default_value_t = crate::config::RAG_CANDIDATE_K)]
+        candidate_k: usize,
+        #[arg(long, default_value_t = crate::config::RAG_SIMILARITY_THRESHOLD)]
+        similarity_threshold: f32,
+        #[arg(long, default_value_t = crate::config::RAG_RERANK_THRESHOLD)]
+        rerank_threshold: f32,
         #[arg(long, value_enum, default_value_t = RagStrategy::Structure)]
         strategy: RagStrategy,
         #[arg(long, default_value_t = 3)]
@@ -82,6 +92,8 @@ pub(crate) enum RagCommand {
     },
     /// Сравнить ответы модели с RAG и без RAG на контрольных вопросах.
     Evaluate {
+        #[arg(long, value_parser = ["day22", "day23"], default_value = "day22")]
+        suite: String,
         #[arg(long)]
         eval: PathBuf,
         #[arg(long)]
@@ -126,6 +138,69 @@ impl From<RagStrategy> for crate::rag_chunk::Strategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_day23_search_and_evaluation_options() {
+        let cli = Cli::try_parse_from([
+            "agi",
+            "rag",
+            "search",
+            "Вопрос",
+            "--filter",
+            "rerank",
+            "--rewrite",
+            "--candidate-k",
+            "20",
+            "--limit",
+            "5",
+            "--similarity-threshold",
+            "0.3",
+            "--rerank-threshold",
+            "0.6",
+        ])
+        .expect("search");
+        assert!(matches!(
+            cli.rag,
+            Some(RootCommand::Rag {
+                command: RagCommand::Search {
+                    filter: crate::rag_pipeline::RelevanceMode::Rerank,
+                    rewrite: true,
+                    candidate_k: 20,
+                    limit: 5,
+                    ..
+                }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "agi",
+            "rag",
+            "evaluate",
+            "--suite",
+            "day23",
+            "--eval",
+            "cases.json",
+            "--report",
+            "report.md",
+        ])
+        .expect("evaluate");
+        assert!(
+            matches!(cli.rag,Some(RootCommand::Rag {command:RagCommand::Evaluate {suite,..}}) if suite == "day23")
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agi",
+                "rag",
+                "evaluate",
+                "--suite",
+                "unknown",
+                "--eval",
+                "cases.json",
+                "--report",
+                "report.md"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn parses_question() {

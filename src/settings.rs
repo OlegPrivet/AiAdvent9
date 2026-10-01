@@ -101,6 +101,7 @@ pub(crate) struct Settings {
     context_strategy: ContextStrategy,
     rag_enabled: bool,
     rag_strategy: crate::rag_chunk::Strategy,
+    rag_options: crate::rag_pipeline::RagOptions,
 }
 
 impl Default for Settings {
@@ -117,6 +118,7 @@ impl Default for Settings {
             context_strategy: ContextStrategy::sliding_default(),
             rag_enabled: false,
             rag_strategy: crate::rag_chunk::Strategy::Structure,
+            rag_options: crate::rag_pipeline::RagOptions::default(),
         }
     }
 }
@@ -138,6 +140,19 @@ impl Settings {
 
     pub(crate) fn rag_enabled(&self) -> bool {
         self.rag_enabled
+    }
+
+    pub(crate) fn rag_options(&self) -> &crate::rag_pipeline::RagOptions {
+        &self.rag_options
+    }
+
+    pub(crate) fn set_rag_options(
+        &mut self,
+        options: crate::rag_pipeline::RagOptions,
+    ) -> Result<(), String> {
+        options.validate()?;
+        self.rag_options = options;
+        Ok(())
     }
 
     pub(crate) fn rag_strategy(&self) -> crate::rag_chunk::Strategy {
@@ -700,6 +715,37 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn legacy_settings_keep_original_rag_and_new_options_round_trip() {
+        let mut legacy = serde_json::to_value(Settings::default()).expect("settings");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("rag_options");
+        legacy["rag_enabled"] = serde_json::json!(true);
+        let mut settings: Settings = serde_json::from_value(legacy).expect("old settings");
+        assert!(settings.rag_enabled());
+        assert_eq!(
+            settings.rag_options(),
+            &crate::rag_pipeline::RagOptions::default()
+        );
+        let options = settings
+            .rag_options()
+            .command("filter", "rerank")
+            .expect("options")
+            .command("rewrite", "on")
+            .expect("rewrite");
+        settings.set_rag_options(options.clone()).expect("update");
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(restored.rag_options(), &options);
+        let mut invalid = options.clone();
+        invalid.context_k = 0;
+        assert!(settings.set_rag_options(invalid).is_err());
+        assert_eq!(settings.rag_options(), &options);
+    }
     use crate::input::BufferedInput;
 
     #[test]

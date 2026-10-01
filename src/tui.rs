@@ -70,6 +70,24 @@ const COMMAND_PALETTE: &[CommandOption] = &[
         &["/раг reindex"],
     ),
     CommandOption::argument("/rag search", "поиск по документам", &["/раг search"]),
+    CommandOption::argument("/rag filter", "off|similarity|rerank", &["/раг filter"]),
+    CommandOption::argument(
+        "/rag rewrite",
+        "on|off — переписывание запроса",
+        &["/раг rewrite"],
+    ),
+    CommandOption::argument("/rag topk", "кандидаты и итоговый top-K", &["/раг topk"]),
+    CommandOption::argument(
+        "/rag threshold",
+        "similarity|rerank и порог",
+        &["/раг threshold"],
+    ),
+    CommandOption::run(
+        "/rag evaluate day23",
+        "сравнить шесть режимов RAG",
+        &["/раг evaluate day23"],
+    ),
+    CommandOption::run("/rag report day23", "отчёт Дня 23", &["/раг report day23"]),
     CommandOption::run(
         "/rag compare",
         "сравнить стратегии поиска",
@@ -363,17 +381,18 @@ pub(crate) async fn run(
         if let Some(command) = app.pending_rag_command.take() {
             let id = app.rag_command_id;
             let strategy = app.chat.settings().rag_strategy();
+            let options = app.chat.settings().rag_options().clone();
             let evaluating = command == "evaluate" || command.starts_with("evaluate ");
             let tx = worker_tx.clone();
             rag_task = Some(tokio::spawn(async move {
-                let result = crate::rag_cli::background(command, strategy)
+                let result = crate::rag_cli::background(command, strategy, options)
                     .await
                     .map_err(|error| error.to_string());
                 let _ = tx.send(WorkerEvent::RagResult(id, result));
             }));
             app.rag_busy = true;
             app.notice = Some(if evaluating {
-                "RAG: сравниваю ответы на 10 вопросах… Ctrl+C: отменить".into()
+                "RAG: сравниваю режимы и ответы… Ctrl+C: отменить".into()
             } else {
                 "RAG: обрабатываю документы… Ctrl+C: отменить".into()
             });
@@ -561,13 +580,14 @@ fn spawn_request(
                         });
                     }
                     let request = if request.settings.rag_enabled() {
-                        let hits =
-                            crate::rag::context(&request.question, request.settings.rag_strategy())
-                                .await
-                                .map_err(|error| {
-                                    AgentError::InvalidRequest(format!("RAG: {error}"))
-                                })?;
-                        request.with_rag(hits)
+                        let hits = crate::rag_pipeline::context(
+                            &request.question,
+                            request.settings.rag_strategy(),
+                            request.settings.rag_options(),
+                        )
+                        .await
+                        .map_err(|error| AgentError::InvalidRequest(format!("RAG: {error}")))?;
+                        request.with_retrieval(hits)
                     } else {
                         request
                     };
@@ -1556,6 +1576,18 @@ impl<'a> App<'a> {
                     }
                 ));
             }
+            "filter" | "rewrite" | "topk" | "threshold" => {
+                match self.chat.settings().rag_options().command(action, tail) {
+                    Ok(options) => {
+                        let message = options.status();
+                        match self.chat.settings_mut().set_rag_options(options) {
+                            Ok(()) => { self.settings_changed(); self.notice = Some(message); }
+                            Err(error) => self.notice = Some(error),
+                        }
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
             "strategy" => match tail.parse::<crate::rag_chunk::Strategy>() {
                 Ok(strategy) => {
                     self.chat.settings_mut().set_rag_strategy(strategy);
@@ -1587,7 +1619,7 @@ impl<'a> App<'a> {
                                 if self.chat.settings().rag_enabled() { "включён" } else { "выключен" },
                                 self.chat.settings().rag_strategy().as_str(),
                                 stats.sources, stats.words, stats.fixed, stats.structure,
-                                embeddings
+                                format_args!("{}\n{}", embeddings, self.chat.settings().rag_options().status())
                             ))),
                             "embeddings" => crate::rag_cli::embedding_status(&service),
                             "list" => service.list().map(|sources| {
@@ -1976,14 +2008,18 @@ impl<'a> App<'a> {
                 self.rag_busy = false;
                 match result {
                     Ok(content) => {
-                        self.modal = Some(if content.starts_with("# День 22 —") {
-                            Modal::Report { content, scroll: 0 }
-                        } else {
-                            Modal::Message {
-                                title: "RAG".into(),
-                                content,
-                            }
-                        })
+                        self.modal = Some(
+                            if content.starts_with("# День 22 —")
+                                || content.starts_with("# День 23 —")
+                            {
+                                Modal::Report { content, scroll: 0 }
+                            } else {
+                                Modal::Message {
+                                    title: "RAG".into(),
+                                    content,
+                                }
+                            },
+                        )
                     }
                     Err(error) => self.notice = Some(format!("RAG: {error}")),
                 }
@@ -2972,6 +3008,12 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/mcp, /мсп             MCP-серверы и инструменты AI",
                 "/rag evaluate          ответы с RAG и без RAG на 10 вопросах",
                 "/rag report            открыть сохранённый отчёт",
+                "/rag evaluate day23    шесть режимов и LLM-судья",
+                "/rag report day23      открыть отчёт Дня 23",
+                "/rag filter MODE       off|similarity|rerank",
+                "/rag rewrite on|off    переписывание запроса",
+                "/rag topk N K          кандидаты и итоговый top-K",
+                "/rag threshold TYPE N  порог similarity|rerank",
                 "/rag ...               документы; embeddings set URL MODEL",
                 "/facts ...              память Sticky Facts",
                 "/memory ...             short-term, working и long-term память",
@@ -3200,6 +3242,42 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+
+    #[test]
+    fn rag_controls_persist_and_invalid_topk_does_not_change_settings() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut chat = Chat::new();
+        chat.record_exchange("Начало".into(), "Ответ".into());
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        app.handle_rag(Some("filter rerank"));
+        app.handle_rag(Some("rewrite on"));
+        app.handle_rag(Some("topk 20 5"));
+        app.handle_rag(Some("threshold rerank 0.6"));
+        app.handle_rag(Some("topk 2 5"));
+        assert_eq!(app.chat.settings().rag_options().candidate_k, 20);
+        assert_eq!(app.chat.settings().rag_options().context_k, 5);
+        assert!(app.chat.settings().rag_options().rewrite);
+        assert_eq!(
+            app.chat.settings().rag_options().filter,
+            crate::rag_pipeline::RelevanceMode::Rerank
+        );
+        assert_eq!(
+            store
+                .load(app.chat.id())
+                .expect("restored")
+                .settings()
+                .rag_options(),
+            app.chat.settings().rag_options()
+        );
+        app.handle_rag(Some("evaluate day23"));
+        assert_eq!(app.pending_rag_command.as_deref(), Some("evaluate day23"));
+    }
     use crate::metrics::TokenUsage;
 
     struct TestDirectory(PathBuf);
@@ -4142,6 +4220,23 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         assert!(matches!(app.modal, Some(Modal::Report { scroll: 10, .. })));
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        app.handle_rag(Some("evaluate day23"));
+        app.rag_busy = true;
+        let id = app.rag_command_id;
+        app.handle_worker_event(WorkerEvent::RagResult(
+            id,
+            Ok("# День 23 — сравнение\nстрока".into()),
+        ));
+        assert!(matches!(app.modal, Some(Modal::Report { scroll: 0, .. })));
+        app.cancel_request();
+        app.rag_command_id = Uuid::new_v4();
+        app.rag_busy = false;
+        app.modal = None;
+        app.handle_worker_event(WorkerEvent::RagResult(
+            id,
+            Ok("# День 23 — поздний результат".into()),
+        ));
         assert!(app.modal.is_none());
     }
 

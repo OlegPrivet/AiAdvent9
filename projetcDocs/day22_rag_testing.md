@@ -10,7 +10,7 @@
 
 ```text
 /rag add README.md
-/rag add projetcDocs/invariants_testing.md
+/rag add projetcDocs/invariants_testing.md§
 /rag add projetcDocs/llm_docs.md
 /rag add projetcDocs/memory_layers.md
 /rag add projetcDocs/memory_testing.md

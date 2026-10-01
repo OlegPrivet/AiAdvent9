@@ -2550,6 +2550,35 @@ mod tests {
     }
 
     #[test]
+    fn rag_options_survive_checkpoint_and_branch_restore() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).expect("store");
+        let mut chat = Chat::new();
+        chat.settings_mut()
+            .select_context_strategy(ContextStrategyKind::Branching);
+        let options = crate::rag_pipeline::RagOptions::default()
+            .command("filter", "rerank")
+            .expect("filter")
+            .command("rewrite", "on")
+            .expect("rewrite");
+        chat.settings_mut()
+            .set_rag_options(options.clone())
+            .expect("settings");
+        chat.settings_mut().set_rag_enabled(true);
+        chat.record_exchange("Основа".into(), "Ответ".into());
+        store.save(&mut chat).expect("save");
+        store.create_checkpoint(&chat, "rag").expect("checkpoint");
+        chat.settings_mut()
+            .set_rag_options(crate::rag_pipeline::RagOptions::default())
+            .expect("change");
+        let branch = store
+            .create_branch(chat.branch_group_id(), "rag", "restored")
+            .expect("restore");
+        assert!(branch.settings().rag_enabled());
+        assert_eq!(branch.settings().rag_options(), &options);
+    }
+
+    #[test]
     fn chooses_platform_state_directory() {
         let path = state_directory_from_lookup(|name| match name {
             "XDG_STATE_HOME" => Some(OsString::from("/state")),

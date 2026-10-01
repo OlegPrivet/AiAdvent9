@@ -247,24 +247,30 @@ async fn ask<W: Write>(
         Ok(servers) => servers,
         Err(error) => return writeln!(output, "Каталог MCP: {error}\n"),
     };
-    let rag_hits = if chat.settings().rag_enabled() {
-        match crate::rag::context(question, chat.settings().rag_strategy()).await {
-            Ok(hits) => hits,
+    let retrieval = if chat.settings().rag_enabled() {
+        match crate::rag_pipeline::context(
+            question,
+            chat.settings().rag_strategy(),
+            chat.settings().rag_options(),
+        )
+        .await
+        {
+            Ok(result) => Some(result),
             Err(error) => return writeln!(output, "RAG: {error}\n"),
         }
     } else {
-        Vec::new()
+        None
     };
+    let mut request = AgentRequest::new(chat, question.to_owned(), agents)
+        .with_memory(memory)
+        .with_invariants(invariants)
+        .with_mcp(mcp_servers);
+    if let Some(result) = retrieval {
+        request = request.with_retrieval(result);
+    }
     let mut live_answer = ui.begin_answer(output);
     let result = client
-        .respond_streaming(
-            AgentRequest::new(chat, question.to_owned(), agents)
-                .with_memory(memory)
-                .with_invariants(invariants)
-                .with_mcp(mcp_servers)
-                .with_rag(rag_hits),
-            |event| live_answer.agent_event(event),
-        )
+        .respond_streaming(request, |event| live_answer.agent_event(event))
         .await;
 
     match result {
@@ -364,8 +370,8 @@ async fn run_task_until<W: Write>(
                     signal = &mut cancellation => Err(signal.err().map_or_else(|| "Остановлено пользователем".into(), |e| format!("Ошибка обработчика паузы: {e}"))),
                     result = async {
                         let request = if request.settings.rag_enabled() {
-                            let hits = crate::rag::context(&request.question, request.settings.rag_strategy()).await.map_err(|e| e.to_string())?;
-                            request.with_rag(hits)
+                            let hits = crate::rag_pipeline::context(&request.question, request.settings.rag_strategy(), request.settings.rag_options()).await.map_err(|e| e.to_string())?;
+                            request.with_retrieval(hits)
                         } else { request };
                         client.respond_streaming(request, |event| live.agent_event(event)).await.map_err(|e| e.to_string())
                     } => result,
@@ -834,6 +840,18 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(
         output,
         "  /rag report             открыть сохранённый отчёт"
+    )?;
+    writeln!(
+        output,
+        "  /rag filter off|similarity|rerank; /rag rewrite on|off"
+    )?;
+    writeln!(
+        output,
+        "  /rag topk N K; /rag threshold similarity|rerank VALUE"
+    )?;
+    writeln!(
+        output,
+        "  /rag evaluate day23; /rag report day23 — шесть режимов и LLM-судья"
     )?;
     writeln!(
         output,

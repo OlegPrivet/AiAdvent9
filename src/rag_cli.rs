@@ -9,6 +9,7 @@ use crate::cli::{EmbeddingsCommand, RagCommand, RootCommand};
 use crate::config::DEFAULT_BASE_URL;
 use crate::rag::{RagError, RagService};
 use crate::rag_chunk::Strategy;
+use crate::rag_pipeline::RagOptions;
 
 pub(crate) async fn slash(
     argument: Option<&str>,
@@ -37,6 +38,14 @@ pub(crate) async fn slash(
                 }
             ))
         }
+        "filter" | "rewrite" | "topk" | "threshold" => {
+            let options = chat.settings().rag_options().command(action, tail).map_err(RagError::Document)?;
+            let message = options.status();
+            chat.settings_mut().set_rag_options(options).map_err(RagError::Document)?;
+            chat.mark_changed();
+            store.save(chat).map_err(|e| RagError::Document(e.to_string()))?;
+            Ok(message)
+        }
         "strategy" => {
             let strategy = tail.parse::<Strategy>().map_err(RagError::Document)?;
             chat.settings_mut().set_rag_strategy(strategy);
@@ -60,7 +69,7 @@ pub(crate) async fn slash(
                 stats.words,
                 stats.fixed,
                 stats.structure,
-                embedding_status(&service)?
+                format_args!("{}\n{}", embedding_status(&service)?, chat.settings().rag_options().status())
             ))
         }
         "embeddings" => embeddings_slash(&mut service, tail).await,
@@ -116,36 +125,14 @@ pub(crate) async fn slash(
                     "Использование: /rag search <вопрос>".into(),
                 ));
             }
-            let hits = service
-                .search(tail, chat.settings().rag_strategy(), 3)
-                .await?;
-            Ok(hits
-                .iter()
-                .enumerate()
-                .map(|(index, hit)| {
-                    format!(
-                        "{}. {:.3} {} · {} · {} · {}\n{}",
-                        index + 1,
-                        hit.score,
-                        hit.source,
-                        hit.title,
-                        hit.section,
-                        hit.chunk_id,
-                        hit.text
-                            .chars()
-                            .take(180)
-                            .collect::<String>()
-                            .replace('\n', " ")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"))
+            Ok(service.retrieve(tail, chat.settings().rag_strategy(), chat.settings().rag_options()).await?.display())
         }
         "compare" => compare(&service, None, None).await,
         "evaluate" => evaluate_inside_agi(&service, tail).await,
         "report" if tail.is_empty() => read_answer_report(),
+        "report" if tail == "day23" => crate::rag_day23::read_report(),
         _ => Err(RagError::Document(
-            "Команды: /rag add|list|remove|refresh|reindex|search|compare|evaluate|report|embeddings|on|off|status|strategy".into(),
+            "Команды: /rag add|list|remove|refresh|reindex|search|compare|evaluate|report|embeddings|on|off|status|strategy|filter|rewrite|topk|threshold".into(),
         )),
     }
 }
@@ -159,7 +146,11 @@ fn expand_tilde(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-pub(crate) async fn background(input: String, strategy: Strategy) -> Result<String, RagError> {
+pub(crate) async fn background(
+    input: String,
+    strategy: Strategy,
+    options: RagOptions,
+) -> Result<String, RagError> {
     let mut service =
         RagService::open(env::var("NEURALDEEP_API_KEY").ok(), DEFAULT_BASE_URL.into())?;
     let (action, tail) = input
@@ -194,32 +185,12 @@ pub(crate) async fn background(input: String, strategy: Strategy) -> Result<Stri
                     "Использование: /rag search <вопрос>".into(),
                 ));
             }
-            let hits = service.search(tail, strategy, 3).await?;
-            Ok(hits
-                .iter()
-                .enumerate()
-                .map(|(index, hit)| {
-                    format!(
-                        "{}. {:.3} {} · {} · {} · {}\n{}",
-                        index + 1,
-                        hit.score,
-                        hit.source,
-                        hit.title,
-                        hit.section,
-                        hit.chunk_id,
-                        hit.text
-                            .chars()
-                            .take(180)
-                            .collect::<String>()
-                            .replace('\n', " ")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"))
+            Ok(service.retrieve(tail, strategy, &options).await?.display())
         }
         "compare" => compare(&service, None, None).await,
         "evaluate" => evaluate_inside_agi(&service, tail).await,
         "report" if tail.is_empty() => read_answer_report(),
+        "report" if tail == "day23" => crate::rag_day23::read_report(),
         _ => Err(RagError::Document(
             "Команды: add|refresh|reindex|search|compare|evaluate|report|embeddings".into(),
         )),
@@ -227,6 +198,20 @@ pub(crate) async fn background(input: String, strategy: Strategy) -> Result<Stri
 }
 
 async fn evaluate_inside_agi(service: &RagService, input: &str) -> Result<String, RagError> {
+    if input == "day23" || input.starts_with("day23 ") {
+        let path = input.strip_prefix("day23").unwrap_or_default().trim();
+        let path = if path.is_empty() {
+            PathBuf::from(crate::rag_day23::DEFAULT_EVAL_PATH)
+        } else {
+            expand_tilde(path)
+        };
+        return crate::rag_day23::evaluate(
+            service,
+            &path,
+            &crate::rag_day23::default_report_path()?,
+        )
+        .await;
+    }
     let path = if input.is_empty() {
         PathBuf::from(crate::rag_eval::DEFAULT_EVAL_PATH)
     } else {
@@ -442,12 +427,36 @@ pub(crate) async fn run(root: RootCommand) -> Result<(), RagError> {
             query,
             strategy,
             limit,
+            filter,
+            rewrite,
+            candidate_k,
+            similarity_threshold,
+            rerank_threshold,
         } => {
-            print_hits(
-                &service
-                    .search(&query, strategy.into(), limit.clamp(1, 20))
-                    .await?,
-            );
+            let options = RagOptions {
+                filter,
+                rewrite,
+                candidate_k,
+                context_k: limit,
+                similarity_threshold,
+                rerank_threshold,
+            };
+            if filter == crate::rag_pipeline::RelevanceMode::Off && !rewrite {
+                print_hits(
+                    &service
+                        .search(&query, strategy.into(), limit.clamp(1, 20))
+                        .await?,
+                );
+            } else {
+                options.validate().map_err(RagError::Document)?;
+                println!(
+                    "{}",
+                    service
+                        .retrieve(&query, strategy.into(), &options)
+                        .await?
+                        .display()
+                );
+            }
         }
         RagCommand::Compare {
             queries,
@@ -461,7 +470,16 @@ pub(crate) async fn run(root: RootCommand) -> Result<(), RagError> {
                 println!("Отчёт: {}", path.display());
             }
         }
-        RagCommand::Evaluate { eval, report } => {
+        RagCommand::Evaluate {
+            eval,
+            report,
+            suite,
+        } => {
+            if suite == "day23" {
+                crate::rag_day23::evaluate(&service, &eval, &report).await?;
+                println!("Отчёт: {}", report.display());
+                return Ok(());
+            }
             let text = crate::rag_eval::evaluate(&service, &eval).await?;
             fs::write(&report, text)?;
             println!("Отчёт: {}", report.display());

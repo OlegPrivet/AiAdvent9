@@ -5,6 +5,12 @@ use thiserror::Error;
 const API_KEY_ENV: &str = "NEURALDEEP_API_KEY";
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.neuraldeep.ru/v1";
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.8-27b";
+pub(crate) const RAG_CANDIDATE_K: usize = 12;
+pub(crate) const RAG_CONTEXT_K: usize = 4;
+pub(crate) const RAG_CONTEXT_CHARS: usize = 6000;
+pub(crate) const RAG_SIMILARITY_THRESHOLD: f32 = 0.35;
+pub(crate) const RAG_RERANK_THRESHOLD: f32 = 0.50;
+pub(crate) const RAG_RERANK_MODEL: &str = "bge-reranker";
 
 /// NeuralDeep llms-full.txt, checked 2026-09-09. Rounded catalog values
 /// are kept conservative; unknown models cannot be sent until their window is known.

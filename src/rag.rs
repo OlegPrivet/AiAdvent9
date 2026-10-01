@@ -65,8 +65,8 @@ pub(crate) enum RagError {
 #[derive(Debug, Clone)]
 pub(crate) struct RagService {
     path: PathBuf,
-    api_key: Option<String>,
-    base_url: String,
+    pub(crate) api_key: Option<String>,
+    pub(crate) base_url: String,
     embedding: EmbeddingConfig,
 }
 
@@ -78,7 +78,7 @@ pub(crate) struct Source {
     pub(crate) words: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct Hit {
     pub(crate) source: String,
     pub(crate) title: String,
@@ -86,6 +86,7 @@ pub(crate) struct Hit {
     pub(crate) chunk_id: String,
     pub(crate) text: String,
     pub(crate) score: f32,
+    pub(crate) rerank_score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -322,6 +323,31 @@ impl RagService {
         })
     }
 
+    pub(crate) fn corpus_fingerprint(&self) -> Result<String, RagError> {
+        let connection = self.connection()?;
+        let mut statement =
+            connection.prepare("SELECT path, checksum FROM sources ORDER BY path")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut fingerprint = Sha256::new();
+        fingerprint.update(self.embedding.profile_id.as_bytes());
+        for row in rows {
+            let (path, checksum) = row?;
+            let actual = format!("{:x}", Sha256::digest(fs::read(&path)?));
+            if checksum != actual {
+                return Err(RagError::Document(format!(
+                    "Источник изменился после индексирования: {path}. Выполните /rag refresh"
+                )));
+            }
+            fingerprint.update(path.as_bytes());
+            fingerprint.update([0]);
+            fingerprint.update(checksum.as_bytes());
+            fingerprint.update([0]);
+        }
+        Ok(format!("{:x}", fingerprint.finalize()))
+    }
+
     pub(crate) fn lengths(&self, strategy: Strategy) -> Result<Vec<usize>, RagError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare("SELECT text FROM chunks WHERE strategy=?1")?;
@@ -540,6 +566,7 @@ impl RagService {
                     .map(|(left, right)| left * right)
                     .sum();
                 Ok(Hit {
+                    rerank_score: None,
                     source,
                     title,
                     section,
@@ -778,14 +805,6 @@ fn private_permissions(_path: &Path, _directory: bool) -> Result<(), RagError> {
     Ok(())
 }
 
-pub(crate) async fn context(question: &str, strategy: Strategy) -> Result<Vec<Hit>, RagError> {
-    let service = RagService::open(
-        std::env::var("NEURALDEEP_API_KEY").ok(),
-        crate::config::DEFAULT_BASE_URL.into(),
-    )?;
-    service.context(question, strategy).await
-}
-
 impl RagService {
     pub(crate) async fn context(
         &self,
@@ -798,17 +817,23 @@ impl RagService {
 }
 
 fn select_context(hits: Vec<Hit>) -> Vec<Hit> {
+    select_context_with_limit(hits, crate::config::RAG_CONTEXT_K)
+}
+
+pub(crate) fn select_context_with_limit(hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
     let mut chars = 0;
     let mut sections = std::collections::HashSet::new();
     let mut selected = Vec::new();
     for hit in &hits {
         let length = hit.text.chars().count();
-        if chars + length > 6000 || !sections.insert((hit.source.clone(), hit.section.clone())) {
+        if chars + length > crate::config::RAG_CONTEXT_CHARS
+            || !sections.insert((hit.source.clone(), hit.section.clone()))
+        {
             continue;
         }
         chars += length;
         selected.push(hit.clone());
-        if selected.len() == 4 {
+        if selected.len() == limit {
             return selected;
         }
     }
@@ -818,12 +843,14 @@ fn select_context(hits: Vec<Hit>) -> Vec<Hit> {
         .collect::<std::collections::HashSet<_>>();
     for hit in hits {
         let length = hit.text.chars().count();
-        if chars + length > 6000 || !chunk_ids.insert(hit.chunk_id.clone()) {
+        if chars + length > crate::config::RAG_CONTEXT_CHARS
+            || !chunk_ids.insert(hit.chunk_id.clone())
+        {
             continue;
         }
         chars += length;
         selected.push(hit);
-        if selected.len() == 4 {
+        if selected.len() == limit {
             break;
         }
     }
@@ -1039,6 +1066,7 @@ mod tests {
                     chunk_id: "chunk-1".into(),
                     text: "Проверенный факт".into(),
                     score: 0.9,
+                    rerank_score: None,
                 },
             ]);
         let messages = crate::agent::main_messages(&request);
@@ -1066,6 +1094,7 @@ mod tests {
             chunk_id: chunk_id.into(),
             text: "Текст".into(),
             score: 0.9,
+            rerank_score: None,
         };
         let selected = select_context(vec![
             hit("1", "Первый"),
