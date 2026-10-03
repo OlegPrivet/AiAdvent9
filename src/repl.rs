@@ -843,7 +843,7 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         output,
-        "  /rag filter off|similarity|rerank; /rag rewrite on|off"
+        "  /rag strict on|off; /rag evaluate day24; /rag report day24\n  /rag filter off|similarity|rerank; /rag rewrite on|off"
     )?;
     writeln!(
         output,

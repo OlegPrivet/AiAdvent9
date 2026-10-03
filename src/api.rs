@@ -133,6 +133,39 @@ impl NeuralDeepClient {
             .await
     }
 
+    pub(crate) async fn complete_strict_rag(
+        &self,
+        messages: &[ApiMessage],
+        settings: &Settings,
+    ) -> Result<ApiAnswer, ApiError> {
+        let started = Instant::now();
+        let body = json!({"model":settings.model(),"messages":messages,
+            "max_tokens":settings.max_tokens(),"temperature":settings.temperature(),
+            "stream":false,"user":Uuid::new_v4().to_string(),
+            "chat_template_kwargs":{"enable_thinking":false},
+            "response_format":crate::rag_answer::schema()});
+        let response = self
+            .post(&body)
+            .await?
+            .json::<ChatResponse>()
+            .await
+            .map_err(|e| ApiError::InvalidJson(describe_reqwest_error(&e)))?;
+        let choice = response
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| missing_content(None))?;
+        Ok(ApiAnswer {
+            content: choice.message.content.unwrap_or_default(),
+            truncated: matches!(
+                choice.finish_reason.as_deref(),
+                Some("length" | "max_tokens")
+            ),
+            usage: response.usage.map(Into::into),
+            elapsed_ms: elapsed_millis(started.elapsed()),
+        })
+    }
+
     pub(crate) async fn complete_rag_json(
         &self,
         messages: &[ApiMessage],

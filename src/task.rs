@@ -639,6 +639,14 @@ pub(crate) fn commit_answer(
             state.pause(reason);
         }
         candidate.set_task(state);
+    } else if let Some(rag) = answer.rag_answer.as_ref()
+        && rag.status == crate::rag_answer::Status::Unknown
+        && let Some(mut state) = chat.task().cloned()
+    {
+        state.question = Some(rag.clarification.clone());
+        state.pending_input = None;
+        state.validate()?;
+        candidate.set_task(state);
     } else if chat.task().is_some() {
         return Err(TaskError(
             "Ответ не содержит проверенного состояния задачи.".into(),

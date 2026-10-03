@@ -38,7 +38,7 @@ pub(crate) async fn slash(
                 }
             ))
         }
-        "filter" | "rewrite" | "topk" | "threshold" => {
+        "strict" | "filter" | "rewrite" | "topk" | "threshold" => {
             let options = chat.settings().rag_options().command(action, tail).map_err(RagError::Document)?;
             let message = options.status();
             chat.settings_mut().set_rag_options(options).map_err(RagError::Document)?;
@@ -131,8 +131,9 @@ pub(crate) async fn slash(
         "evaluate" => evaluate_inside_agi(&service, tail).await,
         "report" if tail.is_empty() => read_answer_report(),
         "report" if tail == "day23" => crate::rag_day23::read_report(),
+        "report" if tail == "day24" => crate::rag_day24::read_report(),
         _ => Err(RagError::Document(
-            "Команды: /rag add|list|remove|refresh|reindex|search|compare|evaluate|report|embeddings|on|off|status|strategy|filter|rewrite|topk|threshold".into(),
+            "Команды: /rag add|list|remove|refresh|reindex|search|compare|evaluate|report|embeddings|on|off|status|strategy|strict|filter|rewrite|topk|threshold".into(),
         )),
     }
 }
@@ -191,13 +192,52 @@ pub(crate) async fn background(
         "evaluate" => evaluate_inside_agi(&service, tail).await,
         "report" if tail.is_empty() => read_answer_report(),
         "report" if tail == "day23" => crate::rag_day23::read_report(),
+        "report" if tail == "day24" => crate::rag_day24::read_report(),
         _ => Err(RagError::Document(
             "Команды: add|refresh|reindex|search|compare|evaluate|report|embeddings".into(),
         )),
     }
 }
 
+fn day24_arguments(input: &str) -> Result<(PathBuf, f32), RagError> {
+    let (path, threshold) = match input.rsplit_once("--rerank-threshold") {
+        Some((path, value)) => (
+            path.trim(),
+            value.trim().parse::<f32>().map_err(|_| {
+                RagError::Document(
+                    "Использование: /rag evaluate day24 [PATH] [--rerank-threshold VALUE]".into(),
+                )
+            })?,
+        ),
+        None => (input.trim(), crate::config::RAG_RERANK_THRESHOLD),
+    };
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return Err(RagError::Document(
+            "Порог rerank должен быть конечным числом в [0, 1]".into(),
+        ));
+    }
+    Ok((
+        if path.is_empty() {
+            PathBuf::from(crate::rag_day24::DEFAULT_EVAL_PATH)
+        } else {
+            expand_tilde(path)
+        },
+        threshold,
+    ))
+}
+
 async fn evaluate_inside_agi(service: &RagService, input: &str) -> Result<String, RagError> {
+    if input == "day24" || input.starts_with("day24 ") {
+        let (path, threshold) =
+            day24_arguments(input.strip_prefix("day24").unwrap_or_default().trim())?;
+        return crate::rag_day24::evaluate(
+            service,
+            &path,
+            &crate::rag_day24::default_report_path()?,
+            threshold,
+        )
+        .await;
+    }
     if input == "day23" || input.starts_with("day23 ") {
         let path = input.strip_prefix("day23").unwrap_or_default().trim();
         let path = if path.is_empty() {
@@ -434,6 +474,7 @@ pub(crate) async fn run(root: RootCommand) -> Result<(), RagError> {
             rerank_threshold,
         } => {
             let options = RagOptions {
+                strict: false,
                 filter,
                 rewrite,
                 candidate_k,
@@ -474,7 +515,24 @@ pub(crate) async fn run(root: RootCommand) -> Result<(), RagError> {
             eval,
             report,
             suite,
+            rerank_threshold,
         } => {
+            if suite != "day24" && rerank_threshold.is_some() {
+                return Err(RagError::Document(
+                    "--rerank-threshold для evaluate доступен только с --suite day24".into(),
+                ));
+            }
+            if suite == "day24" {
+                crate::rag_day24::evaluate(
+                    &service,
+                    &eval,
+                    &report,
+                    rerank_threshold.unwrap_or(crate::config::RAG_RERANK_THRESHOLD),
+                )
+                .await?;
+                println!("Отчёт: {}", report.display());
+                return Ok(());
+            }
             if suite == "day23" {
                 crate::rag_day23::evaluate(&service, &eval, &report).await?;
                 println!("Отчёт: {}", report.display());
@@ -665,5 +723,28 @@ mod tests {
         );
         assert!(parse_embedding_set("--url http://localhost:8000/v1/embeddings").is_err());
         assert!(parse_embedding_set("one two three four").is_err());
+    }
+}
+
+#[cfg(test)]
+mod day24_tests {
+    use super::*;
+    #[test]
+    fn evaluation_threshold_is_explicit_and_validated() {
+        let (path, threshold) = day24_arguments("").unwrap();
+        assert_eq!(path, PathBuf::from(crate::rag_day24::DEFAULT_EVAL_PATH));
+        assert_eq!(threshold, 0.50);
+        let (path, threshold) =
+            day24_arguments("cases with spaces.json --rerank-threshold 0.20").unwrap();
+        assert_eq!(path, PathBuf::from("cases with spaces.json"));
+        assert_eq!(threshold, 0.20);
+        assert_eq!(day24_arguments("--rerank-threshold 0.20").unwrap().1, 0.20);
+        for input in [
+            "--rerank-threshold",
+            "--rerank-threshold NaN",
+            "--rerank-threshold 1.5",
+        ] {
+            assert!(day24_arguments(input).is_err());
+        }
     }
 }

@@ -1855,6 +1855,7 @@ mod tests {
                 updated_facts: None,
                 updated_task: Some(planned),
                 invariant_refusal: false,
+                rag_answer: None,
             },
             &PriceCatalog::default(),
             &mut crate::task::RunBudget::default(),
@@ -2560,7 +2561,9 @@ mod tests {
             .command("filter", "rerank")
             .expect("filter")
             .command("rewrite", "on")
-            .expect("rewrite");
+            .expect("rewrite")
+            .command("strict", "on")
+            .expect("strict");
         chat.settings_mut()
             .set_rag_options(options.clone())
             .expect("settings");

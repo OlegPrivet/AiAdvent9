@@ -1075,3 +1075,314 @@ async fn invalid_sticky_facts_cancel_main_request() {
     );
     assert_eq!(server.requests().len(), 1);
 }
+
+fn strict_request() -> AgentRequest {
+    let mut req = request("Где индекс?", vec![]);
+    req.settings.set_rag_enabled(true);
+    req.settings
+        .set_rag_options(
+            crate::rag_pipeline::RagOptions::default()
+                .command("strict", "on")
+                .unwrap(),
+        )
+        .unwrap();
+    let mut hit = crate::rag_pipeline::tests::hit("a", 0.9);
+    hit.text = "Индекс хранится отдельно. Используется Rust.".into();
+    req.with_rag(vec![hit])
+}
+
+fn strict_json() -> Value {
+    json!({"status":"answered","answer":"Индекс отдельно [1].","citations":[{"id":1,"chunk_id":"a","quote":"Индекс хранится отдельно."}],"clarification":""})
+}
+
+#[tokio::test]
+async fn strict_answer_is_buffered_uses_selected_settings_and_verified_sources() {
+    let server = MockServer::new(|_| json_answer(strict_json()));
+    let mut req = strict_request();
+    req.settings.select_model(0);
+    req.settings.set_response_format(true);
+    req.settings.set_stop_sequence("<END>".into()).unwrap();
+    req.settings.set_temperature("0.8").unwrap();
+    req.settings.set_max_tokens("1200").unwrap();
+    let selected_model = req.settings.model().to_owned();
+    let mut deltas = vec![];
+    let answer = runner(&server)
+        .respond_streaming(req, |event| {
+            if let AgentEvent::MainDelta(text) = event {
+                deltas.push(text);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(deltas.is_empty());
+    assert!(
+        answer
+            .content
+            .contains("Источники:\n[1] notes.md · a · chunk_id a")
+    );
+    assert!(
+        answer
+            .content
+            .contains("Цитаты:\n[1] «Индекс хранится отдельно.»")
+    );
+    assert!(!answer.content.contains("Найденные источники"));
+    let reqs = server.requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(
+        reqs[0]["response_format"]["json_schema"]["name"],
+        "rag_answer"
+    );
+    assert_eq!(reqs[0]["model"], selected_model);
+    assert_eq!(reqs[0]["max_tokens"], 1200);
+    assert!((reqs[0]["temperature"].as_f64().unwrap() - 0.8).abs() < 0.001);
+    assert!(reqs[0].get("stop").is_none());
+    assert_eq!(reqs[0]["stream"], false);
+    assert_eq!(reqs[0]["messages"][0]["role"], "system");
+    assert!(
+        reqs[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(crate::rag_answer::INSTRUCTION)
+    );
+    assert_eq!(
+        reqs[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .count(),
+        1
+    );
+    assert_eq!(answer.calls[0].usage.unwrap().total_tokens, 15);
+}
+
+#[tokio::test]
+async fn strict_repairs_once_and_counts_both_calls_without_leaking_invalid_text() {
+    for bad in [
+        "",
+        "bad JSON",
+        r#"{"status":"answered","answer":"Факт [1]","citations":[{"id":1,"chunk_id":"a","quote":"Выдумка"}],"clarification":""}"#,
+    ] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let next = count.clone();
+        let bad = bad.to_owned();
+        let server = MockServer::new(move |_| {
+            if next.fetch_add(1, Ordering::SeqCst) == 0 {
+                raw_auxiliary_answer(&bad)
+            } else {
+                json_answer(strict_json())
+            }
+        });
+        let mut deltas = vec![];
+        let answer = runner(&server)
+            .respond_streaming(strict_request(), |event| {
+                if let AgentEvent::MainDelta(t) = event {
+                    deltas.push(t);
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(deltas.is_empty());
+        assert_eq!(answer.calls.len(), 2);
+        assert_eq!(answer.rag_answer.unwrap().repairs, 1);
+    }
+    let server = MockServer::new(|_| raw_auxiliary_answer("bad"));
+    assert!(
+        runner(&server)
+            .respond_streaming(strict_request(), |_| Ok(()))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Не удалось получить ответ с проверенными цитатами")
+    );
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn strict_unknown_preserves_task_and_empty_context_does_not_call_api_or_delegate() {
+    let server = MockServer::new(|_| {
+        json_answer(
+            json!({"status":"unknown","answer":"Недостаточно данных","citations":[],"clarification":"Какой документ?"}),
+        )
+    });
+    let mut req = strict_request();
+    req.task = Some(crate::task::TaskState::new("Проверить индекс").unwrap());
+    let answer = runner(&server)
+        .respond_streaming(req.clone(), |_| Ok(()))
+        .await
+        .unwrap();
+    assert!(answer.content.starts_with("Не знаю"));
+    assert!(answer.updated_task.is_none());
+    assert!(!answer.content.contains("Источники:"));
+    assert_eq!(server.requests().len(), 1);
+    req.rag_hits.clear();
+    req.question = "@editor проверь".into();
+    req.agents = vec![definition("editor")];
+    let answer = runner(&server)
+        .respond_streaming(req, |_| Ok(()))
+        .await
+        .unwrap();
+    assert!(answer.content.starts_with("Не знаю"));
+    assert!(answer.updated_task.is_none());
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn strict_service_errors_are_not_unknown_or_format_retries() {
+    let server = MockServer::new(|_| (503, json!({"detail":"Недоступно"}).to_string()));
+    assert!(
+        runner(&server)
+            .respond_streaming(strict_request(), |_| Ok(()))
+            .await
+            .is_err()
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn strict_rechecks_invariants_after_structured_repair_without_leaking_text() {
+    let checks = Arc::new(AtomicUsize::new(0));
+    let seen = checks.clone();
+    let server = MockServer::new(move |req| {
+        if req["response_format"]["json_schema"]["name"] == "agi_invariant_verdict" {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                json_answer(
+                    json!({"compliant":false,"request_conflict":false,"violations":[{"name":"stack","reason":"Укажи Rust"}]}),
+                )
+            } else {
+                json_answer(json!({"compliant":true,"request_conflict":false,"violations":[]}))
+            }
+        } else {
+            let mut value = strict_json();
+            if seen.load(Ordering::SeqCst) > 0 {
+                value["answer"] = json!("Используется Rust [1].");
+                value["citations"][0]["quote"] = json!("Используется Rust.");
+            }
+            json_answer(value)
+        }
+    });
+    let mut req = strict_request();
+    req.invariants = invariant_request("q").invariants;
+    let mut deltas = vec![];
+    let answer = runner(&server)
+        .respond_streaming(req, |event| {
+            if let AgentEvent::MainDelta(t) = event {
+                deltas.push(t);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(deltas.is_empty());
+    assert!(answer.content.contains("Используется Rust [1]"));
+    assert_eq!(server.requests().len(), 4);
+    assert_eq!(answer.rag_answer.unwrap().repairs, 1);
+}
+
+#[tokio::test]
+async fn strict_invariant_refusal_has_no_sources_and_pauses_task() {
+    let server = MockServer::new(|req| {
+        if req["response_format"]["json_schema"]["name"] == "agi_invariant_verdict" {
+            json_answer(
+                json!({"compliant":false,"request_conflict":true,"violations":[{"name":"stack","reason":"Конфликт"}]}),
+            )
+        } else {
+            json_answer(strict_json())
+        }
+    });
+    let mut req = strict_request();
+    req.invariants = invariant_request("q").invariants;
+    req.task = Some(crate::task::TaskState::new("Проверить").unwrap());
+    let answer = runner(&server)
+        .respond_streaming(req, |_| Ok(()))
+        .await
+        .unwrap();
+    assert!(answer.invariant_refusal);
+    assert!(answer.rag_answer.is_none());
+    assert!(answer.updated_task.unwrap().paused);
+    assert!(!answer.content.contains("Источники:"));
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn strict_final_after_tools_is_structured_and_does_not_show_intermediate_main_text() {
+    let server = MockServer::new(|req| {
+        if req["response_format"]["json_schema"]["name"] == "rag_answer" {
+            json_answer(strict_json())
+        } else {
+            text_response("Непроверенный промежуточный текст")
+        }
+    });
+    let mut req = strict_request();
+    req.agents = vec![definition("editor")];
+    let mut deltas = vec![];
+    let answer = runner(&server)
+        .respond_streaming(req, |event| {
+            if let AgentEvent::MainDelta(t) = event {
+                deltas.push(t);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(deltas.is_empty());
+    assert!(!answer.content.contains("Непроверенный"));
+    assert_eq!(server.requests().len(), 2);
+    assert!(server.requests()[0].get("tools").is_some());
+    assert!(server.requests()[1].get("tools").is_none());
+    assert!(answer.rag_answer.is_some());
+}
+
+#[tokio::test]
+async fn strict_truncated_generation_is_repaired_and_never_accepted_as_complete() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let next = count.clone();
+    let server = MockServer::new(move |_| {
+        if next.fetch_add(1, Ordering::SeqCst) == 0 {
+            (200, json!({"choices":[{"message":{"content":strict_json().to_string()},"finish_reason":"length"}]}).to_string())
+        } else {
+            json_answer(strict_json())
+        }
+    });
+    let answer = runner(&server)
+        .respond_streaming(strict_request(), |_| Ok(()))
+        .await
+        .unwrap();
+    assert!(!answer.truncated);
+    assert_eq!(answer.rag_answer.unwrap().repairs, 1);
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn cancelling_strict_generation_emits_no_main_text() {
+    let server = MockServer::new(|_| {
+        std::thread::sleep(Duration::from_millis(150));
+        json_answer(strict_json())
+    });
+    let agent = runner(&server);
+    let deltas = Arc::new(AtomicUsize::new(0));
+    let observed = deltas.clone();
+    let job = tokio::spawn(async move {
+        agent
+            .respond_streaming(strict_request(), move |event| {
+                if matches!(event, AgentEvent::MainDelta(_)) {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    assert_eq!(deltas.load(Ordering::SeqCst), 0);
+    assert_eq!(server.requests().len(), 1);
+}

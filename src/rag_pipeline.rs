@@ -42,6 +42,7 @@ impl RelevanceMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct RagOptions {
+    pub(crate) strict: bool,
     pub(crate) filter: RelevanceMode,
     pub(crate) rewrite: bool,
     pub(crate) candidate_k: usize,
@@ -53,6 +54,7 @@ pub(crate) struct RagOptions {
 impl Default for RagOptions {
     fn default() -> Self {
         Self {
+            strict: false,
             filter: RelevanceMode::Off,
             rewrite: false,
             candidate_k: config::RAG_CANDIDATE_K,
@@ -65,6 +67,9 @@ impl Default for RagOptions {
 
 impl RagOptions {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.strict && self.filter == RelevanceMode::Off {
+            return Err("Сначала отключите строгий режим: /rag strict off".into());
+        }
         if self.context_k == 0
             || self.context_k > 20
             || self.context_k > self.candidate_k
@@ -87,7 +92,12 @@ impl RagOptions {
     }
     pub(crate) fn status(&self) -> String {
         format!(
-            "Фильтр: {}; rewrite: {}; top-K: {} → {}; пороги similarity/rerank: {:.2}/{:.2}",
+            "Strict: {}; фильтр: {}; rewrite: {}; top-K: {} → {}; пороги similarity/rerank: {:.2}/{:.2}",
+            if self.strict {
+                "on (формат RAG имеет приоритет; stop sequence не применяется)"
+            } else {
+                "off"
+            },
             self.filter.name(),
             if self.rewrite { "on" } else { "off" },
             self.candidate_k,
@@ -100,6 +110,8 @@ impl RagOptions {
         let mut next = self.clone();
         let args: Vec<_> = tail.split_whitespace().collect();
         match (action, args.as_slice()) {
+            ("strict", ["on"]) => { next.strict = true; if next.filter == RelevanceMode::Off { next.filter = RelevanceMode::Similarity; } },
+            ("strict", ["off"]) => next.strict = false,
             ("filter", [mode]) => next.filter = RelevanceMode::parse(mode)?,
             ("rewrite", ["on"]) => next.rewrite = true,
             ("rewrite", ["off"]) => next.rewrite = false,
@@ -115,7 +127,7 @@ impl RagOptions {
                     _ => return Err("threshold similarity|rerank <число>".into()),
                 }
             }
-            _ => return Err("Команды: filter off|similarity|rerank; rewrite on|off; topk N K; threshold similarity|rerank VALUE".into()),
+            _ => return Err("Команды: strict on|off; filter off|similarity|rerank; rewrite on|off; topk N K; threshold similarity|rerank VALUE".into()),
         }
         next.validate()?;
         Ok(next)
@@ -400,6 +412,25 @@ pub(crate) mod tests {
     use axum::{Json, Router, routing::post};
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn strict_settings_are_compatible_and_keep_filter_changes_explicit() {
+        let old: RagOptions = serde_json::from_str("{}").unwrap();
+        assert!(!old.strict);
+        let strict = old.command("strict", "on").unwrap();
+        assert_eq!(strict.filter, RelevanceMode::Similarity);
+        assert!(strict.command("filter", "off").is_err());
+        assert!(strict.strict);
+        let off = strict.command("strict", "off").unwrap();
+        assert_eq!(off.filter, RelevanceMode::Similarity);
+        let rerank = old
+            .command("filter", "rerank")
+            .unwrap()
+            .command("strict", "on")
+            .unwrap();
+        assert_eq!(rerank.filter, RelevanceMode::Rerank);
+        assert!(old.command("strict", "maybe").is_err());
+    }
 
     pub(crate) fn hit(id: &str, score: f32) -> Hit {
         Hit {

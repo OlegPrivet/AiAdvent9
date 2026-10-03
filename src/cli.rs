@@ -92,8 +92,11 @@ pub(crate) enum RagCommand {
     },
     /// Сравнить ответы модели с RAG и без RAG на контрольных вопросах.
     Evaluate {
-        #[arg(long, value_parser = ["day22", "day23"], default_value = "day22")]
+        #[arg(long, value_parser = ["day22", "day23", "day24"], default_value = "day22")]
         suite: String,
+        /// Порог reranker для оценки Дня 24; по умолчанию 0.50.
+        #[arg(long)]
+        rerank_threshold: Option<f32>,
         #[arg(long)]
         eval: PathBuf,
         #[arg(long)]
@@ -138,6 +141,25 @@ impl From<RagStrategy> for crate::rag_chunk::Strategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_day24_evaluation() {
+        let cli = Cli::try_parse_from([
+            "agi",
+            "rag",
+            "evaluate",
+            "--suite",
+            "day24",
+            "--eval",
+            "cases.json",
+            "--report",
+            "report.md",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.rag, Some(RootCommand::Rag { command: RagCommand::Evaluate { suite, .. } }) if suite == "day24")
+        );
+    }
 
     #[test]
     fn parses_day23_search_and_evaluation_options() {

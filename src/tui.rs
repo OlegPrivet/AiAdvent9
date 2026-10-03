@@ -70,6 +70,13 @@ const COMMAND_PALETTE: &[CommandOption] = &[
         &["/раг reindex"],
     ),
     CommandOption::argument("/rag search", "поиск по документам", &["/раг search"]),
+    CommandOption::argument("/rag strict", "on|off", &["/раг strict"]),
+    CommandOption::run(
+        "/rag evaluate day24",
+        "цитаты и источники",
+        &["/раг evaluate day24"],
+    ),
+    CommandOption::run("/rag report day24", "отчёт Дня 24", &["/раг report day24"]),
     CommandOption::argument("/rag filter", "off|similarity|rerank", &["/раг filter"]),
     CommandOption::argument(
         "/rag rewrite",
@@ -577,6 +584,7 @@ fn spawn_request(
                             updated_facts: None,
                             updated_task: None,
                             invariant_refusal: false,
+                            rag_answer: None,
                         });
                     }
                     let request = if request.settings.rag_enabled() {
@@ -1576,7 +1584,7 @@ impl<'a> App<'a> {
                     }
                 ));
             }
-            "filter" | "rewrite" | "topk" | "threshold" => {
+            "strict" | "filter" | "rewrite" | "topk" | "threshold" => {
                 match self.chat.settings().rag_options().command(action, tail) {
                     Ok(options) => {
                         let message = options.status();
@@ -3011,6 +3019,8 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/rag evaluate day23    шесть режимов и LLM-судья",
                 "/rag report day23      открыть отчёт Дня 23",
                 "/rag filter MODE       off|similarity|rerank",
+                "/rag strict on|off     проверенные цитаты и источники",
+                "/rag evaluate day24; /rag report day24",
                 "/rag rewrite on|off    переписывание запроса",
                 "/rag topk N K          кандидаты и итоговый top-K",
                 "/rag threshold TYPE N  порог similarity|rerank",
@@ -3259,6 +3269,9 @@ mod tests {
         app.handle_rag(Some("rewrite on"));
         app.handle_rag(Some("topk 20 5"));
         app.handle_rag(Some("threshold rerank 0.6"));
+        app.handle_rag(Some("strict on"));
+        app.handle_rag(Some("filter off"));
+        assert!(app.chat.settings().rag_options().strict);
         app.handle_rag(Some("topk 2 5"));
         assert_eq!(app.chat.settings().rag_options().candidate_k, 20);
         assert_eq!(app.chat.settings().rag_options().context_k, 5);
@@ -3277,6 +3290,10 @@ mod tests {
         );
         app.handle_rag(Some("evaluate day23"));
         assert_eq!(app.pending_rag_command.as_deref(), Some("evaluate day23"));
+        app.handle_rag(Some("evaluate day24"));
+        assert_eq!(app.pending_rag_command.as_deref(), Some("evaluate day24"));
+        app.handle_rag(Some("report day24"));
+        assert_eq!(app.pending_rag_command.as_deref(), Some("report day24"));
     }
     use crate::metrics::TokenUsage;
 
@@ -4040,6 +4057,7 @@ mod tests {
                 updated_facts: None,
                 updated_task: None,
                 invariant_refusal: false,
+                rag_answer: None,
             }),
         ));
         let trace = app.transcript_markdown();
