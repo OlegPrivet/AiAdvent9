@@ -110,6 +110,36 @@ const COMMAND_PALETTE: &[CommandOption] = &[
         "открыть отчёт проверки RAG",
         &["/раг report"],
     ),
+    CommandOption::run(
+        "/rag chat on",
+        "чат с источниками и памятью задачи",
+        &["/раг chat on"],
+    ),
+    CommandOption::run(
+        "/rag chat off",
+        "отключить память диалогового RAG",
+        &["/раг chat off"],
+    ),
+    CommandOption::run(
+        "/rag chat state",
+        "показать цель и условия диалога",
+        &["/раг chat state"],
+    ),
+    CommandOption::run(
+        "/rag chat reset",
+        "очистить память задачи диалога",
+        &["/раг chat reset"],
+    ),
+    CommandOption::run(
+        "/rag evaluate day25",
+        "два длинных сценария RAG",
+        &["/раг evaluate day25"],
+    ),
+    CommandOption::run(
+        "/rag report day25",
+        "отчёт длинных сценариев",
+        &["/раг report day25"],
+    ),
     CommandOption::run("/rag on", "включить RAG в чате", &["/раг on"]),
     CommandOption::run("/rag off", "выключить RAG в чате", &["/раг off"]),
     CommandOption::run(
@@ -583,11 +613,14 @@ fn spawn_request(
                             already_counted_usage: None,
                             updated_facts: None,
                             updated_task: None,
+                            updated_dialogue: None,
                             invariant_refusal: false,
                             rag_answer: None,
                         });
                     }
-                    let request = if request.settings.rag_enabled() {
+                    let request = if request.settings.rag_enabled()
+                        && (!request.settings.rag_chat_enabled() || request.task.is_some())
+                    {
                         let hits = crate::rag_pipeline::context(
                             &request.question,
                             request.settings.rag_strategy(),
@@ -643,7 +676,7 @@ fn spawn_request(
                 .await
             }
         };
-        let _ = worker_tx.send(WorkerEvent::Finished(request_id, result));
+        let _ = worker_tx.send(WorkerEvent::Finished(request_id, Box::new(result)));
     }))
 }
 
@@ -682,7 +715,7 @@ enum WorkerEvent {
         tokio::sync::oneshot::Sender<Result<(), String>>,
     ),
     Agent(Uuid, AgentEvent),
-    Finished(Uuid, Result<AgentAnswer, AgentError>),
+    Finished(Uuid, Box<Result<AgentAnswer, AgentError>>),
     Prices(Result<PriceCatalog, String>),
     RagResult(Uuid, Result<String, String>),
 }
@@ -1571,7 +1604,17 @@ impl<'a> App<'a> {
         let (action, tail) = input
             .split_once(char::is_whitespace)
             .map_or((input, ""), |(action, tail)| (action, tail.trim()));
+        if let Err(error) = crate::rag_chat::guard(self.chat, action, tail) {
+            self.notice = Some(error.to_string());
+            return;
+        }
         match action {
+            "chat" => {
+                self.notice = Some(match crate::rag_chat::saved_command(self.store, self.chat, tail) {
+                    Ok(message) => message,
+                    Err(error) => error.to_string(),
+                });
+            }
             "on" | "off" => {
                 self.chat.settings_mut().set_rag_enabled(action == "on");
                 self.settings_changed();
@@ -1919,7 +1962,7 @@ impl<'a> App<'a> {
                     .take()
                     .map(|started_at| elapsed_millis(started_at.elapsed()))
                     .unwrap_or_default();
-                match result {
+                match *result {
                     Ok(_) if crate::summary::is_command(&question) => {
                         self.trace_question = None;
                         self.streamed_answer.clear();
@@ -1952,22 +1995,15 @@ impl<'a> App<'a> {
                     Ok(answer) => {
                         self.trace_question = None;
                         let truncated = answer.truncated;
-                        let mut metrics = ResponseMetrics::from_calls(
-                            &model,
-                            answer.elapsed_ms,
-                            answer.calls,
-                            &self.prices,
-                        );
-                        metrics.already_counted_usage = answer.already_counted_usage;
-                        self.chat.record_exchange_with_context(
-                            question,
-                            answer.content,
-                            Some(metrics),
-                            answer.updated_facts,
-                        );
                         self.streamed_answer.clear();
                         self.transient_metrics = None;
-                        if let Err(error) = self.store.save(self.chat) {
+                        if let Err(error) = crate::rag_chat::commit_answer(
+                            self.store,
+                            self.chat,
+                            question,
+                            answer,
+                            &self.prices,
+                        ) {
                             self.notice = Some(format!("Чат не удалось сохранить: {error}"));
                         } else if truncated {
                             self.notice =
@@ -3019,6 +3055,8 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/rag evaluate day23    шесть режимов и LLM-судья",
                 "/rag report day23      открыть отчёт Дня 23",
                 "/rag filter MODE       off|similarity|rerank",
+                "/rag chat on|off|state|reset    RAG с памятью задачи",
+                "/rag evaluate day25; /rag report day25    длинные диалоги",
                 "/rag strict on|off     проверенные цитаты и источники",
                 "/rag evaluate day24; /rag report day24",
                 "/rag rewrite on|off    переписывание запроса",
@@ -3253,6 +3291,54 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn rag_chat_commands_match_repl_and_persist_without_an_index() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let mut repl_chat = Chat::new();
+        let mut tui_chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut tui_chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        for command in ["chat on", "chat state", "chat reset", "chat off", "chat on"] {
+            let repl = crate::rag_cli::slash(Some(command), &mut repl_chat, &store)
+                .await
+                .unwrap();
+            app.handle_rag(Some(command));
+            assert_eq!(app.notice.as_deref(), Some(repl.as_str()));
+            assert_eq!(app.chat.settings(), repl_chat.settings());
+            assert_eq!(app.chat.dialogue(), repl_chat.dialogue());
+        }
+        for command in ["off", "strict off"] {
+            assert!(
+                crate::rag_cli::slash(Some(command), &mut repl_chat, &store)
+                    .await
+                    .is_err()
+            );
+            app.handle_rag(Some(command));
+            assert!(app.notice.as_ref().unwrap().contains("/rag chat off"));
+            assert!(app.chat.settings().rag_enabled());
+            assert!(app.chat.settings().rag_options().strict);
+        }
+        assert!(
+            store
+                .load(repl_chat.id())
+                .unwrap()
+                .settings()
+                .rag_chat_enabled()
+        );
+        assert!(
+            store
+                .load(app.chat.id())
+                .unwrap()
+                .settings()
+                .rag_chat_enabled()
+        );
+    }
+
     #[test]
     fn rag_controls_persist_and_invalid_topk_does_not_change_settings() {
         let directory = TestDirectory::new();
@@ -3364,7 +3450,7 @@ mod tests {
         ));
         app.handle_worker_event(WorkerEvent::Finished(
             cancelled,
-            Err(AgentError::InvalidRequest("Поздняя ошибка".into())),
+            Box::new(Err(AgentError::InvalidRequest("Поздняя ошибка".into()))),
         ));
         assert!(app.streamed_answer.is_empty());
         assert!(app.chat.messages().is_empty());
@@ -4044,7 +4130,7 @@ mod tests {
         ));
         app.handle_worker_event(WorkerEvent::Finished(
             id,
-            Ok(AgentAnswer {
+            Box::new(Ok(AgentAnswer {
                 content: "Итог главного".into(),
                 truncated: false,
                 elapsed_ms: 100,
@@ -4056,9 +4142,10 @@ mod tests {
                 already_counted_usage: None,
                 updated_facts: None,
                 updated_task: None,
+                updated_dialogue: None,
                 invariant_refusal: false,
                 rag_answer: None,
-            }),
+            })),
         ));
         let trace = app.transcript_markdown();
         assert!(trace.contains("Дочерний результат"));

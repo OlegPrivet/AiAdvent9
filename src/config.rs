@@ -10,6 +10,14 @@ pub(crate) const RAG_CONTEXT_K: usize = 4;
 pub(crate) const RAG_CONTEXT_CHARS: usize = 6000;
 pub(crate) const RAG_SIMILARITY_THRESHOLD: f32 = 0.35;
 pub(crate) const RAG_RERANK_THRESHOLD: f32 = 0.50;
+pub(crate) const RAG_CHAT_EVAL_ATTEMPTS: usize = 3;
+pub(crate) const RAG_CHAT_EVAL_CANDIDATE_K: usize = 20;
+pub(crate) const RAG_CHAT_EVAL_RERANK_THRESHOLD: f32 = 0.20;
+pub(crate) const RAG_CHAT_HISTORY_MESSAGES: usize = 12;
+pub(crate) const RAG_CHAT_MEMORY_CHARS: usize = 8000;
+pub(crate) const RAG_CHAT_SUPPORT_TOKENS: u32 = 2048;
+pub(crate) const RAG_CHAT_PREPARE_TOKENS: u32 = 4096;
+pub(crate) const RAG_CHAT_PREPARE_TIMEOUT_SECS: u64 = 60;
 pub(crate) const RAG_RERANK_MODEL: &str = "bge-reranker";
 
 /// NeuralDeep llms-full.txt, checked 2026-09-09. Rounded catalog values

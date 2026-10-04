@@ -21,7 +21,7 @@ use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 11;
+const DATABASE_SCHEMA_VERSION: i64 = 12;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -81,6 +81,8 @@ pub(crate) struct Chat {
     #[serde(default)]
     task: Option<crate::task::TaskState>,
     #[serde(default)]
+    dialogue: crate::rag_chat::DialogueTaskState,
+    #[serde(default)]
     branch_group_id: Option<Uuid>,
     #[serde(default)]
     branch_name: Option<String>,
@@ -109,6 +111,7 @@ impl Chat {
             working_memory: WorkingMemory::new(),
             memory_selection: MemorySelection::default(),
             task: None,
+            dialogue: crate::rag_chat::DialogueTaskState::default(),
             branch_group_id: Some(id),
             branch_name: Some("main".to_owned()),
             parent_checkpoint_id: None,
@@ -119,6 +122,15 @@ impl Chat {
 
     pub(crate) fn id(&self) -> Uuid {
         self.id
+    }
+
+    pub(crate) fn dialogue(&self) -> &crate::rag_chat::DialogueTaskState {
+        &self.dialogue
+    }
+
+    pub(crate) fn set_dialogue(&mut self, state: crate::rag_chat::DialogueTaskState) {
+        self.dialogue = state;
+        self.mark_changed();
     }
 
     pub(crate) fn task(&self) -> Option<&crate::task::TaskState> {
@@ -459,6 +471,8 @@ struct CheckpointSnapshot {
     memory_selection: MemorySelection,
     #[serde(default)]
     task: Option<crate::task::TaskState>,
+    #[serde(default)]
+    dialogue: crate::rag_chat::DialogueTaskState,
 }
 
 #[derive(Debug)]
@@ -542,7 +556,7 @@ impl ChatStore {
         Self::with_directory(directory)
     }
 
-    fn with_directory(directory: PathBuf) -> Result<Self, ChatStoreError> {
+    pub(crate) fn with_directory(directory: PathBuf) -> Result<Self, ChatStoreError> {
         fs::create_dir_all(&directory).map_err(|source| ChatStoreError::Io {
             action: "создать каталог",
             path: directory.clone(),
@@ -573,7 +587,7 @@ impl ChatStore {
             .connection
             .query_row(
                 "SELECT title, created_at_ms, updated_at_ms, settings_json, summary_json,
-                        facts_json, branch_group_id, branch_name, parent_checkpoint_id, task_state_json
+                        facts_json, branch_group_id, branch_name, parent_checkpoint_id, task_state_json, dialogue_state_json
                  FROM chats WHERE id = ?1",
                 params![id.to_string()],
                 |row| {
@@ -588,6 +602,7 @@ impl ChatStore {
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, Option<String>>(8)?,
                         row.get::<_, Option<String>>(9)?,
+                        row.get::<_, String>(10)?,
                     ))
                 },
             )
@@ -604,6 +619,7 @@ impl ChatStore {
             branch_name,
             parent_checkpoint_id,
             task_state_json,
+            dialogue_state_json,
         )) = row
         else {
             return Err(ChatStoreError::NotFound(id));
@@ -634,6 +650,17 @@ impl ChatStore {
             task.validate()
                 .map_err(|_| ChatStoreError::InvalidConversation(id))?;
         }
+        let dialogue: crate::rag_chat::DialogueTaskState =
+            serde_json::from_str(&dialogue_state_json).map_err(|source| {
+                ChatStoreError::SettingsJson {
+                    action: "прочитать память диалога",
+                    id,
+                    source,
+                }
+            })?;
+        dialogue
+            .validate()
+            .map_err(|_| ChatStoreError::InvalidConversation(id))?;
         let mut working_memory = WorkingMemory::new();
         {
             let mut statement = self
@@ -793,6 +820,7 @@ impl ChatStore {
             working_memory,
             memory_selection,
             task,
+            dialogue,
             branch_group_id,
             branch_name: branch_name.or_else(|| Some("main".to_owned())),
             parent_checkpoint_id,
@@ -877,6 +905,7 @@ impl ChatStore {
             working_memory: chat.working_memory.clone(),
             memory_selection: chat.memory_selection.clone(),
             task: chat.task.clone(),
+            dialogue: chat.dialogue.clone(),
         };
         let snapshot_json =
             serde_json::to_string(&snapshot).map_err(|source| ChatStoreError::SettingsJson {
@@ -947,6 +976,7 @@ impl ChatStore {
             working_memory: snapshot.working_memory,
             memory_selection: snapshot.memory_selection,
             task: snapshot.task,
+            dialogue: snapshot.dialogue,
             branch_group_id: Some(group_id),
             branch_name: Some(branch_name.to_owned()),
             parent_checkpoint_id: Some(
@@ -1065,6 +1095,9 @@ impl ChatStore {
     }
 
     pub(crate) fn save(&self, chat: &mut Chat) -> Result<bool, ChatStoreError> {
+        chat.dialogue
+            .validate()
+            .map_err(|_| ChatStoreError::InvalidConversation(chat.id))?;
         if let Some(task) = &chat.task {
             task.validate()
                 .map_err(|_| ChatStoreError::InvalidConversation(chat.id))?;
@@ -1205,14 +1238,20 @@ fn write_chat(
             id: chat.id,
             source,
         })?;
+    let dialogue_state_json =
+        serde_json::to_string(&chat.dialogue).map_err(|source| ChatStoreError::SettingsJson {
+            action: "сохранить память диалога",
+            id: chat.id,
+            source,
+        })?;
     let updated_at_ms = timestamp_for_database(chat.id, chat.updated_at_ms)?;
     let id = chat.id.to_string();
 
     let changed = match mode {
         WriteMode::Replace => transaction.execute(
             "INSERT INTO chats(id, title, created_at_ms, updated_at_ms, settings_json, summary_json,
-                               facts_json, branch_group_id, branch_name, parent_checkpoint_id, task_state_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                               facts_json, branch_group_id, branch_name, parent_checkpoint_id, task_state_json, dialogue_state_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                  title = excluded.title,
                  created_at_ms = excluded.created_at_ms,
@@ -1221,7 +1260,8 @@ fn write_chat(
                  facts_json = excluded.facts_json, branch_group_id = excluded.branch_group_id,
                  branch_name = excluded.branch_name,
                  parent_checkpoint_id = excluded.parent_checkpoint_id,
-                 task_state_json = excluded.task_state_json",
+                 task_state_json = excluded.task_state_json,
+                 dialogue_state_json = excluded.dialogue_state_json",
             params![
                 id,
                 chat.title,
@@ -1233,14 +1273,15 @@ fn write_chat(
                 chat.branch_group_id().to_string(),
                 chat.branch_name(),
                 chat.parent_checkpoint_id.map(|value| value.to_string()),
-                task_state_json
+                task_state_json,
+                dialogue_state_json
             ],
         ),
         WriteMode::IgnoreExisting => transaction.execute(
             "INSERT OR IGNORE INTO chats(id, title, created_at_ms, updated_at_ms, settings_json,
                                          summary_json, facts_json, branch_group_id, branch_name,
-                                         parent_checkpoint_id, task_state_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                         parent_checkpoint_id, task_state_json, dialogue_state_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id,
                 chat.title,
@@ -1252,7 +1293,8 @@ fn write_chat(
                 chat.branch_group_id().to_string(),
                 chat.branch_name(),
                 chat.parent_checkpoint_id.map(|value| value.to_string()),
-                task_state_json
+                task_state_json,
+                dialogue_state_json
             ],
         ),
     }
@@ -1569,6 +1611,20 @@ fn initialize_database(
                 database_error("отключить профили для всех чатов", database_path, source)
             })?;
     }
+    if version < 12 {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chats') WHERE name = 'dialogue_state_json')",
+            [], |row| row.get(0)
+        ).map_err(|source| database_error("проверить память диалога", database_path, source))?;
+        if !exists {
+            connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE chats ADD COLUMN dialogue_state_json TEXT NOT NULL DEFAULT '{}'; PRAGMA user_version = 12; COMMIT;")
+                .map_err(|source| database_error("добавить память диалога", database_path, source))?;
+        } else {
+            connection
+                .pragma_update(None, "user_version", 12)
+                .map_err(|source| database_error("обновить версию", database_path, source))?;
+        }
+    }
     Ok(())
 }
 
@@ -1854,6 +1910,7 @@ mod tests {
                 already_counted_usage: None,
                 updated_facts: None,
                 updated_task: Some(planned),
+                updated_dialogue: None,
                 invariant_refusal: false,
                 rag_answer: None,
             },
@@ -2590,5 +2647,144 @@ mod tests {
         });
 
         assert_eq!(path, Some(PathBuf::from("/state/agi")));
+    }
+}
+
+#[cfg(test)]
+mod dialogue_tests {
+    use super::*;
+    use crate::rag_chat::{DialogueTaskState, Term};
+
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            Self(env::temp_dir().join(format!("agi-dialogue-{}", Uuid::new_v4())))
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn state() -> DialogueTaskState {
+        DialogueTaskState {
+            goal: "Восстановление чатов".into(),
+            constraints: vec!["Без облака".into()],
+            terms: vec![Term {
+                name: "сессия".into(),
+                definition: "чат с UUID".into(),
+            }],
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn dialogue_survives_pruning_summary_restore_and_branch() {
+        let directory = Directory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let mut chat = Chat::new();
+        chat.settings_mut().set_rag_chat_enabled(true).unwrap();
+        chat.settings_mut().set_context_window("2").unwrap();
+        chat.set_dialogue(state());
+        for i in 0..5 {
+            chat.record_exchange(format!("q{i}"), format!("a{i}"));
+        }
+        assert_eq!(chat.messages().len(), 2);
+        store.save(&mut chat).unwrap();
+        let summary = crate::summary::ConversationSummary {
+            content: "Короткое резюме".into(),
+            replaced_messages: 2,
+            before_bytes: 20,
+            metrics: ResponseMetrics::new(
+                chat.settings().model(),
+                0,
+                None,
+                &PriceCatalog::default(),
+            ),
+        };
+        store.replace_with_summary(&mut chat, summary).unwrap();
+        assert!(chat.messages().is_empty());
+        assert_eq!(chat.dialogue(), &state());
+        let mut restored = store.load(chat.id()).unwrap();
+        assert_eq!(restored.dialogue(), &state());
+        assert!(restored.settings().rag_chat_enabled());
+        restored
+            .settings_mut()
+            .select_context_strategy(ContextStrategyKind::Branching);
+        store.create_checkpoint(&restored, "memory").unwrap();
+        let branch = store
+            .create_branch(restored.branch_group_id(), "memory", "next")
+            .unwrap();
+        assert_eq!(branch.dialogue(), &state());
+        assert!(branch.settings().rag_chat_enabled());
+        let restored_branch = store.load(branch.id()).unwrap();
+        assert_eq!(restored_branch.dialogue(), &state());
+    }
+
+    #[test]
+    fn migrates_version_eleven_and_reads_old_checkpoints() {
+        let directory = Directory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let mut chat = Chat::new();
+        chat.settings_mut()
+            .select_context_strategy(ContextStrategyKind::Branching);
+        chat.record_exchange("Начало".into(), "Ответ".into());
+        store.save(&mut chat).unwrap();
+        store.create_checkpoint(&chat, "old").unwrap();
+        store.connection.execute_batch("UPDATE checkpoints SET snapshot_json = json_remove(snapshot_json, '$.dialogue'); ALTER TABLE chats DROP COLUMN dialogue_state_json; PRAGMA user_version = 11;").unwrap();
+        drop(store);
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let loaded = store.load(chat.id()).unwrap();
+        assert_eq!(loaded.dialogue(), &DialogueTaskState::default());
+        assert!(!loaded.settings().rag_chat_enabled());
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+        let branch = store
+            .create_branch(chat.branch_group_id(), "old", "new")
+            .unwrap();
+        assert_eq!(branch.dialogue(), &DialogueTaskState::default());
+    }
+
+    #[test]
+    fn failed_commit_and_reset_keep_previous_history_and_memory() {
+        let directory = Directory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let mut chat = Chat::new();
+        chat.set_dialogue(state());
+        chat.record_exchange("Начало".into(), "Ответ".into());
+        store.save(&mut chat).unwrap();
+        store.connection.execute_batch("CREATE TRIGGER reject_writes BEFORE UPDATE ON chats BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+        let answer = crate::agent::AgentAnswer {
+            content: "Ответ 2".into(),
+            truncated: false,
+            elapsed_ms: 0,
+            calls: vec![],
+            already_counted_usage: None,
+            updated_facts: None,
+            updated_task: None,
+            updated_dialogue: Some(Box::new(DialogueTaskState {
+                goal: "Новая цель".into(),
+                ..Default::default()
+            })),
+            invariant_refusal: false,
+            rag_answer: None,
+        };
+        assert!(
+            crate::rag_chat::commit_answer(
+                &store,
+                &mut chat,
+                "Вопрос 2".into(),
+                answer,
+                &PriceCatalog::default()
+            )
+            .is_err()
+        );
+        assert_eq!(chat.messages().len(), 2);
+        assert_eq!(chat.dialogue(), &state());
+        assert!(crate::rag_chat::saved_command(&store, &mut chat, "reset").is_err());
+        assert_eq!(chat.dialogue(), &state());
+        assert_eq!(store.load(chat.id()).unwrap().dialogue(), &state());
     }
 }

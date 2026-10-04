@@ -16,12 +16,16 @@ pub(crate) async fn slash(
     chat: &mut Chat,
     store: &ChatStore,
 ) -> Result<String, RagError> {
-    let mut service =
-        RagService::open(env::var("NEURALDEEP_API_KEY").ok(), DEFAULT_BASE_URL.into())?;
     let input = argument.unwrap_or("status").trim();
     let (action, tail) = input
         .split_once(char::is_whitespace)
         .map_or((input, ""), |(a, b)| (a, b.trim()));
+    crate::rag_chat::guard(chat, action, tail)?;
+    if action == "chat" {
+        return crate::rag_chat::saved_command(store, chat, tail);
+    }
+    let mut service =
+        RagService::open(env::var("NEURALDEEP_API_KEY").ok(), DEFAULT_BASE_URL.into())?;
     match action {
         "on" | "off" => {
             chat.settings_mut().set_rag_enabled(action == "on");
@@ -132,6 +136,7 @@ pub(crate) async fn slash(
         "report" if tail.is_empty() => read_answer_report(),
         "report" if tail == "day23" => crate::rag_day23::read_report(),
         "report" if tail == "day24" => crate::rag_day24::read_report(),
+        "report" if tail == "day25" => crate::rag_day25::read_report(),
         _ => Err(RagError::Document(
             "Команды: /rag add|list|remove|refresh|reindex|search|compare|evaluate|report|embeddings|on|off|status|strategy|strict|filter|rewrite|topk|threshold".into(),
         )),
@@ -193,6 +198,7 @@ pub(crate) async fn background(
         "report" if tail.is_empty() => read_answer_report(),
         "report" if tail == "day23" => crate::rag_day23::read_report(),
         "report" if tail == "day24" => crate::rag_day24::read_report(),
+        "report" if tail == "day25" => crate::rag_day25::read_report(),
         _ => Err(RagError::Document(
             "Команды: add|refresh|reindex|search|compare|evaluate|report|embeddings".into(),
         )),
@@ -200,16 +206,29 @@ pub(crate) async fn background(
 }
 
 fn day24_arguments(input: &str) -> Result<(PathBuf, f32), RagError> {
+    evaluation_arguments(
+        input,
+        crate::rag_day24::DEFAULT_EVAL_PATH,
+        crate::config::RAG_RERANK_THRESHOLD,
+    )
+}
+
+fn evaluation_arguments(
+    input: &str,
+    default_path: &str,
+    default_threshold: f32,
+) -> Result<(PathBuf, f32), RagError> {
     let (path, threshold) = match input.rsplit_once("--rerank-threshold") {
         Some((path, value)) => (
             path.trim(),
             value.trim().parse::<f32>().map_err(|_| {
                 RagError::Document(
-                    "Использование: /rag evaluate day24 [PATH] [--rerank-threshold VALUE]".into(),
+                    "Использование: /rag evaluate day24|day25 [PATH] [--rerank-threshold VALUE]"
+                        .into(),
                 )
             })?,
         ),
-        None => (input.trim(), crate::config::RAG_RERANK_THRESHOLD),
+        None => (input.trim(), default_threshold),
     };
     if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
         return Err(RagError::Document(
@@ -218,7 +237,7 @@ fn day24_arguments(input: &str) -> Result<(PathBuf, f32), RagError> {
     }
     Ok((
         if path.is_empty() {
-            PathBuf::from(crate::rag_day24::DEFAULT_EVAL_PATH)
+            PathBuf::from(default_path)
         } else {
             expand_tilde(path)
         },
@@ -227,6 +246,20 @@ fn day24_arguments(input: &str) -> Result<(PathBuf, f32), RagError> {
 }
 
 async fn evaluate_inside_agi(service: &RagService, input: &str) -> Result<String, RagError> {
+    if input == "day25" || input.starts_with("day25 ") {
+        let (path, threshold) = evaluation_arguments(
+            input.strip_prefix("day25").unwrap_or_default().trim(),
+            crate::rag_day25::DEFAULT_EVAL_PATH,
+            crate::config::RAG_CHAT_EVAL_RERANK_THRESHOLD,
+        )?;
+        return crate::rag_day25::evaluate(
+            service,
+            &path,
+            &crate::rag_day25::default_report_path()?,
+            threshold,
+        )
+        .await;
+    }
     if input == "day24" || input.starts_with("day24 ") {
         let (path, threshold) =
             day24_arguments(input.strip_prefix("day24").unwrap_or_default().trim())?;
@@ -517,10 +550,24 @@ pub(crate) async fn run(root: RootCommand) -> Result<(), RagError> {
             suite,
             rerank_threshold,
         } => {
-            if suite != "day24" && rerank_threshold.is_some() {
+            if suite != "day24" && suite != "day25" && rerank_threshold.is_some() {
                 return Err(RagError::Document(
-                    "--rerank-threshold для evaluate доступен только с --suite day24".into(),
+                    "--rerank-threshold для evaluate доступен только с --suite day24 или day25"
+                        .into(),
                 ));
+            }
+            if suite == "day25" {
+                println!(
+                    "{}",
+                    crate::rag_day25::evaluate(
+                        &service,
+                        &eval,
+                        &report,
+                        rerank_threshold.unwrap_or(crate::config::RAG_CHAT_EVAL_RERANK_THRESHOLD)
+                    )
+                    .await?
+                );
+                return Ok(());
             }
             if suite == "day24" {
                 crate::rag_day24::evaluate(
