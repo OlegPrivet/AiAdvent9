@@ -8,7 +8,6 @@ use crate::api::NeuralDeepClient;
 use crate::chat::{Chat, ChatStore};
 use crate::context::ContextStrategyKind;
 use crate::input::LineInput;
-use crate::metrics::ResponseMetrics;
 use crate::pricing::PriceCatalog;
 use crate::ui::TerminalUi;
 
@@ -86,7 +85,7 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                     .argument
                     .is_some_and(|value| value.trim_start().starts_with("evaluate"))
                 {
-                    writeln!(output, "RAG: сравниваю ответы на 10 вопросах…")?;
+                    writeln!(output, "RAG: выполняю оценку…")?;
                     output.flush()?;
                 }
                 match crate::rag_cli::slash(command.argument, chat, store).await {
@@ -247,7 +246,7 @@ async fn ask<W: Write>(
         Ok(servers) => servers,
         Err(error) => return writeln!(output, "Каталог MCP: {error}\n"),
     };
-    let retrieval = if chat.settings().rag_enabled() {
+    let retrieval = if chat.settings().rag_enabled() && !chat.settings().rag_chat_enabled() {
         match crate::rag_pipeline::context(
             question,
             chat.settings().rag_strategy(),
@@ -277,20 +276,9 @@ async fn ask<W: Write>(
         Ok(answer) => {
             live_answer.finish(&answer.content)?;
             let truncated = answer.truncated;
-            let mut metrics = ResponseMetrics::from_calls(
-                chat.settings().model(),
-                answer.elapsed_ms,
-                answer.calls,
-                prices,
-            );
-            metrics.already_counted_usage = answer.already_counted_usage;
-            chat.record_exchange_with_context(
-                question.to_owned(),
-                answer.content,
-                Some(metrics),
-                answer.updated_facts,
-            );
-            if let Err(error) = store.save(chat) {
+            if let Err(error) =
+                crate::rag_chat::commit_answer(store, chat, question.to_owned(), answer, prices)
+            {
                 writeln!(
                     output,
                     "Предупреждение: чат не удалось сохранить: {error}\n"
@@ -843,7 +831,7 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         output,
-        "  /rag strict on|off; /rag evaluate day24; /rag report day24\n  /rag filter off|similarity|rerank; /rag rewrite on|off"
+        "  /rag chat on|off|state|reset; /rag evaluate day25; /rag report day25\n  /rag strict on|off; /rag evaluate day24; /rag report day24\n  /rag filter off|similarity|rerank; /rag rewrite on|off"
     )?;
     writeln!(
         output,

@@ -100,6 +100,7 @@ pub(crate) struct Settings {
     #[serde(default = "ContextStrategy::legacy_branching")]
     context_strategy: ContextStrategy,
     rag_enabled: bool,
+    rag_chat_enabled: bool,
     rag_strategy: crate::rag_chunk::Strategy,
     rag_options: crate::rag_pipeline::RagOptions,
 }
@@ -117,6 +118,7 @@ impl Default for Settings {
             system_prompt: None,
             context_strategy: ContextStrategy::sliding_default(),
             rag_enabled: false,
+            rag_chat_enabled: false,
             rag_strategy: crate::rag_chunk::Strategy::Structure,
             rag_options: crate::rag_pipeline::RagOptions::default(),
         }
@@ -138,6 +140,20 @@ impl Settings {
         &self.model
     }
 
+    pub(crate) fn rag_chat_enabled(&self) -> bool {
+        self.rag_chat_enabled
+    }
+
+    pub(crate) fn set_rag_chat_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            let options = self.rag_options.command("strict", "on")?;
+            self.rag_options = options;
+            self.rag_enabled = true;
+        }
+        self.rag_chat_enabled = enabled;
+        Ok(())
+    }
+
     pub(crate) fn rag_enabled(&self) -> bool {
         self.rag_enabled
     }
@@ -151,6 +167,9 @@ impl Settings {
         options: crate::rag_pipeline::RagOptions,
     ) -> Result<(), String> {
         options.validate()?;
+        if self.rag_chat_enabled && !options.strict {
+            return Err("Сначала отключите режим: /rag chat off".into());
+        }
         self.rag_options = options;
         Ok(())
     }

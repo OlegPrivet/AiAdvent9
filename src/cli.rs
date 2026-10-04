@@ -92,9 +92,9 @@ pub(crate) enum RagCommand {
     },
     /// Сравнить ответы модели с RAG и без RAG на контрольных вопросах.
     Evaluate {
-        #[arg(long, value_parser = ["day22", "day23", "day24"], default_value = "day22")]
+        #[arg(long, value_parser = ["day22", "day23", "day24", "day25"], default_value = "day22")]
         suite: String,
-        /// Порог reranker для оценки Дня 24; по умолчанию 0.50.
+        /// Порог reranker для оценки: День 24 — 0.50, День 25 — 0.20.
         #[arg(long)]
         rerank_threshold: Option<f32>,
         #[arg(long)]

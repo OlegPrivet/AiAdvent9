@@ -52,6 +52,8 @@ impl EmbeddingConfig {
 pub(crate) enum RagError {
     #[error("ошибка файла: {0}")]
     Io(#[from] std::io::Error),
+    #[error("некорректный JSON RAG: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("ошибка индекса: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("ошибка сети: {0}")]

@@ -399,6 +399,7 @@ fn strict_unknown_is_saved_and_waits_for_clarification_without_advancing_task() 
         already_counted_usage: None,
         updated_facts: None,
         updated_task: None,
+        updated_dialogue: None,
         invariant_refusal: false,
         rag_answer: Some(checked),
     };
