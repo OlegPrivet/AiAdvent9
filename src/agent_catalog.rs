@@ -102,6 +102,10 @@ impl<'a> AgentStore<'a> {
         Self { connection }
     }
 
+    pub(crate) fn llms(&self) -> crate::llm::LlmStore<'_> {
+        crate::llm::LlmStore::new(self.connection)
+    }
+
     pub(crate) fn list(&self) -> Result<Vec<AgentDefinition>, CatalogError> {
         let mut statement = self.connection.prepare(
             "SELECT id, name, handle, description, settings_json FROM agents ORDER BY handle COLLATE NOCASE",
@@ -117,13 +121,18 @@ impl<'a> AgentStore<'a> {
         })?;
         rows.map(|row| {
             let (id, name, handle, description, settings) = row?;
-            let agent = AgentDefinition {
+            let mut agent = AgentDefinition {
                 id: Uuid::parse_str(&id)?,
                 name,
                 handle,
                 description,
                 settings: serde_json::from_str(&settings)?,
             };
+            if agent.settings.profile_id().is_some() {
+                self.llms()
+                    .resolve_agent(&mut agent.settings)
+                    .map_err(|e| CatalogError::Validation(e.to_string()))?;
+            }
             agent.validate()?;
             Ok(agent)
         })

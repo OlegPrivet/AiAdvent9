@@ -21,7 +21,7 @@ use crate::pricing::PriceCatalog;
 use crate::settings::Settings;
 
 const LEGACY_CHAT_SCHEMA_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: i64 = 12;
+const DATABASE_SCHEMA_VERSION: i64 = 13;
 const DATABASE_FILE_NAME: &str = "chats.sqlite3";
 const LEGACY_DIRECTORY_NAME: &str = "chats";
 const LEGACY_IMPORT_KEY: &str = "legacy_json_imported";
@@ -67,7 +67,11 @@ pub(crate) struct Chat {
     title: String,
     created_at_ms: u64,
     updated_at_ms: u64,
-    #[serde(default)]
+    #[serde(
+        default,
+        serialize_with = "crate::settings::serialize_chat_settings",
+        deserialize_with = "crate::settings::deserialize_chat_settings"
+    )]
     settings: Settings,
     messages: Vec<ChatMessage>,
     #[serde(default)]
@@ -531,6 +535,10 @@ pub(crate) enum ChatStoreError {
 }
 
 impl ChatStore {
+    pub(crate) fn llms(&self) -> crate::llm::LlmStore<'_> {
+        crate::llm::LlmStore::new(&self.connection)
+    }
+
     pub(crate) fn agents(&self) -> crate::agent_catalog::AgentStore<'_> {
         crate::agent_catalog::AgentStore::new(&self.connection)
     }
@@ -624,13 +632,19 @@ impl ChatStore {
         else {
             return Err(ChatStoreError::NotFound(id));
         };
-        let settings = serde_json::from_str(&settings_json).map_err(|source| {
-            ChatStoreError::SettingsJson {
+        let settings = serde_json::from_str::<serde_json::Value>(&settings_json)
+            .and_then(|mut value| {
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("model");
+                    object.remove("llm_profile_id");
+                }
+                serde_json::from_value(value)
+            })
+            .map_err(|source| ChatStoreError::SettingsJson {
                 action: "прочитать",
                 id,
                 source,
-            }
-        })?;
+            })?;
         let facts: Facts =
             serde_json::from_str(&facts_json).map_err(|source| ChatStoreError::SettingsJson {
                 action: "прочитать facts",
@@ -1205,8 +1219,9 @@ fn write_chat(
     mode: WriteMode,
     database_path: &Path,
 ) -> Result<bool, ChatStoreError> {
-    let settings_json =
-        serde_json::to_string(&chat.settings).map_err(|source| ChatStoreError::SettingsJson {
+    let settings_json = crate::settings::chat_settings_value(&chat.settings)
+        .and_then(|value| serde_json::to_string(&value))
+        .map_err(|source| ChatStoreError::SettingsJson {
             action: "сохранить",
             id: chat.id,
             source,
@@ -1625,6 +1640,10 @@ fn initialize_database(
                 .map_err(|source| database_error("обновить версию", database_path, source))?;
         }
     }
+    if version < 13 {
+        connection.execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS llm_profiles(id TEXT PRIMARY KEY NOT NULL, profile_json TEXT NOT NULL); PRAGMA user_version = 13; COMMIT;")
+            .map_err(|source| database_error("добавить каталог LLM", database_path, source))?;
+    }
     Ok(())
 }
 
@@ -2038,7 +2057,10 @@ mod tests {
         assert_eq!(restored.summary().expect("summary").content, "Резюме");
         assert!(restored.has_completed_turn());
         assert_eq!(restored.title(), title);
-        assert_eq!(restored.settings(), chat.settings());
+        assert_eq!(
+            crate::settings::chat_settings_value(restored.settings()).unwrap(),
+            crate::settings::chat_settings_value(chat.settings()).unwrap()
+        );
         restored.record_exchange("Новый вопрос".into(), "Ответ".into());
         assert_eq!(restored.title(), title);
         assert_eq!(restored.id(), id);
@@ -2064,6 +2086,8 @@ mod tests {
                 "qwen3.8-27b",
                 0,
                 vec![CallUsage {
+                    provider: None,
+                    profile_id: None,
                     context: None,
                     model: "qwen3.8-27b".into(),
                     usage: Some(usage),
@@ -2160,6 +2184,8 @@ mod tests {
         assert!(store.list().expect("list should load").chats.is_empty());
 
         let metrics = ResponseMetrics {
+            provider: None,
+            profile_id: None,
             is_summary: false,
             model: "gpt-oss-120b".to_owned(),
             elapsed_ms: 1_234,
@@ -2185,12 +2211,15 @@ mod tests {
 
         assert_eq!(restored.title(), "Первый вопрос");
         assert_eq!(restored.messages(), chat.messages());
-        assert_eq!(restored.settings(), chat.settings());
+        assert_eq!(
+            crate::settings::chat_settings_value(restored.settings()).unwrap(),
+            crate::settings::chat_settings_value(chat.settings()).unwrap()
+        );
         assert_eq!(
             restored.settings().system_prompt(),
             Some("Отвечай как редактор")
         );
-        assert_eq!(restored.settings().model(), "gpt-oss-120b");
+        assert_eq!(restored.settings().model(), crate::config::DEFAULT_MODEL);
         assert_eq!(restored.settings().max_tokens(), 900);
         assert_eq!(restored.settings().temperature(), 1.25);
         assert_eq!(
@@ -2212,6 +2241,8 @@ mod tests {
             1200,
             vec![
                 crate::metrics::CallUsage {
+                    provider: None,
+                    profile_id: None,
                     context: None,
                     model: "gpt-oss-20b".into(),
                     usage: Some(TokenUsage {
@@ -2220,6 +2251,8 @@ mod tests {
                     }),
                 },
                 crate::metrics::CallUsage {
+                    provider: None,
+                    profile_id: None,
                     context: None,
                     model: "qwen3.8-27b".into(),
                     usage: Some(TokenUsage {
@@ -2740,7 +2773,7 @@ mod dialogue_tests {
             .connection
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
         let branch = store
             .create_branch(chat.branch_group_id(), "old", "new")
             .unwrap();

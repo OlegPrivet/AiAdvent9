@@ -8,7 +8,7 @@ use crate::agent_catalog::{
     AgentDefinition, AgentStore, CatalogError, validate_handle, validate_text,
 };
 use crate::input::LineInput;
-use crate::settings::Settings;
+
 use crate::ui::sanitize_terminal_text;
 
 const FIELDS: &[&str] = &[
@@ -61,10 +61,23 @@ pub(crate) struct AgentManager {
 
 impl AgentManager {
     pub(crate) fn new(store: &AgentStore<'_>) -> Result<Self, CatalogError> {
+        let mut draft = AgentDefinition::draft();
+        draft.settings.set_model_profiles(
+            store
+                .llms()
+                .list()
+                .map_err(|e| CatalogError::Validation(e.to_string()))?,
+        );
+        draft.settings.apply_profile(
+            store
+                .llms()
+                .active()
+                .map_err(|e| CatalogError::Validation(e.to_string()))?,
+        );
         Ok(Self {
             stage: Stage::Home,
             agents: store.list()?,
-            draft: AgentDefinition::draft(),
+            draft,
             creating: false,
             system_prompt_preview: None,
             notice: None,
@@ -116,7 +129,7 @@ impl AgentManager {
             }
             Stage::Field(4) => AgentPage::List {
                 title: "Модель агента".into(),
-                items: Settings::model_items(),
+                items: self.draft.settings.available_models(),
             },
             Stage::Field(6) => AgentPage::List {
                 title: "Structured Output агента".into(),
@@ -182,7 +195,7 @@ impl AgentManager {
     pub(crate) fn system_prompt_request(
         &self,
         request: String,
-        fallback_model: &str,
+        _fallback_model: &str,
     ) -> SystemPromptRequest {
         SystemPromptRequest {
             name: self.draft.name.clone(),
@@ -195,12 +208,8 @@ impl AgentManager {
                 .unwrap_or_default()
                 .to_owned(),
             request,
-            model: if self.creating {
-                fallback_model
-            } else {
-                self.draft.settings.model()
-            }
-            .to_owned(),
+            profile: self.draft.settings.profile().cloned(),
+            model: self.draft.settings.model().to_owned(),
         }
     }
 
@@ -229,10 +238,28 @@ impl AgentManager {
                         ));
                     }
                     self.draft = AgentDefinition::draft();
+                    self.draft.settings.set_model_profiles(
+                        store
+                            .llms()
+                            .list()
+                            .map_err(|e| CatalogError::Validation(e.to_string()))?,
+                    );
+                    self.draft.settings.apply_profile(
+                        store
+                            .llms()
+                            .active()
+                            .map_err(|e| CatalogError::Validation(e.to_string()))?,
+                    );
                     self.creating = true;
                     self.stage = Stage::Field(0);
                 } else if let Some(agent) = self.agents.get(index - 1) {
                     self.draft = store.get(agent.id)?;
+                    self.draft.settings.set_model_profiles(
+                        store
+                            .llms()
+                            .list()
+                            .map_err(|e| CatalogError::Validation(e.to_string()))?,
+                    );
                     self.stage = Stage::View(agent.id);
                 } else {
                     return Ok(true);
@@ -540,7 +567,7 @@ mod tests {
         );
         assert_eq!(agents[0].description, "Проверяет текст");
         assert_eq!(server.requests().len(), 1);
-        assert_eq!(server.requests()[0]["model"], "gpt-oss-20b");
+        assert_eq!(server.requests()[0]["model"], crate::config::DEFAULT_MODEL);
         assert!(
             String::from_utf8(output)
                 .expect("output")

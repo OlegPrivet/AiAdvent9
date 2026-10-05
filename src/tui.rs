@@ -29,12 +29,12 @@ use crate::chat::{Chat, ChatStore, ChatSummary, MessageRole};
 use crate::cli::EditMode;
 use crate::context::ContextStrategyKind;
 use crate::input::CommandHistory;
+use crate::llm_ui::{LlmManager, LlmPage};
 use crate::mcp::McpError;
 use crate::mcp_ui::{McpAction, McpManager, McpPage};
 use crate::metrics::{ResponseMetrics, format_duration, metric_lines};
 use crate::pricing::PriceCatalog;
 use crate::repl::ParsedCommand;
-use crate::settings::Settings;
 use crate::ui::sanitize_terminal_text;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -57,6 +57,10 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     CommandOption::run("/help", "показать справку", &["/помощь"]),
     CommandOption::run("/exit", "сохранить чат и выйти", &["/quit", "/выход"]),
     CommandOption::run("/agents", "глобальный каталог агентов", &["/агенты"]),
+    CommandOption::run("/llm", "подключить HTTP API и выбрать общую LLM", &[]),
+    CommandOption::argument("/llm default", "выбрать общий профиль", &[]),
+    CommandOption::argument("/llm add", "добавить локальную LLM", &[]),
+    CommandOption::argument("/llm remove", "удалить профиль LLM", &[]),
     CommandOption::run("/mcp", "MCP-серверы и инструменты AI", &["/мсп"]),
     CommandOption::run("/rag", "документы и RAG", &["/раг"]),
     CommandOption::run("/rag status", "состояние RAG", &["/раг status"]),
@@ -552,17 +556,17 @@ pub(crate) async fn run(
 fn spawn_request(
     client: &Agent,
     store: &ChatStore,
-    chat: &Chat,
+    chat: &mut Chat,
     question: String,
     request_id: Uuid,
     worker_tx: UnboundedSender<WorkerEvent>,
 ) -> RequestTask {
     let client = client.clone();
+    let sync = crate::llm::sync_chat(store, chat);
     let manual = crate::summary::is_command(&question);
-    let request = store
-        .agents()
-        .list()
-        .map_err(AgentError::from)
+    let request = sync
+        .map_err(|error| AgentError::InvalidRequest(error.to_string()))
+        .and_then(|_| store.agents().list().map_err(AgentError::from))
         .and_then(|agents| {
             let request =
                 AgentRequest::new(chat, if manual { String::new() } else { question }, agents)
@@ -621,10 +625,11 @@ fn spawn_request(
                     let request = if request.settings.rag_enabled()
                         && (!request.settings.rag_chat_enabled() || request.task.is_some())
                     {
-                        let hits = crate::rag_pipeline::context(
+                        let hits = crate::rag_pipeline::context_with_profile(
                             &request.question,
                             request.settings.rag_strategy(),
                             request.settings.rag_options(),
+                            request.settings.profile(),
                         )
                         .await
                         .map_err(|error| AgentError::InvalidRequest(format!("RAG: {error}")))?;
@@ -818,6 +823,11 @@ impl<'a> App<'a> {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
+        if self.request_started_at.is_none()
+            && let Err(error) = crate::llm::sync_chat(self.store, self.chat)
+        {
+            self.notice = Some(error.to_string());
+        }
         let area = frame.area();
         frame.render_widget(Clear, area);
         let input_height = (self.input.lines().len() as u16 + 2).clamp(3, MAX_INPUT_HEIGHT);
@@ -872,7 +882,7 @@ impl<'a> App<'a> {
         let title = format!(
             " agi · {} · {} ",
             sanitize_terminal_text(self.chat.title()),
-            self.chat.settings().model()
+            self.chat.settings().llm_label()
         );
         let notice = self
             .notice
@@ -1379,6 +1389,10 @@ impl<'a> App<'a> {
             && mcp.inspection.is_none()
         {
             mcp.input.insert_str(text);
+        } else if let Some(Modal::Llm(llm)) = &mut self.modal
+            && matches!(llm.manager.page(), LlmPage::Text { .. })
+        {
+            llm.input.insert_str(text);
         }
     }
 
@@ -1543,6 +1557,19 @@ impl<'a> App<'a> {
             self.open_settings();
         } else if command.matches(&["/chat", "/chats", "/чаты"]) {
             self.open_chats();
+        } else if command.matches(&["/llm"]) {
+            if command.argument.is_none() {
+                self.open_llms();
+            } else {
+                let result = crate::llm::slash(self.store, command.argument);
+                self.modal = Some(Modal::Message {
+                    title: "Общие подключения LLM".into(),
+                    content: result.unwrap_or_else(|error| error.to_string()),
+                });
+            }
+            if let Err(error) = crate::llm::sync_chat(self.store, self.chat) {
+                self.notice = Some(error.to_string());
+            }
         } else if command.matches(&["/agents", "/агенты"]) {
             match AgentManager::new(&self.store.agents()) {
                 Ok(manager) => {
@@ -2106,7 +2133,11 @@ impl<'a> App<'a> {
     }
 
     fn should_refresh_prices(&self) -> bool {
-        !self.price_refresh_in_flight
+        self.chat
+            .settings()
+            .profile()
+            .is_none_or(|profile| profile.provider == crate::llm::Provider::NeuralDeep)
+            && !self.price_refresh_in_flight
             && self.prices.is_stale()
             && self
                 .last_price_attempt
@@ -2162,11 +2193,27 @@ impl<'a> App<'a> {
         }
     }
 
+    fn open_llms(&mut self) {
+        match LlmManager::new(&self.store.llms()) {
+            Ok(manager) => self.modal = Some(Modal::Llm(Box::new(LlmModal::new(manager)))),
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
     fn handle_modal_key(&mut self, key: KeyEvent) {
         let Some(mut modal) = self.modal.take() else {
             return;
         };
         match &mut modal {
+            Modal::Llm(llm) => {
+                let close = llm.handle_key(key, &self.store.llms());
+                if let Err(error) = crate::llm::sync_chat(self.store, self.chat) {
+                    self.notice = Some(error.to_string());
+                }
+                if close {
+                    return;
+                }
+            }
             Modal::Agents(agents) => {
                 if agents.handle_key(key, &self.store.agents()) {
                     return;
@@ -2260,8 +2307,25 @@ impl<'a> App<'a> {
                 0 => {
                     self.modal = Some(Modal::List {
                         title: "Модель".to_owned(),
-                        items: Settings::model_items(),
-                        selected: self.chat.settings().model_index(),
+                        items: self
+                            .store
+                            .llms()
+                            .list()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(crate::llm::LlmProfile::label)
+                            .chain(std::iter::once("Управление подключениями LLM…".into()))
+                            .collect(),
+                        selected: self
+                            .store
+                            .llms()
+                            .list()
+                            .unwrap_or_default()
+                            .iter()
+                            .position(|profile| {
+                                Some(profile.id.as_str()) == self.chat.settings().profile_id()
+                            })
+                            .unwrap_or(0),
                         kind: ListKind::Models,
                     });
                 }
@@ -2334,8 +2398,23 @@ impl<'a> App<'a> {
                 _ => self.open_settings(),
             },
             ListKind::Models => {
-                if self.chat.settings_mut().select_model(selected) {
-                    self.settings_changed();
+                if self
+                    .store
+                    .llms()
+                    .list()
+                    .is_ok_and(|profiles| selected == profiles.len())
+                {
+                    self.open_llms();
+                    return;
+                }
+                match self.store.llms().list().and_then(|profiles| {
+                    let profile = profiles.get(selected).ok_or_else(|| {
+                        crate::llm::LlmError::Validation("Профиль не найден".into())
+                    })?;
+                    self.store.llms().set_default(&profile.id)
+                }) {
+                    Ok(profile) => self.chat.settings_mut().apply_profile(profile),
+                    Err(error) => self.notice = Some(error.to_string()),
                 }
                 self.open_settings();
             }
@@ -3006,6 +3085,141 @@ impl McpModal {
     }
 }
 
+struct LlmModal {
+    manager: LlmManager,
+    input: TextArea<'static>,
+    selected: usize,
+}
+
+impl LlmModal {
+    fn new(manager: LlmManager) -> Self {
+        let mut modal = Self {
+            manager,
+            input: TextArea::default(),
+            selected: 0,
+        };
+        modal.refresh();
+        modal
+    }
+
+    fn refresh(&mut self) {
+        self.selected = 0;
+        if let LlmPage::Text { title, value, .. } = self.manager.page() {
+            self.input = new_textarea(vec![sanitize_terminal_text(&value)], &title);
+            // Select the displayed default so typing or pasting replaces it.
+            self.input.move_cursor(CursorMove::Head);
+            self.input.start_selection();
+            self.input.move_cursor(CursorMove::End);
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, store: &crate::llm::LlmStore<'_>) -> bool {
+        let result = if key.code == KeyCode::Esc {
+            Some(self.manager.cancel(store))
+        } else {
+            match self.manager.page() {
+                LlmPage::List { items, .. } => match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.selected = self.selected.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.selected = (self.selected + 1).min(items.len().saturating_sub(1));
+                        None
+                    }
+                    KeyCode::Enter => Some(self.manager.select(self.selected, store)),
+                    _ => None,
+                },
+                LlmPage::Text { .. } => {
+                    if submits_text_field(key, false) {
+                        Some(
+                            self.manager
+                                .submit(self.input.lines().join("\n"), store)
+                                .map(|()| false),
+                        )
+                    } else {
+                        self.input.input(key);
+                        None
+                    }
+                }
+            }
+        };
+        match result {
+            Some(Ok(true)) => true,
+            Some(Ok(false)) => {
+                self.refresh();
+                false
+            }
+            Some(Err(error)) => {
+                self.manager.notice = Some(error.to_string());
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let notice = self
+            .manager
+            .notice
+            .as_deref()
+            .map(sanitize_terminal_text)
+            .unwrap_or_default();
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(if notice.is_empty() { 0 } else { 3 }),
+                Constraint::Min(1),
+            ])
+            .split(area);
+        if !notice.is_empty() {
+            frame.render_widget(
+                Paragraph::new(notice)
+                    .style(Style::default().fg(Color::Yellow))
+                    .wrap(Wrap { trim: false }),
+                layout[0],
+            );
+        }
+        let area = layout[1];
+        match self.manager.page() {
+            LlmPage::List { title, items } => {
+                let title = Text::from(sanitize_terminal_text(&title));
+                let title_height =
+                    wrapped_text_height(&title, area.width).min(usize::from(area.height / 2));
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(title_height as u16), Constraint::Min(1)])
+                    .split(area);
+                frame.render_widget(Paragraph::new(title).wrap(Wrap { trim: false }), rows[0]);
+                let list = List::new(
+                    items
+                        .into_iter()
+                        .map(|item| ListItem::new(sanitize_terminal_text(&item)))
+                        .collect::<Vec<_>>(),
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Enter: выбрать · Esc: назад "),
+                )
+                .highlight_symbol("› ")
+                .highlight_style(Style::default().fg(Color::Cyan));
+                let mut state = ListState::default().with_selected(Some(self.selected));
+                frame.render_stateful_widget(list, rows[1], &mut state);
+            }
+            LlmPage::Text { title, hint, .. } => {
+                self.input.set_block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" {title} · Enter: далее · Esc: отмена "))
+                        .title_bottom(format!(" {hint} ")),
+                );
+                frame.render_widget(&self.input, area);
+            }
+        }
+    }
+}
+
 fn submits_text_field(key: KeyEvent, multiline: bool) -> bool {
     key.code == KeyCode::F(4)
         || (key.code == KeyCode::Enter
@@ -3013,6 +3227,7 @@ fn submits_text_field(key: KeyEvent, multiline: bool) -> bool {
 }
 
 enum Modal {
+    Llm(Box<LlmModal>),
     Agents(Box<AgentsModal>),
     Mcp(Box<McpModal>),
     Help,
@@ -3041,6 +3256,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
     let area = centered_rect(80, 75, frame.area());
     frame.render_widget(Clear, area);
     match modal {
+        Modal::Llm(llm) => llm.render(frame, area),
         Modal::Agents(agents) => agents.render(frame, area),
         Modal::Mcp(mcp) => mcp.render(frame, area),
         Modal::Help => {
@@ -3049,6 +3265,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/restore <UUID>          восстановить чат",
                 "/settings, /настройки   настройки текущего чата",
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
+                "/llm                  подключить HTTP API, выбрать общую LLM, удалить",
                 "/mcp, /мсп             MCP-серверы и инструменты AI",
                 "/rag evaluate          ответы с RAG и без RAG на 10 вопросах",
                 "/rag report            открыть сохранённый отчёт",
@@ -3290,6 +3507,80 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+
+    #[test]
+    fn llm_form_accepts_paste_updates_global_model_and_preserves_chat_history() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let mut chat = Chat::new();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        app.handle_command(ParsedCommand::parse("/llm").unwrap());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_modal_key(enter); // add
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = (0..30)
+            .map(|row| buffer_row(terminal.backend().buffer(), row))
+            .collect::<String>();
+        assert!(screen.contains("Имя подключения (ID)"));
+        for value in ["mine", "invalid-url"] {
+            app.handle_paste(value);
+            app.handle_modal_key(enter);
+        }
+        let Some(Modal::Llm(modal)) = &mut app.modal else {
+            panic!("LLM modal")
+        };
+        assert!(modal.manager.notice.is_some());
+        assert_eq!(modal.input.lines(), &["invalid-url"]);
+        modal.input.select_all();
+        app.handle_paste("http://127.0.0.1:1/v1");
+        app.handle_modal_key(enter);
+        for value in ["my-model", "8192"] {
+            app.handle_paste(value);
+            app.handle_modal_key(enter);
+        }
+        app.handle_modal_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_modal_key(enter); // tools yes
+        app.handle_modal_key(enter); // schema no
+        assert!(store.llms().get("mine").is_err());
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = (0..30)
+            .map(|row| buffer_row(terminal.backend().buffer(), row))
+            .collect::<String>();
+        assert!(screen.contains("Модель: my-model"));
+        assert!(screen.contains("Сохранить и использовать"));
+        app.handle_modal_key(enter);
+        assert_eq!(store.llms().active().unwrap().id, "mine");
+        assert_eq!(app.chat.settings().profile_id(), Some("mine"));
+        assert!(app.chat.messages().is_empty());
+        assert!(app.input.lines().join("\n").is_empty());
+        app.handle_modal_key(esc);
+        assert!(app.modal.is_none());
+
+        app.activate_list_item(ListKind::Settings, 0);
+        let Some(Modal::List { items, .. }) = &app.modal else {
+            panic!("models")
+        };
+        assert_eq!(items.last().unwrap(), "Управление подключениями LLM…");
+        app.activate_list_item(ListKind::Models, items.len() - 1);
+        assert!(matches!(app.modal, Some(Modal::Llm(_))));
+        app.handle_modal_key(enter);
+        app.handle_paste("cancelled");
+        app.handle_modal_key(enter);
+        app.handle_modal_key(esc);
+        assert!(store.llms().get("cancelled").is_err());
+        assert_eq!(store.llms().active().unwrap().id, "mine");
+        app.handle_modal_key(esc);
+        app.begin_question("Вопрос".into()).unwrap();
+        app.handle_command(ParsedCommand::parse("/llm").unwrap());
+        assert!(app.modal.is_none());
+    }
 
     #[tokio::test]
     async fn rag_chat_commands_match_repl_and_persist_without_an_index() {
@@ -3643,6 +3934,8 @@ mod tests {
             "qwen3.8-27b",
             0,
             vec![crate::metrics::CallUsage {
+                provider: None,
+                profile_id: None,
                 context: None,
                 model: "qwen3.8-27b".into(),
                 usage: Some(TokenUsage {
@@ -4135,6 +4428,8 @@ mod tests {
                 truncated: false,
                 elapsed_ms: 100,
                 calls: vec![crate::metrics::CallUsage {
+                    provider: None,
+                    profile_id: None,
                     context: None,
                     model: "qwen3.8-27b".into(),
                     usage: Some(TokenUsage::default()),
@@ -4422,6 +4717,8 @@ mod tests {
         let store = ChatStore::for_tests(directory.0.clone()).expect("test store should open");
         let mut chat = Chat::new();
         let metrics = ResponseMetrics {
+            provider: None,
+            profile_id: None,
             is_summary: false,
             model: "qwen3.8-27b-noreason".to_owned(),
             elapsed_ms: 2_345,

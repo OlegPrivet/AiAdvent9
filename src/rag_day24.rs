@@ -206,7 +206,7 @@ pub(crate) async fn evaluate(
     };
     let mut report = format!(
         "# День 24 — проверенные источники и цитаты\n\nМодель: `{}`; embeddings: `{}`; strategy: structure; {}; temperature: 0; max_tokens: 10000.\n\nSHA-256 набора: `{hash}`.\n\n## Корпус\n\n",
-        crate::config::DEFAULT_MODEL,
+        client.default_model(),
         service.embedding_config().model,
         options.status()
     );

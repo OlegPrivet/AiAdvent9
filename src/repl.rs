@@ -29,7 +29,8 @@ pub(crate) async fn run<I: LineInput, W: Write>(
     display: ReplDisplay<'_>,
 ) -> io::Result<()> {
     let ReplDisplay { ui, prices } = display;
-    writeln!(output, "agi — интерактивный клиент NeuralDeep")?;
+    crate::llm::sync_chat(store, chat).map_err(io::Error::other)?;
+    writeln!(output, "agi — интерактивный клиент LLM")?;
     writeln!(output, "Введите вопрос или /help для списка команд.")?;
     if chat.is_persisted() {
         ui.print_chat(output, chat)?;
@@ -45,6 +46,7 @@ pub(crate) async fn run<I: LineInput, W: Write>(
     }
 
     loop {
+        crate::llm::sync_chat(store, chat).map_err(io::Error::other)?;
         let Some(line) = input.read_line(MAIN_PROMPT)? else {
             return finish_session(store, chat, output);
         };
@@ -65,6 +67,16 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                 start_new_chat(store, chat, output)?;
             } else if command.matches(&["/help", "/помощь"]) {
                 print_help(output)?;
+            } else if command.matches(&["/llm"]) {
+                if command.argument.is_none() {
+                    crate::llm_ui::run(&store.llms(), input, output)?;
+                } else {
+                    match crate::llm::slash(store, command.argument) {
+                        Ok(message) => writeln!(output, "{message}")?,
+                        Err(error) => writeln!(output, "LLM: {error}")?,
+                    }
+                }
+                crate::llm::sync_chat(store, chat).map_err(io::Error::other)?;
             } else if command.matches(&["/settings", "/setting", "/настройки"]) {
                 configure_settings(store, chat, input, output)?;
             } else if command.matches(&["/chat", "/chats", "/чаты"]) {
@@ -247,10 +259,11 @@ async fn ask<W: Write>(
         Err(error) => return writeln!(output, "Каталог MCP: {error}\n"),
     };
     let retrieval = if chat.settings().rag_enabled() && !chat.settings().rag_chat_enabled() {
-        match crate::rag_pipeline::context(
+        match crate::rag_pipeline::context_with_profile(
             question,
             chat.settings().rag_strategy(),
             chat.settings().rag_options(),
+            chat.settings().profile(),
         )
         .await
         {
@@ -411,8 +424,16 @@ fn configure_settings<I: LineInput, W: Write>(
     input: &mut I,
     output: &mut W,
 ) -> io::Result<()> {
+    chat.settings_mut()
+        .set_model_profiles(store.llms().list().map_err(io::Error::other)?);
+    let original_profile = chat.settings().profile_id().map(str::to_owned);
     let original_context = chat.settings().context_strategy().clone();
     if chat.settings_mut().configure(input, output)? {
+        if chat.settings().profile_id() != original_profile.as_deref()
+            && let Some(id) = chat.settings().profile_id()
+        {
+            store.llms().set_default(id).map_err(io::Error::other)?;
+        }
         if chat.has_completed_turn() && chat.settings().context_strategy() != &original_context {
             chat.settings_mut()
                 .replace_context_strategy(original_context);
@@ -801,6 +822,10 @@ fn from_russian_keyboard_layout(value: &str) -> String {
 
 fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(output, "Доступные команды:")?;
+    writeln!(
+        output,
+        "  /llm — меню подключений LLM: добавить HTTP API, выбрать общую модель, удалить"
+    )?;
     writeln!(
         output,
         "  /task [start <описание> | approve | pause | resume] — состояние задачи; Ctrl+C во время выполнения: пауза"

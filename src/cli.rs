@@ -12,7 +12,7 @@ pub(crate) enum EditMode {
     Vim,
 }
 
-/// Интерактивный CLI-клиент AI-сервиса NeuralDeep.
+/// Интерактивный CLI-клиент NeuralDeep и локальных LLM.
 #[derive(Debug, Parser)]
 #[command(name = "agi", version, about)]
 pub(crate) struct Cli {
@@ -32,11 +32,16 @@ pub(crate) struct Cli {
     pub(crate) mcp_demo_server: bool,
 
     #[command(subcommand)]
-    pub(crate) rag: Option<RootCommand>,
+    pub(crate) command: Option<RootCommand>,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum RootCommand {
+    /// Общие подключения LLM.
+    Llm {
+        #[command(subcommand)]
+        command: crate::llm::LlmCommand,
+    },
     /// Локальная библиотека документов для ответов с источниками.
     Rag {
         #[command(subcommand)]
@@ -157,7 +162,7 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            matches!(cli.rag, Some(RootCommand::Rag { command: RagCommand::Evaluate { suite, .. } }) if suite == "day24")
+            matches!(cli.command, Some(RootCommand::Rag { command: RagCommand::Evaluate { suite, .. } }) if suite == "day24")
         );
     }
 
@@ -182,7 +187,7 @@ mod tests {
         ])
         .expect("search");
         assert!(matches!(
-            cli.rag,
+            cli.command,
             Some(RootCommand::Rag {
                 command: RagCommand::Search {
                     filter: crate::rag_pipeline::RelevanceMode::Rerank,
@@ -206,7 +211,7 @@ mod tests {
         ])
         .expect("evaluate");
         assert!(
-            matches!(cli.rag,Some(RootCommand::Rag {command:RagCommand::Evaluate {suite,..}}) if suite == "day23")
+            matches!(cli.command,Some(RootCommand::Rag {command:RagCommand::Evaluate {suite,..}}) if suite == "day23")
         );
         assert!(
             Cli::try_parse_from([
@@ -273,7 +278,7 @@ mod tests {
         let cli = Cli::try_parse_from(["agi", "rag", "add", "/tmp/manual.pdf", "/tmp/source code"])
             .expect("RAG paths should parse");
         assert!(matches!(
-            cli.rag,
+            cli.command,
             Some(RootCommand::Rag {
                 command: RagCommand::Add { paths, dry_run: false }
             }) if paths.len() == 2
@@ -296,7 +301,7 @@ mod tests {
         ])
         .expect("embedding configuration should parse");
         assert!(matches!(
-            cli.rag,
+            cli.command,
             Some(RootCommand::Rag {
                 command: RagCommand::Embeddings {
                     command: EmbeddingsCommand::Set { model, api_key_env, .. }

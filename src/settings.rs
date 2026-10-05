@@ -88,7 +88,15 @@ impl fmt::Display for CompletionCondition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
+    // Connection identity is persisted only for agent definitions. Chat serializers
+    // omit it; in a live chat it is a snapshot of the application selection.
     model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    llm_profile_id: Option<String>,
+    #[serde(skip)]
+    resolved_profile: Option<crate::llm::LlmProfile>,
+    #[serde(skip)]
+    model_profiles: Vec<crate::llm::LlmProfile>,
     response_format_enabled: bool,
     max_tokens: u32,
     #[cfg(test)]
@@ -109,6 +117,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             model: DEFAULT_MODEL.to_owned(),
+            llm_profile_id: None,
+            resolved_profile: None,
+            model_profiles: Vec::new(),
             response_format_enabled: false,
             max_tokens: DEFAULT_MAX_TOKENS,
             #[cfg(test)]
@@ -134,6 +145,48 @@ impl Settings {
             max_tokens,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn model_label(model: &str) -> String {
+        MODEL_OPTIONS
+            .iter()
+            .find(|option| option.name == model)
+            .map_or_else(|| model.into(), |option| option.label())
+    }
+
+    pub(crate) fn model_names() -> Vec<&'static str> {
+        MODEL_OPTIONS.iter().map(|model| model.name).collect()
+    }
+
+    pub(crate) fn profile_id(&self) -> Option<&str> {
+        self.llm_profile_id.as_deref()
+    }
+    pub(crate) fn profile(&self) -> Option<&crate::llm::LlmProfile> {
+        self.resolved_profile.as_ref()
+    }
+    pub(crate) fn apply_profile(&mut self, profile: crate::llm::LlmProfile) {
+        self.model = profile.model.clone();
+        self.llm_profile_id = Some(profile.id.clone());
+        self.resolved_profile = Some(profile);
+    }
+    pub(crate) fn set_model_profiles(&mut self, profiles: Vec<crate::llm::LlmProfile>) {
+        self.model_profiles = profiles;
+    }
+    pub(crate) fn available_models(&self) -> Vec<String> {
+        if self.model_profiles.is_empty() {
+            Self::model_items()
+        } else {
+            self.model_profiles
+                .iter()
+                .map(crate::llm::LlmProfile::label)
+                .collect()
+        }
+    }
+    pub(crate) fn llm_label(&self) -> String {
+        self.profile().map_or_else(
+            || self.model.clone(),
+            |profile| format!("{} · {}", profile.id, profile.model),
+        )
     }
 
     pub(crate) fn model(&self) -> &str {
@@ -199,7 +252,10 @@ impl Settings {
         if self.test_context_tokens != 0 {
             return self.test_context_tokens;
         }
-        crate::config::model_context_tokens(self.model()).unwrap_or(0)
+        self.profile().map_or_else(
+            || crate::config::model_context_tokens(self.model()).unwrap_or(0),
+            |profile| profile.context_tokens,
+        )
     }
 
     pub(crate) fn temperature(&self) -> f32 {
@@ -267,7 +323,7 @@ impl Settings {
 
     pub(crate) fn menu_items(&self) -> Vec<String> {
         vec![
-            format!("Модель: {}", self.model),
+            format!("Общая LLM: {}", self.llm_label()),
             format!(
                 "Structured Output: {}",
                 if self.response_format_enabled {
@@ -303,14 +359,19 @@ impl Settings {
             .collect()
     }
 
-    pub(crate) fn model_index(&self) -> usize {
-        MODEL_OPTIONS
-            .iter()
-            .position(|model| model.name == self.model)
-            .unwrap_or(0)
-    }
-
     pub(crate) fn select_model(&mut self, choice: usize) -> bool {
+        if !self.model_profiles.is_empty() {
+            let Some(profile) = self.model_profiles.get(choice).cloned() else {
+                return false;
+            };
+            if self.profile_id() == Some(&profile.id) {
+                return false;
+            }
+            self.apply_profile(profile);
+            return true;
+        }
+        self.llm_profile_id = None;
+        self.resolved_profile = None;
         let Some(model) = MODEL_OPTIONS.get(choice) else {
             return false;
         };
@@ -431,7 +492,7 @@ impl Settings {
     }
 
     fn configure_model<I: LineInput>(&mut self, input: &mut I) -> io::Result<()> {
-        let items = Self::model_items();
+        let items = self.available_models();
         let Some(choice) = input.select("Модель — Esc: назад", &items)? else {
             return Ok(());
         };
@@ -727,6 +788,35 @@ fn read_non_empty<I: LineInput, W: Write>(
     } else {
         Ok(Some(value))
     }
+}
+
+pub(crate) fn chat_settings_value(
+    settings: &Settings,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(settings)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("model");
+        object.remove("llm_profile_id");
+    }
+    Ok(value)
+}
+pub(crate) fn serialize_chat_settings<S: serde::Serializer>(
+    settings: &Settings,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    chat_settings_value(settings)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+pub(crate) fn deserialize_chat_settings<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Settings, D::Error> {
+    let mut value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("model");
+        object.remove("llm_profile_id");
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]

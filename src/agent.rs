@@ -40,6 +40,7 @@ pub(crate) struct SystemPromptRequest {
     pub(crate) instructions: String,
     pub(crate) request: String,
     pub(crate) model: String,
+    pub(crate) profile: Option<crate::llm::LlmProfile>,
 }
 
 #[derive(Clone)]
@@ -254,7 +255,12 @@ impl Agent {
         request: &AgentRequest,
         target: usize,
     ) -> Result<crate::summary::ConversationSummary, AgentError> {
-        crate::summary::summarize(&self.client, request, target).await
+        crate::summary::summarize(
+            &self.client.with_settings(&request.settings),
+            request,
+            target,
+        )
+        .await
     }
 
     pub(crate) async fn generate_system_prompt(
@@ -270,7 +276,11 @@ impl Agent {
             ApiMessage::text("system", "Составь system prompt для LLM-агента на русском языке по данным пользователя. Верни только готовую системную инструкцию от 1 до 8000 символов, без вступления и обрамляющего блока кода. Определи роль, задачи, порядок работы, формат результата и поведение при недостатке данных. Сохраняй полезную структуру и переносы строк. Учитывай ручное описание и пожелания пользователя, не выдумывай доступ к внешним инструментам. Не выполняй подзадачу агента сам: создай инструкцию для её выполнения."),
             ApiMessage::text("user", json!({"name":request.name,"handle":request.handle,"description":request.description,"system_prompt":request.instructions,"request":request.request}).to_string()),
         ];
-        let answer = self.client.complete_text(&messages, &request.model).await?;
+        let client = request.profile.as_ref().map_or_else(
+            || self.client.clone(),
+            |profile| self.client.with_profile(profile),
+        );
+        let answer = client.complete_text(&messages, &request.model).await?;
         let prompt = answer.content.trim().to_owned();
         if answer.truncated || prompt.chars().count() > 8000 {
             return Err(AgentError::InvalidRequest("LLM вернула слишком длинный или обрезанный system prompt. Уточните запрос и попробуйте ещё раз".into()));
@@ -279,6 +289,36 @@ impl Agent {
     }
 
     pub(crate) async fn respond_streaming<F>(
+        &self,
+        mut request: AgentRequest,
+        on_event: F,
+    ) -> Result<AgentAnswer, AgentError>
+    where
+        F: FnMut(AgentEvent) -> io::Result<()>,
+    {
+        if request.settings.profile().is_none()
+            && let Some(profile) = self.client.profile()
+        {
+            request.settings.apply_profile(profile.clone());
+        }
+        let scoped = Self {
+            client: self.client.with_settings(&request.settings),
+        };
+        if request.settings.profile().is_some() {
+            for definition in &mut request.agents {
+                if definition.settings.profile().is_none() {
+                    definition
+                        .settings
+                        .apply_profile(crate::llm::LlmProfile::neuraldeep(
+                            definition.settings.model(),
+                        ));
+                }
+            }
+        }
+        scoped.respond_inner(request, on_event).await
+    }
+
+    async fn respond_inner<F>(
         &self,
         mut request: AgentRequest,
         mut on_event: F,
@@ -303,7 +343,8 @@ impl Agent {
                 std::env::var("NEURALDEEP_API_KEY").ok(),
                 crate::config::DEFAULT_BASE_URL.into(),
             )
-            .map_err(|e| AgentError::InvalidRequest(e.to_string()))?;
+            .map_err(|e| AgentError::InvalidRequest(e.to_string()))?
+            .with_generation_profile(request.settings.profile());
             request = crate::rag_chat::prepare(&self.client, &service, request)
                 .await
                 .map_err(|e| AgentError::InvalidRequest(e.to_string()))?
@@ -336,9 +377,14 @@ impl Agent {
         let explicit = explicit_handles(&request.question, &request.agents)?;
         let wants_tools =
             !request.agents.is_empty() || request.mcp_servers.iter().any(|server| server.enabled);
-        if wants_tools && !supports_tools(request.settings.model()) {
+        if wants_tools
+            && !request.settings.profile().map_or_else(
+                || crate::config::model_supports_tools(request.settings.model()),
+                |profile| profile.tools,
+            )
+        {
             return Err(AgentError::InvalidRequest(format!(
-                "Модель {} не заявлена как tools-совместимая. Выберите qwen3.8-27b, qwen3.6-35b-a3b, gpt-oss-120b или gemma-4-31b в /settings",
+                "Модель {} не заявлена как tools-совместимая. Выберите профиль с поддержкой tools в /settings или проверьте возможности локальной модели",
                 request.settings.model()
             )));
         }
@@ -431,6 +477,11 @@ impl Agent {
                     )
                     .await?;
                 calls.push(CallUsage {
+                    provider: request
+                        .settings
+                        .profile()
+                        .map(|profile| profile.provider.clone()),
+                    profile_id: request.settings.profile().map(|profile| profile.id.clone()),
                     context: Some(turn.context),
                     model: request.settings.model().into(),
                     usage: turn.usage,
@@ -518,6 +569,11 @@ impl Agent {
                         )
                         .await?;
                     calls.push(CallUsage {
+                        provider: request
+                            .settings
+                            .profile()
+                            .map(|profile| profile.provider.clone()),
+                        profile_id: request.settings.profile().map(|profile| profile.id.clone()),
                         model: request.settings.model().into(),
                         usage: update.usage,
                         context: None,
@@ -604,6 +660,11 @@ impl Agent {
                 AgentError::InvalidRequest("Таймаут строгого RAG-ответа (120 секунд)".into())
             })??;
             calls.push(CallUsage {
+                provider: request
+                    .settings
+                    .profile()
+                    .map(|profile| profile.provider.clone()),
+                profile_id: request.settings.profile().map(|profile| profile.id.clone()),
                 model: request.settings.model().into(),
                 usage: answer.usage,
                 context: None,
@@ -801,6 +862,11 @@ impl Agent {
             .complete_text(&repair_messages, request.settings.model())
             .await?;
         calls.push(CallUsage {
+            provider: request
+                .settings
+                .profile()
+                .map(|profile| profile.provider.clone()),
+            profile_id: request.settings.profile().map(|profile| profile.id.clone()),
             model: request.settings.model().into(),
             usage: repaired.usage,
             context: None,
@@ -859,6 +925,11 @@ impl Agent {
                 )
                 .await?;
             calls.push(CallUsage {
+                provider: request
+                    .settings
+                    .profile()
+                    .map(|profile| profile.provider.clone()),
+                profile_id: request.settings.profile().map(|profile| profile.id.clone()),
                 model: request.settings.model().into(),
                 usage: result.usage,
                 context: None,
@@ -932,6 +1003,11 @@ impl Agent {
         Ok((
             facts,
             CallUsage {
+                provider: request
+                    .settings
+                    .profile()
+                    .map(|profile| profile.provider.clone()),
+                profile_id: request.settings.profile().map(|profile| profile.id.clone()),
                 model: request.settings.model().into(),
                 usage: answer.usage,
                 context: None,
@@ -1025,6 +1101,14 @@ impl Agent {
                     )
                     .await;
                 let call_usage = CallUsage {
+                    provider: definition
+                        .settings
+                        .profile()
+                        .map(|profile| profile.provider.clone()),
+                    profile_id: definition
+                        .settings
+                        .profile()
+                        .map(|profile| profile.id.clone()),
                     context: turn.as_ref().ok().map(|turn| turn.context),
                     model: definition.settings.model().into(),
                     usage: turn.as_ref().ok().and_then(|turn| turn.usage),
@@ -1074,13 +1158,6 @@ impl Agent {
         }
         Ok(results.into_iter().flatten().collect())
     }
-}
-
-fn supports_tools(model: &str) -> bool {
-    matches!(
-        model,
-        "gpt-oss-120b" | "qwen3.8-27b" | "qwen3.6-35b-a3b" | "gemma-4-31b"
-    )
 }
 
 fn explicit_handles(question: &str, agents: &[AgentDefinition]) -> Result<Vec<String>, AgentError> {

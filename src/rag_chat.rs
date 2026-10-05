@@ -199,7 +199,9 @@ async fn prepare_state_with_timeout(
         .map_err(|_| RagError::Api("Таймаут подготовки памяти диалога".into()))?
         .map_err(|e| RagError::Api(format!("Подготовка памяти диалога: {e}")))?;
         calls.push(CallUsage {
-            model: config::DEFAULT_MODEL.into(),
+            provider: client.profile().map(|profile| profile.provider.clone()),
+            profile_id: client.profile().map(|profile| profile.id.clone()),
+            model: client.default_model().into(),
             usage: answer.usage,
             context: None,
         });
@@ -295,7 +297,9 @@ pub(crate) async fn check_support(
         },"required":["supported","unsupported_claims"]})), config::RAG_CHAT_SUPPORT_TOKENS)).await
         .map_err(|_| AgentError::InvalidRequest("Таймаут проверки подтверждения цитатами".into()))??;
     calls.push(CallUsage {
-        model: config::DEFAULT_MODEL.into(),
+        provider: client.profile().map(|profile| profile.provider.clone()),
+        profile_id: client.profile().map(|profile| profile.id.clone()),
+        model: client.default_model().into(),
         usage: response.usage,
         context: None,
     });

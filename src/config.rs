@@ -42,6 +42,13 @@ pub(crate) fn model_context_tokens(model: &str) -> Option<u32> {
     }
 }
 
+pub(crate) fn model_supports_tools(model: &str) -> bool {
+    matches!(
+        model,
+        "gpt-oss-120b" | "qwen3.8-27b" | "qwen3.6-35b-a3b" | "gemma-4-31b"
+    )
+}
+
 #[derive(Debug)]
 pub(crate) struct Config {
     pub(crate) api_key: String,

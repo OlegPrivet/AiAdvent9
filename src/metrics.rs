@@ -42,6 +42,10 @@ impl TokenUsage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CallUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<crate::llm::Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) context: Option<crate::context::ContextReport>,
     pub(crate) model: String,
     pub(crate) usage: Option<TokenUsage>,
@@ -49,6 +53,10 @@ pub(crate) struct CallUsage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ResponseMetrics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<crate::llm::Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile_id: Option<String>,
     #[serde(default)]
     pub(crate) is_summary: bool,
     pub(crate) model: String,
@@ -74,6 +82,8 @@ impl ResponseMetrics {
         let model = model.into();
         let estimate = usage.and_then(|usage| prices.estimate(&model, usage));
         Self {
+            provider: None,
+            profile_id: None,
             is_summary: false,
             model,
             elapsed_ms,
@@ -92,7 +102,14 @@ impl ResponseMetrics {
                 .calls
                 .iter()
                 .try_fold((0_u64, false), |(cost, premium), call| {
-                    let estimate = prices.estimate(&call.model, call.usage?)?;
+                    let estimate = if call.provider == Some(crate::llm::Provider::Local) {
+                        crate::pricing::CostEstimate {
+                            microrubles: 0,
+                            premium: false,
+                        }
+                    } else {
+                        prices.estimate(&call.model, call.usage?)?
+                    };
                     Some((
                         cost.saturating_add(estimate.microrubles),
                         premium || estimate.premium,
@@ -100,6 +117,11 @@ impl ResponseMetrics {
                 });
             self.estimated_cost_microrubles = total.map(|(cost, _)| cost);
             self.premium = total.map(|(_, premium)| premium);
+            return;
+        }
+        if self.provider == Some(crate::llm::Provider::Local) {
+            self.estimated_cost_microrubles = Some(0);
+            self.premium = Some(false);
             return;
         }
         let estimate = self
@@ -130,6 +152,10 @@ impl ResponseMetrics {
                 Some(total)
             });
         let mut metrics = Self::new(model, elapsed_ms, usage, prices);
+        if let Some(call) = calls.iter().rev().find(|call| call.model == model) {
+            metrics.provider = call.provider.clone();
+            metrics.profile_id = call.profile_id.clone();
+        }
         metrics.calls = calls;
         metrics.refresh_cost(prices);
         metrics
@@ -189,7 +215,19 @@ pub(crate) fn metric_lines(metrics: Option<&ResponseMetrics>) -> [String; 5] {
         .map_or(metrics.model.as_str(), |call| call.model.as_str());
     let context = usage.map_or_else(
         || "нет данных API".into(),
-        |usage| match crate::config::model_context_tokens(model) {
+        |usage| match metrics
+            .calls
+            .last()
+            .and_then(|call| {
+                let limit = call.context.map(|context| context.limit);
+                if call.provider.is_some() {
+                    limit
+                } else {
+                    crate::config::model_context_tokens(&call.model).or(limit)
+                }
+            })
+            .or_else(|| crate::config::model_context_tokens(model))
+        {
             Some(limit) => {
                 let percent = usage.total_tokens as f64 * 100.0 / f64::from(limit);
                 format!(
@@ -246,6 +284,8 @@ mod tests {
             "main",
             11130,
             vec![CallUsage {
+                provider: None,
+                profile_id: None,
                 model: "main".into(),
                 usage: Some(TokenUsage {
                     prompt_tokens: 29003,
@@ -267,7 +307,10 @@ mod tests {
         metrics.cumulative_usage = metrics.usage;
         let lines = metric_lines(Some(&metrics));
         assert_eq!(lines[0], "Время суммаризации: 11,13 с");
-        assert_eq!(lines[1], "Контекстное окно: 31 226 / неизвестно токенов");
+        assert_eq!(
+            lines[1],
+            "Контекстное окно: 31 226 / 200 000 токенов (15,6%)"
+        );
         assert_eq!(lines[2], "Выход последнего вызова: 2 223 токенов");
         assert_eq!(
             lines[3],
@@ -291,6 +334,8 @@ mod tests {
             0,
             vec![
                 CallUsage {
+                    provider: None,
+                    profile_id: None,
                     model: "child".into(),
                     context: None,
                     usage: Some(TokenUsage {
@@ -299,6 +344,8 @@ mod tests {
                     }),
                 },
                 CallUsage {
+                    provider: None,
+                    profile_id: None,
                     model: "main".into(),
                     context: Some(report),
                     usage: Some(TokenUsage {
@@ -313,7 +360,7 @@ mod tests {
         );
         assert_eq!(
             metric_lines(Some(&metrics))[1],
-            "Контекстное окно: 300 / неизвестно токенов"
+            "Контекстное окно: 300 / 200 000 токенов (0,1%)"
         );
         metrics.calls[1].model = "deepseek-v4-flash".into();
         assert_eq!(
@@ -333,6 +380,8 @@ mod tests {
             "main",
             0,
             vec![CallUsage {
+                provider: None,
+                profile_id: None,
                 model: "main".into(),
                 usage: None,
                 context: Some(crate::context::ContextReport {
@@ -384,11 +433,15 @@ mod tests {
         };
         let calls = vec![
             CallUsage {
+                provider: None,
+                profile_id: None,
                 context: None,
                 model: "main".into(),
                 usage: Some(usage),
             },
             CallUsage {
+                provider: None,
+                profile_id: None,
                 context: None,
                 model: "child".into(),
                 usage: Some(usage),

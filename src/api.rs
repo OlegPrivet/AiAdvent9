@@ -55,6 +55,9 @@ pub(crate) struct NeuralDeepClient {
     http: Client,
     api_key: String,
     base_url: String,
+    profile: Option<crate::llm::LlmProfile>,
+    neuraldeep_base_url: String,
+    neuraldeep_api_key: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -100,6 +103,46 @@ pub(crate) enum ApiError {
 }
 
 impl NeuralDeepClient {
+    pub(crate) fn with_profile(&self, profile: &crate::llm::LlmProfile) -> Self {
+        let mut client = self.clone();
+        client.base_url = profile.base_url.clone();
+        if profile.provider == crate::llm::Provider::Local {
+            client.api_key.clear();
+        } else {
+            client.api_key = self.neuraldeep_api_key.clone();
+            if profile.base_url == crate::config::DEFAULT_BASE_URL {
+                client.base_url = self.neuraldeep_base_url.clone();
+            }
+            if client.api_key.is_empty()
+                && let Ok(config) = crate::config::Config::from_env()
+            {
+                client.api_key = config.api_key;
+                if self.neuraldeep_base_url == crate::config::DEFAULT_BASE_URL
+                    && profile.base_url == crate::config::DEFAULT_BASE_URL
+                {
+                    client.base_url = config.base_url;
+                }
+            }
+        }
+        client.profile = Some(profile.clone());
+        client
+    }
+    pub(crate) fn with_settings(&self, settings: &Settings) -> Self {
+        settings
+            .profile()
+            .map_or_else(|| self.clone(), |profile| self.with_profile(profile))
+    }
+    pub(crate) fn default_model(&self) -> &str {
+        self.profile
+            .as_ref()
+            .map_or(crate::config::DEFAULT_MODEL, |profile| {
+                profile.model.as_str()
+            })
+    }
+    pub(crate) fn profile(&self) -> Option<&crate::llm::LlmProfile> {
+        self.profile.as_ref()
+    }
+
     pub(crate) fn new(api_key: String, base_url: String) -> Result<Self, ApiError> {
         let http = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
@@ -108,8 +151,11 @@ impl NeuralDeepClient {
 
         Ok(Self {
             http,
+            neuraldeep_api_key: api_key.clone(),
+            neuraldeep_base_url: base_url.trim_end_matches('/').into(),
             api_key,
             base_url: base_url.trim_end_matches('/').to_owned(),
+            profile: None,
         })
     }
 
@@ -145,6 +191,7 @@ impl NeuralDeepClient {
             "chat_template_kwargs":{"enable_thinking":false},
             "response_format":crate::rag_answer::schema()});
         let response = self
+            .with_settings(settings)
             .post(&body)
             .await?
             .json::<ChatResponse>()
@@ -174,7 +221,7 @@ impl NeuralDeepClient {
     ) -> Result<ApiAnswer, ApiError> {
         self.complete_auxiliary(
             messages,
-            crate::config::DEFAULT_MODEL,
+            self.default_model(),
             Some(response_format),
             max_tokens,
             0.0,
@@ -187,14 +234,8 @@ impl NeuralDeepClient {
         messages: &[ApiMessage],
         max_tokens: u32,
     ) -> Result<ApiAnswer, ApiError> {
-        self.complete_auxiliary(
-            messages,
-            crate::config::DEFAULT_MODEL,
-            None,
-            max_tokens,
-            0.0,
-        )
-        .await
+        self.complete_auxiliary(messages, self.default_model(), None, max_tokens, 0.0)
+            .await
     }
 
     async fn complete_auxiliary(
@@ -332,7 +373,7 @@ impl NeuralDeepClient {
         if let Some(stop) = settings.stop_sequence() {
             request["stop"] = json!(stop);
         }
-        let mut response = self.post(&request).await?;
+        let mut response = self.with_settings(settings).post(&request).await?;
         let mut decoder = SseDecoder::default();
         let mut content = String::new();
         let mut finish_reason = None;
@@ -366,7 +407,7 @@ impl NeuralDeepClient {
                 Ok(None) if received_events == 0 && !retried => {
                     retried = true;
                     tokio::time::sleep(STREAM_RETRY_DELAY).await;
-                    response = self.post(&request).await?;
+                    response = self.with_settings(settings).post(&request).await?;
                     decoder = SseDecoder::default();
                     received_bytes = 0;
                 }
@@ -374,7 +415,7 @@ impl NeuralDeepClient {
                 Err(_) if received_events == 0 && !retried => {
                     retried = true;
                     tokio::time::sleep(STREAM_RETRY_DELAY).await;
-                    response = self.post(&request).await?;
+                    response = self.with_settings(settings).post(&request).await?;
                     decoder = SseDecoder::default();
                     received_bytes = 0;
                 }
@@ -417,7 +458,19 @@ impl NeuralDeepClient {
             });
         }
 
-        let tool_calls = tool_calls.into_values().collect::<Vec<_>>();
+        let mut tool_calls = tool_calls.into_values().collect::<Vec<_>>();
+        if settings.profile().is_some_and(|profile| {
+            profile.provider == crate::llm::Provider::Local && profile.model.contains("granite3.3")
+        }) {
+            for call in &mut tool_calls {
+                if let Ok(value) = serde_json::from_str::<Value>(&call.function.arguments)
+                    && value["function"].as_str() == Some(call.function.name.as_str())
+                    && value["arguments"].is_object()
+                {
+                    call.function.arguments = value["arguments"].to_string();
+                }
+            }
+        }
         let mut ids = std::collections::HashSet::new();
         for call in &tool_calls {
             if call.id.is_empty()
@@ -503,23 +556,55 @@ impl NeuralDeepClient {
             }),
         };
 
-        self.post(&request).await
+        self.with_settings(settings).post(&request).await
     }
 
     async fn post(&self, request: &impl Serialize) -> Result<Response, ApiError> {
-        let response = self
+        let mut body: Value = serde_json::from_slice(
+            &serde_json::to_vec(request).map_err(|e| ApiError::InvalidJson(e.to_string()))?,
+        )
+        .map_err(|e| ApiError::InvalidJson(e.to_string()))?;
+        if let Some(profile) = &self.profile {
+            body["model"] = json!(profile.model);
+            if body.get("tools").is_some() && !profile.tools {
+                return Err(ApiError::Request(format!(
+                    "LLM {} не поддерживает tools",
+                    profile.id
+                )));
+            }
+            if body
+                .get("response_format")
+                .is_some_and(|value| !value.is_null())
+                && !profile.json_schema
+            {
+                return Err(ApiError::Request(format!(
+                    "LLM {} не поддерживает JSON Schema",
+                    profile.id
+                )));
+            }
+            if profile.provider == crate::llm::Provider::Local {
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("chat_template_kwargs");
+                }
+            } else if self.api_key.trim().is_empty() {
+                return Err(ApiError::Request(
+                    "Для NeuralDeep нужен NEURALDEEP_API_KEY".into(),
+                ));
+            }
+        }
+        let mut request = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|error| {
-                ApiError::Request(format!(
-                    "соединение или отправка запроса: {}",
-                    describe_reqwest_error(&error)
-                ))
-            })?;
+            .json(&body);
+        if !self.api_key.is_empty() {
+            request = request.bearer_auth(&self.api_key);
+        }
+        let response = request.send().await.map_err(|error| {
+            ApiError::Request(format!(
+                "соединение или отправка запроса: {}",
+                describe_reqwest_error(&error)
+            ))
+        })?;
 
         let status = response.status();
         if !status.is_success() {

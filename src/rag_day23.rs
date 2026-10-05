@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::agent::AgentRequest;
 use crate::api::{ApiMessage, NeuralDeepClient};
 use crate::chat::Chat;
+#[cfg(test)]
 use crate::config::DEFAULT_MODEL;
 use crate::rag::{Hit, RagError, RagService};
 use crate::rag_chunk::Strategy;
@@ -408,9 +409,10 @@ pub(crate) async fn evaluate(
         }
     }
     let client = service.auxiliary_client()?;
+    let default_model = client.default_model();
     let initial_fingerprint = fingerprint(service)?;
     let mut report = format!(
-        "# День 23 — фильтрация, reranker и query rewrite\n\nОтветы/rewrite/судья: `{DEFAULT_MODEL}`. Reranker: `{}`. Эмбеддинги: `{}`. Endpoint эмбеддингов: `{}`. Стратегия: structure. Top-K: 12 → 4. Бюджет: 6000 символов.\n\nFingerprint корпуса: `{initial_fingerprint}`. Набор: `{}` (SHA256 `{}`). Источники: {}. Проверка: {} вопросов; настройка: {}. Время запуска Unix: {}.\n\nВсе ответы получены в новых пустых чатах с температурой 0 и одинаковыми настройками, обычными непотоковыми запросами. Судья не получает названия режимов и оценки поиска. Та же модель используется для ответов и оценки: оценки требуют ручной проверки. Список источников приложения не считается ссылкой модели. Ошибки судьи исключены из средних.\n\n",
+        "# День 23 — фильтрация, reranker и query rewrite\n\nОтветы/rewrite/судья: `{default_model}`. Reranker: `{}`. Эмбеддинги: `{}`. Endpoint эмбеддингов: `{}`. Стратегия: structure. Top-K: 12 → 4. Бюджет: 6000 символов.\n\nFingerprint корпуса: `{initial_fingerprint}`. Набор: `{}` (SHA256 `{}`). Источники: {}. Проверка: {} вопросов; настройка: {}. Время запуска Unix: {}.\n\nВсе ответы получены в новых пустых чатах с температурой 0 и одинаковыми настройками, обычными непотоковыми запросами. Судья не получает названия режимов и оценки поиска. Та же модель используется для ответов и оценки: оценки требуют ручной проверки. Список источников приложения не считается ссылкой модели. Ошибки судьи исключены из средних.\n\n",
         crate::config::RAG_RERANK_MODEL,
         service.embedding_config().model,
         service.embedding_config().url,
@@ -573,7 +575,9 @@ pub(crate) async fn evaluate(
             report.push_str(&format!("\nВремя генерации: {answer_ms} мс. Время поиска с rewrite и вторым этапом: {} мс.\n\n**Token usage (только возвращённые API данные):**\n\n",retrieval.rewrite_ms+retrieval.search_ms+retrieval.filter_ms));
             let mut calls = retrieval.calls.clone();
             calls.push(crate::metrics::CallUsage {
-                model: DEFAULT_MODEL.into(),
+                provider: client.profile().map(|profile| profile.provider.clone()),
+                profile_id: client.profile().map(|profile| profile.id.clone()),
+                model: client.default_model().into(),
                 usage: answer.usage,
                 context: None,
             });

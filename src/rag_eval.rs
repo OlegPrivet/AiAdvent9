@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::agent::{Agent, AgentRequest};
+#[cfg(test)]
 use crate::api::NeuralDeepClient;
 use crate::chat::Chat;
-use crate::config::{Config, DEFAULT_MODEL};
+
 use crate::rag::{Hit, RagError, RagService};
 use crate::rag_chunk::Strategy;
 
@@ -59,12 +60,11 @@ pub(crate) async fn evaluate(service: &RagService, path: &Path) -> Result<String
             }
         }
     }
-    let config = Config::from_env().map_err(|error| RagError::Document(error.to_string()))?;
-    let client = NeuralDeepClient::new(config.api_key, config.base_url)
-        .map_err(|error| RagError::Api(error.to_string()))?;
+    let client = service.auxiliary_client()?;
+    let default_model = client.default_model().to_owned();
     let agent = Agent::new(client);
     let mut report = format!(
-        "# День 22 — сравнение ответов с RAG и без RAG\n\nМодель ответа: `{DEFAULT_MODEL}`. Эмбеддинги: `{}`. Стратегия: `structure`. Источников в индексе: {}. Вопросов: {}.\n\nКаждый ответ получен в новом пустом чате с одинаковыми настройками модели. Порядок: сначала без RAG, затем с RAG. Оцените каждый ответ по ожиданию: 0 — неверно, 1 — частично, 2 — полностью. Для RAG отдельно проверьте, что нужный источник попал в найденные фрагменты и модель сослалась на его номер `[n]`. Список «Найденные источники» сам по себе не является ссылкой модели.\n",
+        "# День 22 — сравнение ответов с RAG и без RAG\n\nМодель ответа: `{default_model}`. Эмбеддинги: `{}`. Стратегия: `structure`. Источников в индексе: {}. Вопросов: {}.\n\nКаждый ответ получен в новом пустом чате с одинаковыми настройками модели. Порядок: сначала без RAG, затем с RAG. Оцените каждый ответ по ожиданию: 0 — неверно, 1 — частично, 2 — полностью. Для RAG отдельно проверьте, что нужный источник попал в найденные фрагменты и модель сослалась на его номер `[n]`. Список «Найденные источники» сам по себе не является ссылкой модели.\n",
         service.embedding_config().model,
         stats.sources,
         cases.len()

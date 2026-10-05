@@ -19,6 +19,17 @@ pub(crate) struct MockServer {
 
 impl MockServer {
     pub(crate) fn new(handler: impl Fn(&Value) -> (u16, String) + Send + Sync + 'static) -> Self {
+        Self::with_auth(handler, true)
+    }
+    pub(crate) fn new_local(
+        handler: impl Fn(&Value) -> (u16, String) + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_auth(handler, false)
+    }
+    fn with_auth(
+        handler: impl Fn(&Value) -> (u16, String) + Send + Sync + 'static,
+        auth: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
         let url = format!("http://{}", listener.local_addr().expect("address"));
         listener.set_nonblocking(true).expect("nonblocking");
@@ -40,7 +51,7 @@ impl MockServer {
                         workers.push(thread::spawn(move || {
                             stream.set_read_timeout(Some(Duration::from_secs(5))).expect("read timeout");
                             stream.set_write_timeout(Some(Duration::from_secs(5))).expect("write timeout");
-                            let request = read_request(&mut stream);
+                            let request = read_request_with_auth(&mut stream, auth);
                             captured.lock().expect("requests lock").push(request.clone());
                             let (status, body) = handler(&request);
                             let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
@@ -84,6 +95,9 @@ impl Drop for MockServer {
 }
 
 pub(crate) fn read_request(stream: &mut TcpStream) -> Value {
+    read_request_with_auth(stream, true)
+}
+fn read_request_with_auth(stream: &mut TcpStream, auth: bool) -> Value {
     let mut bytes = Vec::new();
     let mut buffer = [0; 4096];
     loop {
@@ -93,11 +107,18 @@ pub(crate) fn read_request(stream: &mut TcpStream) -> Value {
         if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
             let headers = String::from_utf8_lossy(&bytes[..end]);
             assert!(headers.starts_with("POST /chat/completions HTTP/1.1"));
-            assert!(
-                headers
-                    .to_lowercase()
-                    .contains("authorization: bearer test-key")
-            );
+            if auth {
+                assert!(
+                    headers
+                        .to_lowercase()
+                        .contains("authorization: bearer test-key")
+                );
+            } else {
+                assert!(
+                    !headers.to_lowercase().contains("authorization:"),
+                    "local request leaked credentials"
+                );
+            }
             let length = headers
                 .lines()
                 .find_map(|line| {

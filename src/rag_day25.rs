@@ -309,7 +309,7 @@ pub(crate) async fn evaluate(
         finished: false,
         text: format!(
             "# День 25 — диалог с RAG и памятью\n\nМодель `{}`; strict on; structure; rerank {rerank_threshold:.2}; top-K 20 → 4; temperature 0; max_tokens 10000.\nОкно истории: 4 сообщения; подготовка поиска использует до 12 доступных сообщений и память.\nSHA-256 набора: `{hash}`; fingerprint индекса: `{}`.\n\n## Корпус\n\n",
-            crate::config::DEFAULT_MODEL,
+            client.default_model(),
             service.corpus_fingerprint()?
         ),
     };

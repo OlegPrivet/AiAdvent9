@@ -196,6 +196,14 @@ pub(crate) fn elapsed(start: Instant) -> u64 {
 
 impl RagService {
     pub(crate) fn auxiliary_client(&self) -> Result<NeuralDeepClient, RagError> {
+        if let Some(profile) = &self.generation_profile {
+            return NeuralDeepClient::new(
+                self.api_key.clone().unwrap_or_default(),
+                self.base_url.clone(),
+            )
+            .map(|client| client.with_profile(profile))
+            .map_err(|e| RagError::Api(e.to_string()));
+        }
         let key = self
             .api_key
             .as_deref()
@@ -234,7 +242,9 @@ impl RagService {
         Ok((
             query,
             CallUsage {
-                model: config::DEFAULT_MODEL.into(),
+                provider: client.profile().map(|profile| profile.provider.clone()),
+                profile_id: client.profile().map(|profile| profile.id.clone()),
+                model: client.default_model().into(),
                 usage: answer.usage,
                 context: None,
             },
@@ -398,10 +408,20 @@ pub(crate) async fn context(
     strategy: Strategy,
     options: &RagOptions,
 ) -> Result<RetrievalResult, RagError> {
+    context_with_profile(question, strategy, options, None).await
+}
+
+pub(crate) async fn context_with_profile(
+    question: &str,
+    strategy: Strategy,
+    options: &RagOptions,
+    profile: Option<&crate::llm::LlmProfile>,
+) -> Result<RetrievalResult, RagError> {
     RagService::open(
         std::env::var("NEURALDEEP_API_KEY").ok(),
         config::DEFAULT_BASE_URL.into(),
     )?
+    .with_generation_profile(profile)
     .retrieve(question, strategy, options)
     .await
 }

@@ -376,7 +376,9 @@ fn embedding_set_usage() -> RagError {
 }
 
 pub(crate) async fn run(root: RootCommand) -> Result<(), RagError> {
-    let RootCommand::Rag { command } = root;
+    let RootCommand::Rag { command } = root else {
+        return Err(RagError::Document("Ожидалась команда rag".into()));
+    };
     if let RagCommand::Add {
         paths,
         dry_run: true,

@@ -70,6 +70,7 @@ pub(crate) struct RagService {
     pub(crate) api_key: Option<String>,
     pub(crate) base_url: String,
     embedding: EmbeddingConfig,
+    pub(crate) generation_profile: Option<crate::llm::LlmProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +102,15 @@ pub(crate) struct Stats {
 }
 
 impl RagService {
+    pub(crate) fn with_generation_profile(
+        mut self,
+        profile: Option<&crate::llm::LlmProfile>,
+    ) -> Self {
+        if let Some(profile) = profile {
+            self.generation_profile = Some(profile.clone());
+        }
+        self
+    }
     pub(crate) fn open(api_key: Option<String>, base_url: String) -> Result<Self, RagError> {
         let directory = crate::chat::state_directory().ok_or_else(|| {
             RagError::Document("Не удалось определить каталог состояния agi".into())
@@ -112,6 +122,13 @@ impl RagService {
             api_key,
             base_url: base_url.trim_end_matches('/').to_owned(),
             embedding: EmbeddingConfig::default_for(&base_url),
+            generation_profile: Some(
+                crate::chat::ChatStore::open()
+                    .map_err(|e| RagError::Document(e.to_string()))?
+                    .llms()
+                    .active()
+                    .map_err(|e| RagError::Document(e.to_string()))?,
+            ),
         };
         let mut service = service;
         let connection = service.connection()?;
@@ -126,6 +143,7 @@ impl RagService {
             path,
             api_key,
             embedding: EmbeddingConfig::default_for(&base_url),
+            generation_profile: None,
             base_url,
         };
         let connection = service.connection().expect("test database should open");

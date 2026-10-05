@@ -28,3 +28,8 @@ History is small and uses brief, task-focused subjects (for example, `Day 1: Ð¿Ñ
 ## Security & Configuration
 
 Provide credentials only through `NEURALDEEP_API_KEY`. Never commit API keys, shell exports, or captured authorization headers. Keep service defaults centralized in `src/config.rs` and document intentional API contract changes against `projetcDocs/llm_docs.md`.
+
+
+## User-managed LLM Servers
+
+Connect the user's existing LLM servers through OpenAI-compatible HTTP APIs. Do not download, create, start, or run third-party models independently; model lifecycle is managed by the user unless they explicitly request a specific lifecycle action. Register profiles without contacting their endpoints. Use local mock HTTP servers for automated checks instead of sending prompts to real models.
