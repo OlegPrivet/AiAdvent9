@@ -54,7 +54,7 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     ),
     CommandOption::run("/summarize", "заменить историю резюме", &["/суммаризация"]),
     CommandOption::run("/clear", "начать новый чат без контекста", &["/очистить"]),
-    CommandOption::run("/help", "показать справку", &["/помощь"]),
+    CommandOption::run("/help", "справка; /help <вопрос> — о проекте", &["/помощь"]),
     CommandOption::run("/exit", "сохранить чат и выйти", &["/quit", "/выход"]),
     CommandOption::run("/agents", "глобальный каталог агентов", &["/агенты"]),
     CommandOption::run("/llm", "подключить HTTP API и выбрать общую LLM", &[]),
@@ -568,11 +568,12 @@ fn spawn_request(
         .map_err(|error| AgentError::InvalidRequest(error.to_string()))
         .and_then(|_| store.agents().list().map_err(AgentError::from))
         .and_then(|agents| {
-            let request =
+            let request = crate::project_help::prepare(
                 AgentRequest::new(chat, if manual { String::new() } else { question }, agents)
                     .with_mcp(store.mcp().enabled().map_err(|error| {
                         AgentError::InvalidRequest(format!("Ошибка каталога MCP: {error}"))
-                    })?);
+                    })?),
+            );
             if manual {
                 Ok(request)
             } else {
@@ -623,7 +624,9 @@ fn spawn_request(
                         });
                     }
                     let request = if request.settings.rag_enabled()
-                        && (!request.settings.rag_chat_enabled() || request.task.is_some())
+                        && (request.project_help
+                            || !request.settings.rag_chat_enabled()
+                            || request.task.is_some())
                     {
                         let hits = crate::rag_pipeline::context_with_profile(
                             &request.question,
@@ -1421,6 +1424,15 @@ impl<'a> App<'a> {
         if crate::summary::is_command(&value) {
             return self.begin_question("/summarize".into()).map(Some);
         }
+        if crate::project_help::question(&value).is_some() {
+            if self.pending_question.is_some() {
+                self.notice =
+                    Some("Дождитесь завершения запроса или отмените его через Ctrl+C".into());
+                return Ok(None);
+            }
+            self.scheduled_task = false;
+            return self.begin_question(value).map(Some);
+        }
         if let Some(command) = ParsedCommand::parse(&value) {
             self.set_input("");
             self.handle_command(command);
@@ -1999,7 +2011,10 @@ impl<'a> App<'a> {
                             |summary| summary.report(),
                         ));
                     }
-                    Ok(answer) if self.chat.task().is_some() => {
+                    Ok(answer)
+                        if self.chat.task().is_some()
+                            && crate::project_help::question(&question).is_none() =>
+                    {
                         self.trace_question = None;
                         self.streamed_answer.clear();
                         self.transient_metrics = None;
@@ -2048,7 +2063,9 @@ impl<'a> App<'a> {
                         ));
                         self.streamed_answer.clear();
                         self.notice = Some(format!("Ошибка запроса: {error}"));
-                        if self.chat.task().is_some() {
+                        if self.chat.task().is_some()
+                            && crate::project_help::question(&question).is_none()
+                        {
                             self.pause_task(&error.to_string());
                         }
                     }
@@ -2099,6 +2116,11 @@ impl<'a> App<'a> {
     }
 
     fn cancel_request(&mut self) {
+        let project_help = self
+            .pending_question
+            .as_deref()
+            .and_then(crate::project_help::question)
+            .is_some();
         self.scheduled_task = false;
         self.request_id = Uuid::new_v4();
         let elapsed_ms = self
@@ -2114,7 +2136,7 @@ impl<'a> App<'a> {
         self.streamed_answer.clear();
         self.transient_metrics = Some(ResponseMetrics::new(model, elapsed_ms, None, &self.prices));
         self.notice = Some("Запрос отменён".to_owned());
-        if self.chat.task().is_some() {
+        if self.chat.task().is_some() && !project_help {
             self.pause_task("Остановлено пользователем");
         }
     }
@@ -3261,6 +3283,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
         Modal::Mcp(mcp) => mcp.render(frame, area),
         Modal::Help => {
             let help = [
+                "/help <вопрос>          о проекте; RAG согласно /rag on|off",
                 "/chat, /чаты             выбрать сохранённый чат",
                 "/restore <UUID>          восстановить чат",
                 "/settings, /настройки   настройки текущего чата",
@@ -3507,6 +3530,114 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+
+    #[tokio::test]
+    async fn project_help_worker_preserves_task_on_success_and_service_error() {
+        for fails in [false, true] {
+            let server = crate::test_http::MockServer::new(move |request| {
+                assert_eq!(
+                    request["messages"].as_array().unwrap().last().unwrap()["content"],
+                    "Где API?"
+                );
+                assert!(request.get("response_format").is_none());
+                if fails {
+                    (503, "{\"detail\":\"offline\"}".into())
+                } else {
+                    crate::test_http::text_response("Ответ о проекте")
+                }
+            });
+            let client = Agent::new(
+                crate::api::NeuralDeepClient::new("test-key".into(), server.url.clone()).unwrap(),
+            );
+            let directory = TestDirectory::new();
+            let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+            let mut chat = Chat::new();
+            crate::llm::sync_chat(&store, &mut chat).unwrap();
+            let task = crate::task::TaskState::new("Текущая задача").unwrap();
+            chat.set_task(task.clone());
+            store.save(&mut chat).unwrap();
+            let settings = serde_json::to_value(chat.settings()).unwrap();
+            let mut app = App::with_history(
+                &store,
+                &mut chat,
+                EditMode::Emacs,
+                CommandHistory::default(),
+            );
+            app.set_input("/help");
+            assert!(app.take_question().unwrap().is_none());
+            assert!(matches!(app.modal.take(), Some(Modal::Help)));
+            app.scheduled_task = true;
+            app.set_input("/помощь Где API?");
+            let question = app.take_question().unwrap().unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let worker = spawn_request(&client, &store, app.chat, question, app.request_id, tx);
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let finished = matches!(event, WorkerEvent::Finished(_, _));
+                app.handle_worker_event(event);
+                if finished {
+                    break;
+                }
+            }
+            drop(worker);
+            assert_eq!(app.chat.task(), Some(&task));
+            let database = rusqlite::Connection::open(directory.0.join("chats.sqlite3")).unwrap();
+            let saved: String = database
+                .query_row(
+                    "SELECT task_state_json FROM chats WHERE id=?1",
+                    [app.chat.id().to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<crate::task::TaskState>(&saved).unwrap(),
+                task
+            );
+            assert_eq!(serde_json::to_value(app.chat.settings()).unwrap(), settings);
+            assert!(app.take_scheduled_task().unwrap().is_none());
+            if fails {
+                assert!(app.chat.messages().is_empty());
+                assert!(app.notice.as_deref().unwrap().contains("Ошибка запроса"));
+            } else {
+                assert_eq!(app.chat.messages()[0].content, "/помощь Где API?");
+                assert_eq!(app.chat.messages()[1].content, "Ответ о проекте");
+                assert!(app.chat.last_response_metrics().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn project_help_cancellation_preserves_task_and_ignores_late_answer() {
+        let directory = TestDirectory::new();
+        let store = ChatStore::for_tests(directory.0.clone()).unwrap();
+        let mut chat = Chat::new();
+        let task = crate::task::TaskState::new("Текущая задача").unwrap();
+        chat.set_task(task.clone());
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        app.set_input("/help Где API?");
+        app.take_question().unwrap().unwrap();
+        let id = app.request_id;
+        app.set_input("/help Второй вопрос");
+        assert!(app.take_question().unwrap().is_none());
+        assert_eq!(app.request_id, id);
+        app.cancel_request();
+        app.handle_worker_event(WorkerEvent::Finished(
+            id,
+            Box::new(Err(AgentError::InvalidRequest("Поздняя ошибка".into()))),
+        ));
+        assert_eq!(app.chat.task(), Some(&task));
+        assert!(app.chat.messages().is_empty());
+        assert_eq!(app.notice.as_deref(), Some("Запрос отменён"));
+        assert!(app.take_scheduled_task().unwrap().is_none());
+    }
 
     #[test]
     fn llm_form_accepts_paste_updates_global_model_and_preserves_chat_history() {

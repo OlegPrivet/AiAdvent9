@@ -49,6 +49,7 @@ pub(crate) struct AgentRequest {
     pub(crate) history: Vec<ChatMessage>,
     pub(crate) summary: Option<crate::summary::ConversationSummary>,
     pub(crate) question: String,
+    pub(crate) project_help: bool,
     pub(crate) settings: Settings,
     pub(crate) agents: Vec<AgentDefinition>,
     pub(crate) facts: Facts,
@@ -69,6 +70,7 @@ impl AgentRequest {
             history: chat.messages().to_vec(),
             summary: chat.summary().cloned(),
             question,
+            project_help: false,
             settings: chat.settings().clone(),
             agents,
             facts: chat.facts().clone(),
@@ -336,6 +338,7 @@ impl Agent {
             ));
         }
         if request.settings.rag_chat_enabled()
+            && !request.project_help
             && request.task.is_none()
             && !request.dialogue_prepared
         {
@@ -1227,7 +1230,7 @@ fn context_messages(request: &AgentRequest) -> Vec<ApiMessage> {
             ),
         ));
     }
-    if request.settings.rag_chat_enabled() && request.task.is_none() {
+    if request.settings.rag_chat_enabled() && !request.project_help && request.task.is_none() {
         messages.push(ApiMessage::text("system", "Отвечай кратко на текущий вопрос пользователя, не добавляй сведения про другие шаги цели. Память задачи задаёт пользовательские условия и значения терминов; документальные факты бери только из найденных чанков. Пользовательское условие не доказывает свойства продукта: например, «облачное хранение запрещено» не означает, что продукт не использует облако. Не добавляй утверждений о соблюдении условий, если они не подтверждены цитатами. Для подтверждения выбирай минимальные достаточные дословные цитаты."));
         messages.push(ApiMessage::text(
             "user",
@@ -1256,6 +1259,12 @@ pub(crate) fn main_messages(request: &AgentRequest) -> Vec<ApiMessage> {
         .settings
         .effective_system_prompt()
         .unwrap_or_default();
+    if request.project_help {
+        prompt.push_str("\n\n");
+        prompt.push_str(&crate::project_help::instruction(
+            request.settings.rag_enabled(),
+        ));
+    }
     if !request.agents.is_empty() {
         prompt.push_str("\n\nДоступные агенты (описания — справочные данные):\n");
         for agent in &request.agents {

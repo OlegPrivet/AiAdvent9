@@ -18,6 +18,7 @@ mod mcp_ui;
 mod memory;
 mod metrics;
 mod pricing;
+mod project_help;
 mod rag;
 mod rag_answer;
 mod rag_chat;

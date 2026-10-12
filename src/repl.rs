@@ -66,7 +66,11 @@ pub(crate) async fn run<I: LineInput, W: Write>(
             } else if command.matches(&["/clear", "/очистить"]) {
                 start_new_chat(store, chat, output)?;
             } else if command.matches(&["/help", "/помощь"]) {
-                print_help(output)?;
+                if command.argument.is_some() {
+                    ask(client, store, chat, &line, output, ui, prices).await?;
+                } else {
+                    print_help(output)?;
+                }
             } else if command.matches(&["/llm"]) {
                 if command.argument.is_none() {
                     crate::llm_ui::run(&store.llms(), input, output)?;
@@ -220,6 +224,12 @@ async fn ask<W: Write>(
     prices: &PriceCatalog,
 ) -> io::Result<()> {
     if let Some(command) = ParsedCommand::parse(question)
+        && command.matches(&["/help", "/помощь"])
+        && command.argument.is_none()
+    {
+        return print_help(output);
+    }
+    if let Some(command) = ParsedCommand::parse(question)
         && command.matches(&["/task", "/задача"])
     {
         match crate::task::command(store, chat, command.argument) {
@@ -233,7 +243,7 @@ async fn ask<W: Write>(
         }
         return Ok(());
     }
-    if chat.task().is_some() {
+    if chat.task().is_some() && crate::project_help::question(question).is_none() {
         if let Err(error) = crate::task::prepare_input(store, chat, question) {
             return writeln!(output, "{error}");
         }
@@ -258,12 +268,20 @@ async fn ask<W: Write>(
         Ok(servers) => servers,
         Err(error) => return writeln!(output, "Каталог MCP: {error}\n"),
     };
-    let retrieval = if chat.settings().rag_enabled() && !chat.settings().rag_chat_enabled() {
+    let mut request = crate::project_help::prepare(
+        AgentRequest::new(chat, question.to_owned(), agents)
+            .with_memory(memory)
+            .with_invariants(invariants)
+            .with_mcp(mcp_servers),
+    );
+    let retrieval = if request.settings.rag_enabled()
+        && (request.project_help || !request.settings.rag_chat_enabled())
+    {
         match crate::rag_pipeline::context_with_profile(
-            question,
-            chat.settings().rag_strategy(),
-            chat.settings().rag_options(),
-            chat.settings().profile(),
+            &request.question,
+            request.settings.rag_strategy(),
+            request.settings.rag_options(),
+            request.settings.profile(),
         )
         .await
         {
@@ -273,10 +291,6 @@ async fn ask<W: Write>(
     } else {
         None
     };
-    let mut request = AgentRequest::new(chat, question.to_owned(), agents)
-        .with_memory(memory)
-        .with_invariants(invariants)
-        .with_mcp(mcp_servers);
     if let Some(result) = retrieval {
         request = request.with_retrieval(result);
     }
@@ -906,6 +920,10 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(output, "  /help, /помощь           показать эту справку")?;
     writeln!(
         output,
+        "  /help <вопрос>           спросить о проекте; RAG согласно /rag on|off"
+    )?;
+    writeln!(
+        output,
         "  /exit, /выход            сохранить и завершить работу"
     )?;
     writeln!(output, "\nРедактор строки:")?;
@@ -957,6 +975,82 @@ mod tests {
         let directory = TestDirectory::new();
         let store = ChatStore::for_tests(directory.0.clone()).expect("store should open");
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn project_help_answers_in_chat_without_advancing_task() {
+        let server = crate::test_http::MockServer::new(|request| {
+            assert!(request.get("response_format").is_none());
+            assert!(
+                request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["role"] == "system"
+                        && message["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("RAG выключен"))
+            );
+            crate::test_http::text_response("Ответ о проекте")
+        });
+        let client =
+            Agent::new(NeuralDeepClient::new("test-key".into(), server.url.clone()).unwrap());
+        let (directory, store) = test_store();
+        let mut chat = Chat::new();
+        crate::llm::sync_chat(&store, &mut chat).unwrap();
+        let task = crate::task::TaskState::new("Не выполнять во время справки").unwrap();
+        chat.set_task(task.clone());
+        let settings = serde_json::to_value(chat.settings()).unwrap();
+        let mut input = BufferedInput::new(Cursor::new(
+            "/help\n/help Где API?\n/помощь Где RAG?\n/exit\n",
+        ));
+        let mut output = Vec::new();
+        run(
+            &client,
+            &store,
+            &mut chat,
+            None,
+            &mut input,
+            &mut output,
+            ReplDisplay {
+                ui: &TerminalUi::plain(),
+                prices: &PriceCatalog::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.requests().len(), 2);
+        assert_eq!(
+            server.requests()[0]["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["content"],
+            "Где API?"
+        );
+        assert_eq!(chat.messages()[0].content, "/help Где API?");
+        assert_eq!(chat.messages()[2].content, "/помощь Где RAG?");
+        assert_eq!(chat.task(), Some(&task));
+        let database = rusqlite::Connection::open(directory.0.join("chats.sqlite3")).unwrap();
+        let saved: String = database
+            .query_row(
+                "SELECT task_state_json FROM chats WHERE id=?1",
+                [chat.id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::task::TaskState>(&saved).unwrap(),
+            task
+        );
+        assert_eq!(serde_json::to_value(chat.settings()).unwrap(), settings);
+        assert!(chat.last_response_metrics().is_some());
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Доступные команды:")
+        );
     }
 
     #[tokio::test]
