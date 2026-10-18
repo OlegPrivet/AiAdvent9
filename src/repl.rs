@@ -1389,7 +1389,7 @@ mod tests {
         assert!(output.contains("Доступные команды:"));
         assert!(output.contains("Неизвестная команда: /unknown"));
         assert!(output.contains("Чат не сохранён: нет завершённых ответов"));
-        assert_eq!(chat.settings().max_tokens(), 900);
+        assert_eq!(chat.settings().max_tokens(), Some(900));
     }
 
     #[tokio::test]

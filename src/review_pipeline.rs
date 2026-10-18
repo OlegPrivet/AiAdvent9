@@ -102,17 +102,13 @@ pub(crate) async fn run_with_id(
         run.head.clone_from(&snapshot.head);
         analyze(&mut run, snapshot, &project, &directory, &progress).await
     };
-    let result = tokio::time::timeout(Duration::from_secs(15 * 60), work).await;
+    let result = work.await;
     run.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     match result {
-        Ok(Ok(())) => run.status = "completed".into(),
-        Ok(Err(error)) => {
+        Ok(()) => run.status = "completed".into(),
+        Err(error) => {
             run.status = "failed".into();
             run.error = Some(error.to_string());
-        }
-        Err(_) => {
-            run.status = "failed".into();
-            run.error = Some("Превышен тайм-аут ревью 15 минут".into());
         }
     }
     if !run.markdown.is_empty() {
@@ -243,9 +239,7 @@ pub(crate) async fn analyze(
             ];
             let answer = complete_with_retry(&client, &messages, &run.model.model).await?;
             if answer.truncated {
-                return Err(ReviewError::Invalid(
-                    "LLM обрезала ревью по лимиту ответа; результат неполный".into(),
-                ));
+                return Err(review_length_error("Получен неполный текст ревью"));
             }
             let parsed = parse_sections(&answer.content)?;
             for (section, text) in sections.iter_mut().zip(parsed) {
@@ -270,9 +264,14 @@ async fn complete_with_retry(
     model: &str,
 ) -> Result<crate::api::ApiAnswer> {
     for attempt in 0..3 {
-        match client.complete_text(messages, model).await {
+        match client.complete_review(messages, model).await {
             Ok(answer) => return Ok(answer),
             Err(error) => {
+                if let crate::api::ApiError::MissingContent { finish_reason } = &error
+                    && matches!(finish_reason.as_str(), "length" | "max_tokens")
+                {
+                    return Err(review_length_error(&error.to_string()));
+                }
                 let retry = match &error {
                     crate::api::ApiError::Http { status, .. } => {
                         status.is_server_error() || status.as_u16() == 429
@@ -292,6 +291,16 @@ async fn complete_with_retry(
     }
     Err(ReviewError::Invalid("LLM недоступна".into()))
 }
+
+fn review_length_error(details: &str) -> ReviewError {
+    ReviewError::Invalid(format!(
+        "{details}. Сервер модели исчерпал бюджет генерации; готового ревью нет. \
+         AGI не задаёт max_tokens для ревью. Проверьте лимит генерации и режим размышлений \
+         на сервере модели или выберите другую модель в /llm. Настройки чата /settings \
+         на ревью не влияют"
+    ))
+}
+
 fn prefix(text: &str, limit: usize) -> &str {
     let mut end = text.len().min(limit);
     while !text.is_char_boundary(end) {
@@ -427,6 +436,14 @@ mod http_tests {
     use serde_json::json;
 
     fn server(review: &'static str, status: u16) -> MockServer {
+        server_with_finish(review, status, "stop")
+    }
+
+    fn server_with_finish(
+        review: &'static str,
+        status: u16,
+        finish_reason: &'static str,
+    ) -> MockServer {
         MockServer::new_local_rag(move |body| {
             if let Some(input) = body["input"].as_array() {
                 return (200, json!({"data": input.iter().enumerate().map(|(i,_)| json!({"index":i,"embedding":[1.0,0.5]})).collect::<Vec<_>>()}).to_string());
@@ -437,7 +454,7 @@ mod http_tests {
                     json!({"error":{"message":"test error"}}).to_string(),
                 );
             }
-            (200, json!({"choices":[{"message":{"content":review},"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"completion_tokens":10,"total_tokens":35}}).to_string())
+            (200, json!({"choices":[{"message":{"content":review},"finish_reason":finish_reason}],"usage":{"prompt_tokens":25,"completion_tokens":10,"total_tokens":35}}).to_string())
         })
     }
     fn snapshot() -> Snapshot {
@@ -493,6 +510,7 @@ mod http_tests {
         assert!(prompt.contains("совместимости"));
         assert!(request.get("tools").is_none());
         assert!(request.get("response_format").is_none());
+        assert!(request.get("max_tokens").is_none());
         let another = crate::rag::RagService::scoped(
             directory.join("another/rag.sqlite3"),
             project.embedding.clone(),
@@ -509,7 +527,8 @@ mod http_tests {
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let captured = calls.clone();
-        let server = MockServer::new_local(move |_| {
+        let server = MockServer::new_local(move |body| {
+            assert!(body.get("max_tokens").is_none());
             if captured.fetch_add(1, Ordering::SeqCst) < 2 {
                 return (503, "{}".into());
             }
@@ -538,6 +557,48 @@ mod http_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         std::fs::remove_dir_all(directory).unwrap();
     }
+
+    #[tokio::test]
+    async fn rejects_empty_and_partial_length_limited_reviews_without_network_retries() {
+        for reason in ["length", "max_tokens"] {
+            for content in ["", "## Потенциальные баги\nНезавершённое замечание"]
+            {
+                let server = server_with_finish(content, 200, reason);
+                let directory = std::env::temp_dir()
+                    .join(format!("agi-review-length-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&directory).unwrap();
+                let project = test_project(&directory, &server.url);
+                let mut run = test_run(&project, &server.url);
+                let error = analyze(
+                    &mut run,
+                    snapshot(),
+                    &project,
+                    &directory.join("run"),
+                    &|_| {},
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("AGI не задаёт max_tokens для ревью"));
+                assert!(error.contains("Настройки чата /settings на ревью не влияют"));
+                assert!(!error.contains("попробуйте увеличить"));
+                if content.is_empty() {
+                    assert!(error.contains(&format!("finish_reason: {reason}")));
+                }
+                assert!(run.markdown.is_empty());
+                assert_eq!(run.publication, "not_published");
+                let requests = server.requests();
+                let generation: Vec<_> = requests
+                    .iter()
+                    .filter(|body| body["messages"].is_array())
+                    .collect();
+                assert_eq!(generation.len(), 1);
+                assert!(generation[0].get("max_tokens").is_none());
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn rejects_malformed_llm_response_and_service_error() {
         for (response, status) in [("без разделов", 200), ("", 400)] {
@@ -562,6 +623,84 @@ mod http_tests {
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
+    #[tokio::test]
+    async fn review_can_finish_after_more_than_fifteen_minutes() {
+        let (ready, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = std::sync::Mutex::new(wait);
+        let server = MockServer::new_local_rag(move |body| {
+            if let Some(input) = body["input"].as_array() {
+                return (200, json!({"data": input.iter().enumerate().map(|(i,_)| json!({"index":i,"embedding":[1.0,0.5]})).collect::<Vec<_>>()}).to_string());
+            }
+            ready.send(()).unwrap();
+            wait.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            (200, json!({"choices":[{"message":{"content":"## Потенциальные баги\nПроверить a.rs.\n## Архитектурные проблемы\nНет.\n## Рекомендации\nДобавить тест."},"finish_reason":"stop"}]}).to_string())
+        });
+        let directory =
+            std::env::temp_dir().join(format!("agi-review-long-{}", uuid::Uuid::new_v4()));
+        let repository = directory.join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::write(repository.join("a.rs"), "fn a() -> u32 { 1 }\n").unwrap();
+        for args in [
+            vec!["init", "--template="],
+            vec!["add", "a.rs"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::write(repository.join("a.rs"), "fn a() -> u32 { 2 }\n").unwrap();
+        let project = test_project(&repository, &server.url);
+        let model = test_run(&project, &server.url).model;
+        let store = ReviewStore::at(directory.join("state")).unwrap();
+        let cloned = store.clone();
+        let worker =
+            tokio::spawn(async move { run(&cloned, project, model, None, None, |_| {}).await });
+        tokio::time::timeout(Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Pause only after the HTTP connection is established so virtual time
+        // cannot expire the transport's connection timeout during setup.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(16 * 60)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        let still_running = !worker.is_finished();
+        tokio::time::resume();
+        release.send(()).unwrap();
+        let result = worker.await.unwrap().unwrap();
+        assert!(still_running, "Review stopped at the former deadline");
+        assert_eq!(result.status, "completed");
+        assert!(result.error.is_none());
+        assert!(result.markdown.contains("Потенциальные баги"));
+        assert_eq!(store.history(None).unwrap()[0].status, "completed");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn records_cancellation_when_worker_is_aborted() {
         let directory =

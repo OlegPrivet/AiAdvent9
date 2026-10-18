@@ -2391,9 +2391,9 @@ impl<'a> App<'a> {
                     });
                 }
                 2 => self.open_text_modal(
-                    "Максимальная длина · Enter: сохранить",
+                    "Максимальная длина · число или «без лимита» · Enter: сохранить",
                     TextKind::MaxTokens,
-                    self.chat.settings().max_tokens().to_string(),
+                    self.chat.settings().max_tokens_input(),
                 ),
                 3 => self.open_text_modal(
                     "Температура 0.0–2.0 · Enter: сохранить",

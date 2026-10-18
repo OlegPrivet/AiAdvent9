@@ -20,6 +20,9 @@ fn automation_defaults_are_offline_and_off_by_default() {
     assert_eq!(reopened.automation(project.id).unwrap().interval_secs, 90);
     let lock = acquire(&store).unwrap().unwrap();
     assert!(acquire(&store).unwrap().is_none());
+    // Concurrent tests can fork with this descriptor before exec closes it.
+    // Explicitly unlock the shared file description before checking reacquisition.
+    lock.unlock().unwrap();
     drop(lock);
     assert!(acquire(&store).unwrap().is_some());
     std::fs::remove_dir_all(directory).unwrap();
@@ -317,20 +320,95 @@ async fn stop_request_terminates_idle_daemon_and_releases_singleton_lock() {
 }
 
 #[test]
-fn requires_local_generation_and_embeddings_without_contacting_endpoints() {
+fn accepts_local_generation_and_embeddings_without_contacting_endpoints() {
     let fixture = Fixture::new();
     let settings = Automation {
         enabled: true,
         publish: false,
         ..Default::default()
     };
-    assert!(validate_setup(&fixture.store, &fixture.project, &settings).is_err());
     let chats = crate::chat::ChatStore::with_directory(fixture.directory.clone()).unwrap();
     let model = crate::review::tests::test_run(&fixture.project, "http://127.0.0.1:1").model;
     chats.llms().add(model.clone()).unwrap();
     chats.llms().set_default(&model.id).unwrap();
     validate_setup(&fixture.store, &fixture.project, &settings).unwrap();
+}
+
+#[test]
+fn accepts_cloud_generation_with_local_or_cloud_embeddings_when_key_is_present() {
+    let fixture = Fixture::new();
+    let model = crate::llm::LlmProfile::neuraldeep(config::DEFAULT_MODEL);
+    let settings = Automation {
+        publish: false,
+        ..Default::default()
+    };
+    let env = |name: &str| (name == "NEURALDEEP_API_KEY").then(|| "test-key".into());
+    validate_setup_with_env(&model, &fixture.project, &settings, env).unwrap();
     let mut project = fixture.project.clone();
     project.embedding.url = format!("{}/embeddings", config::DEFAULT_BASE_URL);
-    assert!(validate_setup(&fixture.store, &project, &settings).is_err());
+    project.embedding.api_key_env = Some("NEURALDEEP_API_KEY".into());
+    validate_setup_with_env(&model, &project, &settings, env).unwrap();
+}
+
+#[test]
+fn rejects_cloud_generation_without_a_nonblank_key() {
+    let fixture = Fixture::new();
+    let model = crate::llm::LlmProfile::neuraldeep(config::DEFAULT_MODEL);
+    let settings = Automation {
+        publish: false,
+        ..Default::default()
+    };
+    for key in [None, Some(String::new()), Some(" \n".into())] {
+        let error = validate_setup_with_env(&model, &fixture.project, &settings, |_| key.clone())
+            .unwrap_err();
+        assert!(error.to_string().contains("NEURALDEEP_API_KEY"));
+    }
+}
+
+#[test]
+fn accepts_local_generation_with_cloud_embeddings_and_checks_the_configured_key() {
+    let fixture = Fixture::new();
+    let model = crate::review::tests::test_run(&fixture.project, "http://127.0.0.1:1").model;
+    let settings = Automation {
+        publish: false,
+        ..Default::default()
+    };
+    let mut project = fixture.project.clone();
+    for (url, name) in [
+        (
+            format!("{}/embeddings", config::DEFAULT_BASE_URL),
+            "NEURALDEEP_API_KEY",
+        ),
+        ("http://127.0.0.1:1/embeddings".into(), "TEST_EMBEDDING_KEY"),
+    ] {
+        project.embedding.url = url;
+        project.embedding.api_key_env = Some(name.into());
+        for key in [None, Some(" \n".into())] {
+            let error =
+                validate_setup_with_env(&model, &project, &settings, |_| key.clone()).unwrap_err();
+            assert!(error.to_string().contains(name));
+        }
+        validate_setup_with_env(&model, &project, &settings, |variable| {
+            (variable == name).then(|| "test-key".into())
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn still_requires_sufficient_context_and_a_token_for_publication() {
+    let fixture = Fixture::new();
+    let mut model = crate::review::tests::test_run(&fixture.project, "http://127.0.0.1:1").model;
+    let settings = Automation::default();
+    for token in [None, Some(" \n".into())] {
+        let error = validate_setup_with_env(&model, &fixture.project, &settings, |_| token.clone())
+            .unwrap_err();
+        assert!(error.to_string().contains(&fixture.project.token_env));
+    }
+    let env = |name: &str| (name == fixture.project.token_env).then(|| "test-token".into());
+    model.context_tokens = 8192;
+    validate_setup_with_env(&model, &fixture.project, &settings, env).unwrap();
+    model.context_tokens = 8191;
+    let error = validate_setup_with_env(&model, &fixture.project, &settings, env).unwrap_err();
+    assert!(error.to_string().contains("8192"));
 }

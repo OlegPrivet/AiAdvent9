@@ -33,3 +33,4 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 axum = "0.8"
 rmcp = { version = "3.4", features = ["transport-streamable-http-server"] }
+tokio = { version = "1.0", features = ["test-util"] }

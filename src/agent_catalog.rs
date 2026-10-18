@@ -45,8 +45,9 @@ impl AgentDefinition {
         if self.settings.model().is_empty()
             || !self.settings.temperature().is_finite()
             || !(0.0..=2.0).contains(&self.settings.temperature())
-            || self.settings.max_tokens() == 0
-            || (self.settings.response_format_enabled() && self.settings.max_tokens() < 256)
+            || self.settings.max_tokens().is_some_and(|limit| {
+                limit == 0 || (self.settings.response_format_enabled() && limit < 256)
+            })
         {
             return Err(CatalogError::Validation(
                 "Некорректные LLM-настройки агента".into(),

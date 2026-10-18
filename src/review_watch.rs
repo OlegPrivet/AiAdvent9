@@ -333,26 +333,34 @@ pub(crate) fn validate_setup(
         .llms()
         .active()
         .map_err(|e| ReviewError::Invalid(e.to_string()))?;
-    if model.provider != crate::llm::Provider::Local {
-        return Err(ReviewError::Invalid(
-            "Для автоматики выберите свою локальную HTTP-модель в /llm".into(),
-        ));
-    }
+    validate_setup_with_env(&model, project, settings, |name| std::env::var(name).ok())
+}
+
+fn validate_setup_with_env(
+    model: &crate::llm::LlmProfile,
+    project: &Project,
+    settings: &Automation,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
     if model.context_tokens < 8192 {
         return Err(ReviewError::Invalid(
             "Для автоматического ревью нужен контекст модели не меньше 8192 токенов".into(),
         ));
     }
-    if project.embedding.url.starts_with(config::DEFAULT_BASE_URL) {
+    let missing = |name: &str| env(name).is_none_or(|value| value.trim().is_empty());
+    if model.provider == crate::llm::Provider::NeuralDeep && missing("NEURALDEEP_API_KEY") {
         return Err(ReviewError::Invalid(
-            "Настройте локальные эмбеддинги в карточке проекта".into(),
+            "Для NeuralDeep задайте NEURALDEEP_API_KEY до запуска agi".into(),
         ));
     }
-    if settings.publish
-        && std::env::var(&project.token_env)
-            .ok()
-            .is_none_or(|token| token.trim().is_empty())
+    if let Some(name) = &project.embedding.api_key_env
+        && missing(name)
     {
+        return Err(ReviewError::Invalid(format!(
+            "Для эмбеддингов задайте {name} до запуска agi"
+        )));
+    }
+    if settings.publish && missing(&project.token_env) {
         return Err(ReviewError::Invalid(format!(
             "Для автопубликации задайте {} до запуска agi либо выключите автопубликацию",
             project.token_env

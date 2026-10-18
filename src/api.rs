@@ -96,9 +96,7 @@ pub(crate) enum ApiError {
     Output(io::Error),
     #[error("Structured Output не соответствует ожидаемой JSON Schema: {0}")]
     InvalidStructuredOutput(serde_json::Error),
-    #[error(
-        "AI-сервис вернул ответ без текста (finish_reason: {finish_reason}); попробуйте увеличить max_tokens в /settings"
-    )]
+    #[error("AI-сервис вернул ответ без текста (finish_reason: {finish_reason})")]
     MissingContent { finish_reason: String },
 }
 
@@ -165,7 +163,17 @@ impl NeuralDeepClient {
         messages: &[ApiMessage],
         model: &str,
     ) -> Result<ApiAnswer, ApiError> {
-        self.complete_auxiliary(messages, model, None, 4096, 0.1)
+        self.complete_auxiliary(messages, model, None, Some(4096), 0.1)
+            .await
+    }
+
+    /// Review generation uses the server's output budget, independently of chat/UI settings.
+    pub(crate) async fn complete_review(
+        &self,
+        messages: &[ApiMessage],
+        model: &str,
+    ) -> Result<ApiAnswer, ApiError> {
+        self.complete_auxiliary(messages, model, None, None, 0.1)
             .await
     }
 
@@ -175,7 +183,7 @@ impl NeuralDeepClient {
         model: &str,
         response_format: Value,
     ) -> Result<ApiAnswer, ApiError> {
-        self.complete_auxiliary(messages, model, Some(response_format), 4096, 0.1)
+        self.complete_auxiliary(messages, model, Some(response_format), Some(4096), 0.1)
             .await
     }
 
@@ -185,11 +193,14 @@ impl NeuralDeepClient {
         settings: &Settings,
     ) -> Result<ApiAnswer, ApiError> {
         let started = Instant::now();
-        let body = json!({"model":settings.model(),"messages":messages,
-            "max_tokens":settings.max_tokens(),"temperature":settings.temperature(),
+        let mut body = json!({"model":settings.model(),"messages":messages,
+            "temperature":settings.temperature(),
             "stream":false,"user":Uuid::new_v4().to_string(),
             "chat_template_kwargs":{"enable_thinking":false},
             "response_format":crate::rag_answer::schema()});
+        if let Some(limit) = settings.max_tokens() {
+            body["max_tokens"] = json!(limit);
+        }
         let response = self
             .with_settings(settings)
             .post(&body)
@@ -223,7 +234,7 @@ impl NeuralDeepClient {
             messages,
             self.default_model(),
             Some(response_format),
-            max_tokens,
+            Some(max_tokens),
             0.0,
         )
         .await
@@ -232,7 +243,7 @@ impl NeuralDeepClient {
     pub(crate) async fn complete_rag_text(
         &self,
         messages: &[ApiMessage],
-        max_tokens: u32,
+        max_tokens: Option<u32>,
     ) -> Result<ApiAnswer, ApiError> {
         self.complete_auxiliary(messages, self.default_model(), None, max_tokens, 0.0)
             .await
@@ -243,16 +254,19 @@ impl NeuralDeepClient {
         messages: &[ApiMessage],
         model: &str,
         response_format: Option<Value>,
-        max_tokens: u32,
+        max_tokens: Option<u32>,
         temperature: f32,
     ) -> Result<ApiAnswer, ApiError> {
         let started_at = Instant::now();
         let mut request = json!({
-            "model": model, "messages": messages, "max_tokens": max_tokens,
+            "model": model, "messages": messages,
             "temperature": temperature, "stream": false,
             "user": Uuid::new_v4().to_string(),
             "chat_template_kwargs": {"enable_thinking": false}
         });
+        if let Some(limit) = max_tokens {
+            request["max_tokens"] = json!(limit);
+        }
         if let Some(response_format) = response_format {
             request["response_format"] = response_format;
         }
@@ -360,10 +374,13 @@ impl NeuralDeepClient {
         let messages = messages.to_vec();
         let mut request = json!({
             "model": settings.model(), "messages": messages,
-            "max_tokens": settings.max_tokens(), "temperature": settings.temperature(),
+            "temperature": settings.temperature(),
             "user": session_id.to_string(), "chat_template_kwargs": {"enable_thinking": false},
             "stream": true, "stream_options": {"include_usage": true}
         });
+        if let Some(limit) = settings.max_tokens() {
+            request["max_tokens"] = json!(limit);
+        }
         if let Some(tools) = tools {
             request["tools"] = tools;
             request["tool_choice"] = json!("auto");
@@ -751,7 +768,8 @@ fn missing_content(finish_reason: Option<String>) -> ApiError {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<RequestMessage<'a>>,
-    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1014,6 +1032,125 @@ mod tests {
 
     use super::*;
     use crate::input::BufferedInput;
+
+    #[tokio::test]
+    async fn neuraldeep_review_omits_output_cap_and_disables_thinking() {
+        let server = crate::test_http::MockServer::new(|_| {
+            (
+                200,
+                json!({"choices":[{"message":{"content":"Ревью"},"finish_reason":"stop"}]})
+                    .to_string(),
+            )
+        });
+        let mut profile = crate::llm::LlmProfile::neuraldeep(crate::config::DEFAULT_MODEL);
+        profile.base_url = server.url.clone();
+        let answer = test_client(server.url.clone())
+            .with_profile(&profile)
+            .complete_review(&[ApiMessage::text("user", "diff")], &profile.model)
+            .await
+            .unwrap();
+        assert_eq!(answer.content, "Ревью");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].get("max_tokens").is_none());
+        assert_eq!(
+            requests[0]["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
+        assert_eq!(requests[0]["model"], profile.model);
+    }
+
+    #[tokio::test]
+    async fn streaming_omits_unlimited_tokens_for_chat_tools_and_structured_output() {
+        let server = crate::test_http::MockServer::new(|_| {
+            crate::test_http::text_response(
+                r#"{"short_answer":"a","details":["b"],"conclusion":"c"}"#,
+            )
+        });
+        let client = test_client(server.url.clone());
+        let messages = [ApiMessage::text("user", "Вопрос")];
+        for mode in 0..3 {
+            let mut settings = Settings::default();
+            if mode == 2 {
+                settings.set_response_format(true);
+            }
+            for (input, expected) in [
+                (None, None),
+                (Some("750"), Some(750)),
+                (Some("без лимита"), None),
+            ] {
+                if let Some(input) = input {
+                    settings.set_max_tokens(input).unwrap();
+                }
+                client
+                    .complete_streaming(
+                        &messages,
+                        Uuid::nil(),
+                        &settings,
+                        (mode == 1).then(|| json!([])),
+                        |_| Ok(()),
+                    )
+                    .await
+                    .unwrap();
+                let requests = server.requests();
+                let body = requests.last().unwrap();
+                assert_eq!(
+                    body.get("max_tokens"),
+                    expected.map(|limit| json!(limit)).as_ref()
+                );
+                assert_eq!(body.get("tools").is_some(), mode == 1);
+                assert_eq!(body.get("response_format").is_some(), mode == 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rag_omits_unlimited_tokens_and_auxiliary_requests_keep_explicit_budgets() {
+        let server = crate::test_http::MockServer::new(|_| {
+            (
+                200,
+                json!({"choices":[{"message":{"content":"Ответ"},"finish_reason":"stop"}]})
+                    .to_string(),
+            )
+        });
+        let client = test_client(server.url.clone());
+        let messages = [ApiMessage::text("user", "Вопрос")];
+        let mut settings = Settings::default();
+        for (input, expected) in [
+            (None, None),
+            (Some("750"), Some(750)),
+            (Some("без лимита"), None),
+        ] {
+            if let Some(input) = input {
+                settings.set_max_tokens(input).unwrap();
+            }
+            client
+                .complete_strict_rag(&messages, &settings)
+                .await
+                .unwrap();
+            let requests = server.requests();
+            let body = requests.last().unwrap();
+            assert_eq!(
+                body.get("max_tokens"),
+                expected.map(|limit| json!(limit)).as_ref()
+            );
+            assert_eq!(body["response_format"]["type"], "json_schema");
+        }
+        client.complete_rag_text(&messages, None).await.unwrap();
+        assert!(
+            server
+                .requests()
+                .last()
+                .unwrap()
+                .get("max_tokens")
+                .is_none()
+        );
+        client
+            .complete_text(&messages, settings.model())
+            .await
+            .unwrap();
+        assert_eq!(server.requests().last().unwrap()["max_tokens"], 4096);
+    }
 
     #[tokio::test]
     async fn sends_large_context_to_provider_without_local_token_guessing() {

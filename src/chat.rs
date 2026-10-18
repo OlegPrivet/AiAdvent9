@@ -2220,7 +2220,7 @@ mod tests {
             Some("Отвечай как редактор")
         );
         assert_eq!(restored.settings().model(), crate::config::DEFAULT_MODEL);
-        assert_eq!(restored.settings().max_tokens(), 900);
+        assert_eq!(restored.settings().max_tokens(), Some(900));
         assert_eq!(restored.settings().temperature(), 1.25);
         assert_eq!(
             restored.last_response_metrics(),

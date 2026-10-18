@@ -313,7 +313,6 @@ jobs:
   review:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 20
     env:
       AGI_BINARY: '{binary}'
       GITHUB_TOKEN: ${{{{ github.token }}}}
