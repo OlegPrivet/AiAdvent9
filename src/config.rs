@@ -2,6 +2,10 @@ use std::env;
 
 use thiserror::Error;
 
+pub(crate) const REVIEW_POLL_SECS: u64 = 60;
+pub(crate) const REVIEW_RETRY_MAX_SECS: u64 = 900;
+pub(crate) const REVIEW_HEARTBEAT_SECS: u64 = 2;
+
 const API_KEY_ENV: &str = "NEURALDEEP_API_KEY";
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.neuraldeep.ru/v1";
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.8-27b";

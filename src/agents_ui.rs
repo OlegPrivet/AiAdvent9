@@ -19,7 +19,7 @@ const FIELDS: &[&str] = &[
     "Модель",
     "Температура",
     "Structured Output",
-    "Max tokens",
+    "Max tokens (число или «без лимита»)",
     "Условие завершения",
 ];
 
@@ -418,7 +418,7 @@ impl AgentManager {
                 .unwrap_or_default()
                 .to_owned(),
             5 => self.draft.settings.temperature().to_string(),
-            7 => self.draft.settings.max_tokens().to_string(),
+            7 => self.draft.settings.max_tokens_input(),
             _ => String::new(),
         }
     }
@@ -640,7 +640,7 @@ mod tests {
         assert_eq!(saved.handle, "editor");
         assert_eq!(saved.settings.temperature(), 0.6);
         assert!(saved.settings.response_format_enabled());
-        assert_eq!(saved.settings.max_tokens(), 600);
+        assert_eq!(saved.settings.max_tokens(), Some(600));
         manager.select(1, &store).expect("view");
         manager.select(0, &store).expect("actions");
         manager.select(0, &store).expect("edit");

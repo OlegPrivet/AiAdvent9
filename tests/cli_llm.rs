@@ -117,6 +117,7 @@ fn local_cli_runs_without_cloud_key_and_persists_global_selection() {
                 serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
             assert_eq!(body["model"], "offline-model");
             assert!(body.get("chat_template_kwargs").is_none());
+            assert!(body.get("max_tokens").is_none());
             let response = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Локальный ответ\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
         }

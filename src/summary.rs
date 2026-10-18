@@ -167,7 +167,7 @@ pub(crate) async fn summarize(
                 Some("stop") => {}
                 Some("length") => reasons.push(format!(
                     "ответ обрезан по лимиту генерации (finish_reason=length, max_tokens={})",
-                    settings.max_tokens()
+                    settings.max_tokens_input()
                 )),
                 Some(reason) => reasons.push(format!(
                     "неожиданная причина завершения: finish_reason={reason}"

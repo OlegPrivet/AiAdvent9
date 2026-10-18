@@ -37,6 +37,11 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum RootCommand {
+    /// AI-ревью PR и локальных изменений. Настройка в /review.
+    Review {
+        #[command(subcommand)]
+        command: crate::review::ReviewCommand,
+    },
     /// Общие подключения LLM.
     Llm {
         #[command(subcommand)]
@@ -146,6 +151,80 @@ impl From<RagStrategy> for crate::rag_chunk::Strategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_requires_one_target_and_pr_for_publication() {
+        let id = "12345678-1234-1234-1234-123456789abc";
+        assert!(
+            Cli::try_parse_from([
+                "agi",
+                "review",
+                "run",
+                "--project",
+                id,
+                "--local",
+                "--output",
+                "reports"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agi",
+                "review",
+                "run",
+                "--project",
+                id,
+                "--pr",
+                "1",
+                "--publish",
+                "--output",
+                "reports"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agi",
+                "review",
+                "run",
+                "--project",
+                id,
+                "--output",
+                "reports"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agi",
+                "review",
+                "run",
+                "--project",
+                id,
+                "--local",
+                "--publish",
+                "--output",
+                "reports"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agi",
+                "review",
+                "run",
+                "--project",
+                id,
+                "--local",
+                "--pr",
+                "1",
+                "--output",
+                "reports"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn parses_day24_evaluation() {

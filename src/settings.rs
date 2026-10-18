@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::{ContextStrategy, ContextStrategyKind};
 use crate::input::LineInput;
 
-const DEFAULT_MAX_TOKENS: u32 = 10000;
+const LEGACY_DEFAULT_MAX_TOKENS: u32 = 10_000;
 const DEFAULT_TEMPERATURE: f32 = 0.1;
 use crate::config::DEFAULT_MODEL;
 const MIN_STRUCTURED_TOKENS: u32 = 256;
@@ -98,7 +98,9 @@ pub(crate) struct Settings {
     #[serde(skip)]
     model_profiles: Vec<crate::llm::LlmProfile>,
     response_format_enabled: bool,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
+    // Distinguish an explicitly chosen 10 000 from the old implicit default.
+    max_tokens_explicit: bool,
     #[cfg(test)]
     #[serde(skip)]
     test_context_tokens: u32,
@@ -121,7 +123,8 @@ impl Default for Settings {
             resolved_profile: None,
             model_profiles: Vec::new(),
             response_format_enabled: false,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: None,
+            max_tokens_explicit: false,
             #[cfg(test)]
             test_context_tokens: 0,
             temperature: DEFAULT_TEMPERATURE,
@@ -142,7 +145,8 @@ impl Settings {
             model: model.into(),
             #[cfg(test)]
             test_context_tokens: _context_tokens,
-            max_tokens,
+            max_tokens: Some(max_tokens),
+            max_tokens_explicit: true,
             ..Self::default()
         }
     }
@@ -243,8 +247,14 @@ impl Settings {
         self.response_format_enabled
     }
 
-    pub(crate) fn max_tokens(&self) -> u32 {
+    pub(crate) fn max_tokens(&self) -> Option<u32> {
         self.max_tokens
+            .filter(|limit| self.max_tokens_explicit || *limit != LEGACY_DEFAULT_MAX_TOKENS)
+    }
+
+    pub(crate) fn max_tokens_input(&self) -> String {
+        self.max_tokens()
+            .map_or_else(|| "без лимита".into(), |limit| limit.to_string())
     }
 
     pub(crate) fn context_tokens(&self) -> u32 {
@@ -332,7 +342,11 @@ impl Settings {
                     "выключен"
                 }
             ),
-            format!("Максимальная длина: {} токенов", self.max_tokens),
+            format!(
+                "Максимальная длина: {}",
+                self.max_tokens()
+                    .map_or_else(|| "без лимита".into(), |limit| format!("{limit} токенов"))
+            ),
             format!("Температура: {}", format_temperature(self.temperature)),
             format!("Завершение ответа: {}", self.completion_condition),
             format!(
@@ -384,10 +398,15 @@ impl Settings {
 
     pub(crate) fn set_response_format(&mut self, enabled: bool) -> Option<String> {
         self.response_format_enabled = enabled;
-        if enabled && self.max_tokens < MIN_STRUCTURED_TOKENS {
-            self.max_tokens = MIN_STRUCTURED_TOKENS;
+        if enabled
+            && self
+                .max_tokens()
+                .is_some_and(|limit| limit < MIN_STRUCTURED_TOKENS)
+        {
+            self.max_tokens = Some(MIN_STRUCTURED_TOKENS);
+            self.max_tokens_explicit = true;
             Some(format!(
-                "Для Structured Output лимит увеличен до {MIN_STRUCTURED_TOKENS} токенов."
+                "Для Structured Output лимит автоматически увеличен до {MIN_STRUCTURED_TOKENS} токенов."
             ))
         } else {
             None
@@ -395,9 +414,18 @@ impl Settings {
     }
 
     pub(crate) fn set_max_tokens(&mut self, value: &str) -> Result<Option<String>, String> {
+        let value = value.trim();
+        if matches!(
+            value.to_lowercase().as_str(),
+            "без лимита" | "нет" | "none" | "off"
+        ) {
+            self.max_tokens = None;
+            self.max_tokens_explicit = true;
+            return Ok(None);
+        }
         let max_tokens = value
             .parse::<u32>()
-            .map_err(|_| "Требуется целое число больше нуля.".to_owned())?;
+            .map_err(|_| "Требуется целое число больше нуля или «без лимита».".to_owned())?;
         if max_tokens == 0 {
             return Err("Требуется целое число больше нуля.".to_owned());
         }
@@ -409,7 +437,8 @@ impl Settings {
                 "Для Structured Output требуется минимум {MIN_STRUCTURED_TOKENS} токенов."
             ));
         }
-        self.max_tokens = max_tokens;
+        self.max_tokens = Some(max_tokens);
+        self.max_tokens_explicit = true;
         Ok((max_tokens < 128)
             .then(|| "При лимите меньше 128 токенов ответ будет очень кратким.".to_owned()))
     }
@@ -513,16 +542,13 @@ impl Settings {
 
         match choice {
             0 => {
-                self.response_format_enabled = true;
-                if self.max_tokens < MIN_STRUCTURED_TOKENS {
-                    self.max_tokens = MIN_STRUCTURED_TOKENS;
-                    writeln!(
-                        output,
-                        "Для Structured Output лимит автоматически увеличен до {MIN_STRUCTURED_TOKENS} токенов."
-                    )?;
+                if let Some(message) = self.set_response_format(true) {
+                    writeln!(output, "{message}")?;
                 }
             }
-            1 => self.response_format_enabled = false,
+            1 => {
+                self.set_response_format(false);
+            }
             _ => {}
         }
         Ok(())
@@ -568,8 +594,9 @@ impl Settings {
         input: &mut I,
         output: &mut W,
     ) -> io::Result<()> {
-        let Some(value) =
-            input.read_line("Максимальное количество токенов (> 0; пустая строка — отмена): ")?
+        let Some(value) = input.read_line(
+            "Максимальное количество токенов (> 0 или «без лимита»; пустая строка — отмена): ",
+        )?
         else {
             return Ok(());
         };
@@ -577,31 +604,10 @@ impl Settings {
             return Ok(());
         }
 
-        match value.parse::<u32>() {
-            Ok(max_tokens)
-                if self.response_format_enabled && max_tokens < MIN_STRUCTURED_TOKENS =>
-            {
-                writeln!(
-                    output,
-                    "Для Structured Output требуется минимум {MIN_STRUCTURED_TOKENS} токенов; значение не изменено."
-                )?;
-            }
-            Ok(max_tokens) if max_tokens >= self.context_tokens() => {
-                writeln!(output, "Лимит ответа должен быть меньше окна контекста")?;
-            }
-            Ok(max_tokens) if max_tokens > 0 => {
-                self.max_tokens = max_tokens;
-                if max_tokens < 128 {
-                    writeln!(
-                        output,
-                        "Предупреждение: при лимите меньше 128 токенов ответ будет очень кратким."
-                    )?;
-                }
-            }
-            _ => writeln!(
-                output,
-                "Значение не изменено: требуется целое число больше нуля."
-            )?,
+        match self.set_max_tokens(&value) {
+            Ok(Some(warning)) => writeln!(output, "Предупреждение: {warning}")?,
+            Ok(None) => {}
+            Err(error) => writeln!(output, "Значение не изменено: {error}")?,
         }
         Ok(())
     }
@@ -863,7 +869,7 @@ mod tests {
 
         assert_eq!(settings.model(), DEFAULT_MODEL);
         assert!(!settings.response_format_enabled());
-        assert_eq!(settings.max_tokens(), DEFAULT_MAX_TOKENS);
+        assert_eq!(settings.max_tokens(), None);
         assert_eq!(settings.temperature(), DEFAULT_TEMPERATURE);
         assert_eq!(settings.stop_sequence(), None);
         assert_eq!(settings.completion_instruction(), None);
@@ -873,6 +879,65 @@ mod tests {
             settings.context_strategy(),
             &ContextStrategy::sliding_default()
         );
+    }
+
+    #[test]
+    fn legacy_default_limit_is_removed_but_other_saved_limits_are_kept() {
+        for (saved, expected) in [
+            (serde_json::json!(10_000), None),
+            (serde_json::json!(900), Some(900)),
+            (serde_json::Value::Null, None),
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "max_tokens": saved, "response_format_enabled": true
+            }))
+            .unwrap();
+            assert_eq!(settings.max_tokens(), expected);
+            let restored: Settings =
+                serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+            assert_eq!(restored.max_tokens(), expected);
+        }
+    }
+
+    #[test]
+    fn explicit_limits_and_unlimited_mode_survive_round_trip() {
+        let mut settings = Settings::default();
+        for (input, expected) in [
+            ("900", Some(900)),
+            ("10000", Some(10_000)),
+            ("без лимита", None),
+        ] {
+            settings.set_max_tokens(input).unwrap();
+            let restored: Settings =
+                serde_json::from_value(chat_settings_value(&settings).unwrap()).unwrap();
+            assert_eq!(restored.max_tokens(), expected);
+            assert_eq!(restored.max_tokens_input(), input);
+        }
+        assert_eq!(settings.menu_items()[2], "Максимальная длина: без лимита");
+    }
+
+    #[test]
+    fn structured_output_accepts_unlimited_mode_and_still_validates_manual_limits() {
+        let mut settings = Settings::default();
+        assert!(settings.set_response_format(true).is_none());
+        assert_eq!(settings.max_tokens(), None);
+        for invalid in ["0", "255", "-1", "text", "262144"] {
+            assert!(settings.set_max_tokens(invalid).is_err());
+            assert_eq!(settings.max_tokens(), None);
+        }
+        settings.set_max_tokens("256").unwrap();
+        settings.set_max_tokens("без лимита").unwrap();
+        assert_eq!(settings.max_tokens(), None);
+        assert!(settings.response_format_enabled());
+    }
+
+    #[test]
+    fn settings_menu_can_remove_a_manual_limit() {
+        let mut settings = Settings::default();
+        settings.set_max_tokens("900").unwrap();
+        let mut input = BufferedInput::new(Cursor::new("3\nбез лимита\nesc\n"));
+        assert!(settings.configure(&mut input, &mut Vec::new()).unwrap());
+        assert_eq!(settings.max_tokens(), None);
     }
 
     #[test]
@@ -890,7 +955,7 @@ mod tests {
         assert!(changed);
         assert_eq!(settings.model(), "gpt-oss-120b");
         assert!(settings.response_format_enabled());
-        assert_eq!(settings.max_tokens(), 1200);
+        assert_eq!(settings.max_tokens(), Some(1200));
         assert_eq!(settings.temperature(), 0.7);
         assert_eq!(settings.stop_sequence(), Some("<END>"));
         assert_eq!(settings.completion_instruction(), None);
@@ -960,7 +1025,7 @@ mod tests {
             .expect("settings should be configured");
 
         assert!(settings.response_format_enabled());
-        assert_eq!(settings.max_tokens(), MIN_STRUCTURED_TOKENS);
+        assert_eq!(settings.max_tokens(), Some(MIN_STRUCTURED_TOKENS));
         let output = String::from_utf8(output).expect("output should be UTF-8");
         assert!(output.contains("автоматически увеличен"));
         assert!(output.contains("требуется минимум"));
@@ -1074,7 +1139,7 @@ mod tests {
             serde_json::from_str(r#"{"max_tokens":900}"#).expect("old settings should deserialize");
 
         assert_eq!(settings.model(), DEFAULT_MODEL);
-        assert_eq!(settings.max_tokens(), 900);
+        assert_eq!(settings.max_tokens(), Some(900));
         assert_eq!(settings.temperature(), DEFAULT_TEMPERATURE);
     }
 

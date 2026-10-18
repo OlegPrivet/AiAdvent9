@@ -31,6 +31,12 @@ mod rag_eval;
 mod rag_extract;
 mod rag_pipeline;
 mod repl;
+mod review;
+mod review_git;
+mod review_github;
+mod review_pipeline;
+mod review_ui;
+mod review_watch;
 mod settings;
 mod summary;
 mod task;
@@ -92,6 +98,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
                 println!("{}", llm::command(&store.llms(), command)?);
                 return Ok(());
+            }
+            cli::RootCommand::Review { command } => {
+                return review::cli(command).await.map_err(Into::into);
             }
             command => return rag_cli::run(command).await.map_err(Into::into),
         }

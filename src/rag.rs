@@ -16,7 +16,7 @@ const DEFAULT_MODEL: &str = "bge-m3";
 const DEFAULT_DIMENSION: usize = 1024;
 const DEFAULT_PROFILE_ID: &str = "neuraldeep-bge-m3-v1";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EmbeddingConfig {
     pub(crate) url: String,
     pub(crate) model: String,
@@ -135,6 +135,41 @@ impl RagService {
         service.embedding = service.load_embedding(&connection)?;
         private_permissions(&service.path, false)?;
         Ok(service)
+    }
+
+    /// A project/run index, independent of the global chat corpus and profiles.
+    pub(crate) fn scoped(path: PathBuf, embedding: EmbeddingConfig) -> Result<Self, RagError> {
+        let directory = path
+            .parent()
+            .ok_or_else(|| RagError::Document("Нет каталога индекса".into()))?;
+        fs::create_dir_all(directory)?;
+        private_permissions(directory, true)?;
+        let mut service = Self {
+            path,
+            api_key: std::env::var("NEURALDEEP_API_KEY").ok(),
+            base_url: crate::config::DEFAULT_BASE_URL.into(),
+            embedding: EmbeddingConfig::default_for(crate::config::DEFAULT_BASE_URL),
+            generation_profile: None,
+        };
+        service.connection()?;
+        service.save_embedding(embedding)?;
+        private_permissions(&service.path, false)?;
+        Ok(service)
+    }
+
+    pub(crate) async fn add_text(
+        &self,
+        source: &str,
+        text: &str,
+    ) -> Result<(usize, usize), RagError> {
+        self.index_text(
+            source,
+            text,
+            source,
+            "text",
+            &format!("{:x}", Sha256::digest(text)),
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -401,16 +436,31 @@ impl RagService {
             &self.base_url,
         )
         .await?;
-        let words = document.text.split_whitespace().count();
-        let chars = document.text.chars().count();
-        let fixed = rag_chunk::split(&document.text, &document.title, Strategy::Fixed);
-        let structure = rag_chunk::split(&document.text, &document.title, Strategy::Structure);
+        self.index_text(
+            &path.to_string_lossy(),
+            &document.text,
+            &document.title,
+            &document.format,
+            &checksum,
+        )
+        .await
+    }
+
+    async fn index_text(
+        &self,
+        source: &str,
+        text: &str,
+        title: &str,
+        format: &str,
+        checksum: &str,
+    ) -> Result<(usize, usize), RagError> {
+        let words = text.split_whitespace().count();
+        let chars = text.chars().count();
+        let fixed = rag_chunk::split(text, title, Strategy::Fixed);
+        let structure = rag_chunk::split(text, title, Strategy::Structure);
         let all = fixed.into_iter().chain(structure).collect::<Vec<_>>();
         if all.is_empty() {
-            return Err(RagError::Document(format!(
-                "{}: нет чанков",
-                path.display()
-            )));
+            return Err(RagError::Document(format!("{source}: нет чанков")));
         }
         let vectors = self
             .embed_many(
@@ -422,7 +472,7 @@ impl RagService {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         self.ensure_active(&transaction)?;
-        let path_text = path.to_string_lossy().into_owned();
+        let path_text = source;
         let existing: Option<String> = transaction
             .query_row(
                 "SELECT id FROM sources WHERE path=?1",
@@ -438,8 +488,8 @@ impl RagService {
             params![
                 id,
                 path_text,
-                document.title,
-                document.format,
+                title,
+                format,
                 checksum,
                 words as i64,
                 chars as i64
@@ -748,7 +798,7 @@ fn decode(bytes: &[u8], dimension: usize) -> Option<Vec<f32>> {
     )
 }
 
-fn validate_embedding_options(
+pub(crate) fn validate_embedding_options(
     url: &str,
     model: &str,
     api_key_env: Option<&str>,
