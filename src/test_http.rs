@@ -26,9 +26,21 @@ impl MockServer {
     ) -> Self {
         Self::with_auth(handler, false)
     }
+    pub(crate) fn new_local_rag(
+        handler: impl Fn(&Value) -> (u16, String) + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_endpoints(handler, false, true)
+    }
     fn with_auth(
         handler: impl Fn(&Value) -> (u16, String) + Send + Sync + 'static,
         auth: bool,
+    ) -> Self {
+        Self::with_endpoints(handler, auth, false)
+    }
+    fn with_endpoints(
+        handler: impl Fn(&Value) -> (u16, String) + Send + Sync + 'static,
+        auth: bool,
+        embeddings: bool,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
         let url = format!("http://{}", listener.local_addr().expect("address"));
@@ -51,7 +63,7 @@ impl MockServer {
                         workers.push(thread::spawn(move || {
                             stream.set_read_timeout(Some(Duration::from_secs(5))).expect("read timeout");
                             stream.set_write_timeout(Some(Duration::from_secs(5))).expect("write timeout");
-                            let request = read_request_with_auth(&mut stream, auth);
+                            let request = read_request_with_auth(&mut stream, auth, embeddings);
                             captured.lock().expect("requests lock").push(request.clone());
                             let (status, body) = handler(&request);
                             let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
@@ -95,9 +107,9 @@ impl Drop for MockServer {
 }
 
 pub(crate) fn read_request(stream: &mut TcpStream) -> Value {
-    read_request_with_auth(stream, true)
+    read_request_with_auth(stream, true, false)
 }
-fn read_request_with_auth(stream: &mut TcpStream, auth: bool) -> Value {
+fn read_request_with_auth(stream: &mut TcpStream, auth: bool, embeddings: bool) -> Value {
     let mut bytes = Vec::new();
     let mut buffer = [0; 4096];
     loop {
@@ -106,7 +118,10 @@ fn read_request_with_auth(stream: &mut TcpStream, auth: bool) -> Value {
         bytes.extend_from_slice(&buffer[..read]);
         if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
             let headers = String::from_utf8_lossy(&bytes[..end]);
-            assert!(headers.starts_with("POST /chat/completions HTTP/1.1"));
+            assert!(
+                headers.starts_with("POST /chat/completions HTTP/1.1")
+                    || embeddings && headers.starts_with("POST /embeddings HTTP/1.1")
+            );
             if auth {
                 assert!(
                     headers

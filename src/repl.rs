@@ -71,6 +71,8 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                 } else {
                     print_help(output)?;
                 }
+            } else if command.matches(&["/review", "/ревью"]) {
+                crate::review_ui::run(input, output).await?;
             } else if command.matches(&["/llm"]) {
                 if command.argument.is_none() {
                     crate::llm_ui::run(&store.llms(), input, output)?;
@@ -836,6 +838,10 @@ fn from_russian_keyboard_layout(value: &str) -> String {
 
 fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(output, "Доступные команды:")?;
+    writeln!(
+        output,
+        "  /review, /ревью — проекты, AI-ревью PR и локальных изменений, история, workflow"
+    )?;
     writeln!(
         output,
         "  /llm — меню подключений LLM: добавить HTTP API, выбрать общую модель, удалить"

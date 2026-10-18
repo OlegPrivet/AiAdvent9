@@ -35,6 +35,7 @@ use crate::mcp_ui::{McpAction, McpManager, McpPage};
 use crate::metrics::{ResponseMetrics, format_duration, metric_lines};
 use crate::pricing::PriceCatalog;
 use crate::repl::ParsedCommand;
+use crate::review_ui::{ReviewManager, ReviewModal, ReviewPage};
 use crate::ui::sanitize_terminal_text;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -57,6 +58,11 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     CommandOption::run("/help", "справка; /help <вопрос> — о проекте", &["/помощь"]),
     CommandOption::run("/exit", "сохранить чат и выйти", &["/quit", "/выход"]),
     CommandOption::run("/agents", "глобальный каталог агентов", &["/агенты"]),
+    CommandOption::run(
+        "/review",
+        "AI-ревью проектов, PR и локальных изменений",
+        &["/ревью"],
+    ),
     CommandOption::run("/llm", "подключить HTTP API и выбрать общую LLM", &[]),
     CommandOption::argument("/llm default", "выбрать общий профиль", &[]),
     CommandOption::argument("/llm add", "добавить локальную LLM", &[]),
@@ -401,6 +407,11 @@ pub(crate) async fn run(
     let exit_message = loop {
         if let Some(Modal::Agents(agents)) = &mut app.modal
             && agents.poll_generation()
+        {
+            needs_draw = true;
+        }
+        if let Some(Modal::Review(review)) = &mut app.modal
+            && review.poll()
         {
             needs_draw = true;
         }
@@ -1362,6 +1373,10 @@ impl<'a> App<'a> {
     }
 
     fn handle_mouse(&mut self, kind: MouseEventKind) {
+        if let Some(Modal::Review(review)) = &mut self.modal {
+            review.handle_mouse(kind);
+            return;
+        }
         if let Some(Modal::Mcp(mcp)) = &mut self.modal {
             mcp.handle_mouse(kind);
             return;
@@ -1392,6 +1407,10 @@ impl<'a> App<'a> {
             && mcp.inspection.is_none()
         {
             mcp.input.insert_str(text);
+        } else if let Some(Modal::Review(review)) = &mut self.modal
+            && matches!(review.manager.page(), ReviewPage::Text { .. })
+        {
+            review.input.insert_str(text);
         } else if let Some(Modal::Llm(llm)) = &mut self.modal
             && matches!(llm.manager.page(), LlmPage::Text { .. })
         {
@@ -1569,6 +1588,13 @@ impl<'a> App<'a> {
             self.open_settings();
         } else if command.matches(&["/chat", "/chats", "/чаты"]) {
             self.open_chats();
+        } else if command.matches(&["/review", "/ревью"]) {
+            match ReviewManager::new() {
+                Ok(manager) => {
+                    self.modal = Some(Modal::Review(Box::new(ReviewModal::new(manager))))
+                }
+                Err(error) => self.notice = Some(error.to_string()),
+            }
         } else if command.matches(&["/llm"]) {
             if command.argument.is_none() {
                 self.open_llms();
@@ -2227,6 +2253,11 @@ impl<'a> App<'a> {
             return;
         };
         match &mut modal {
+            Modal::Review(review) => {
+                if review.handle_key(key) {
+                    return;
+                }
+            }
             Modal::Llm(llm) => {
                 let close = llm.handle_key(key, &self.store.llms());
                 if let Err(error) = crate::llm::sync_chat(self.store, self.chat) {
@@ -3249,6 +3280,7 @@ fn submits_text_field(key: KeyEvent, multiline: bool) -> bool {
 }
 
 enum Modal {
+    Review(Box<ReviewModal>),
     Llm(Box<LlmModal>),
     Agents(Box<AgentsModal>),
     Mcp(Box<McpModal>),
@@ -3278,6 +3310,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
     let area = centered_rect(80, 75, frame.area());
     frame.render_widget(Clear, area);
     match modal {
+        Modal::Review(review) => review.render(frame, area),
         Modal::Llm(llm) => llm.render(frame, area),
         Modal::Agents(agents) => agents.render(frame, area),
         Modal::Mcp(mcp) => mcp.render(frame, area),
@@ -3288,6 +3321,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/restore <UUID>          восстановить чат",
                 "/settings, /настройки   настройки текущего чата",
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
+                "/review, /ревью        AI-ревью проектов, PR, история и workflow",
                 "/llm                  подключить HTTP API, выбрать общую LLM, удалить",
                 "/mcp, /мсп             MCP-серверы и инструменты AI",
                 "/rag evaluate          ответы с RAG и без RAG на 10 вопросах",
@@ -3425,7 +3459,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn wrapped_text_height(text: &Text<'_>, width: u16) -> usize {
+pub(crate) fn wrapped_text_height(text: &Text<'_>, width: u16) -> usize {
     let width = usize::from(width.max(1));
     text.lines
         .iter()
