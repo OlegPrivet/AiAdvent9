@@ -73,6 +73,8 @@ pub(crate) async fn run<I: LineInput, W: Write>(
                 }
             } else if command.matches(&["/review", "/ревью"]) {
                 crate::review_ui::run(input, output).await?;
+            } else if command.matches(&["/support"]) {
+                ask(client, store, chat, &line, output, ui, prices).await?;
             } else if command.matches(&["/llm"]) {
                 if command.argument.is_none() {
                     crate::llm_ui::run(&store.llms(), input, output)?;
@@ -226,6 +228,15 @@ async fn ask<W: Write>(
     prices: &PriceCatalog,
 ) -> io::Result<()> {
     if let Some(command) = ParsedCommand::parse(question)
+        && command.matches(&["/support"])
+        && !crate::support::is_context(question)
+    {
+        return match crate::support::command(store, chat, command.argument) {
+            Ok(message) => writeln!(output, "{message}"),
+            Err(error) => writeln!(output, "Поддержка: {error}"),
+        };
+    }
+    if let Some(command) = ParsedCommand::parse(question)
         && command.matches(&["/help", "/помощь"])
         && command.argument.is_none()
     {
@@ -245,7 +256,10 @@ async fn ask<W: Write>(
         }
         return Ok(());
     }
-    if chat.task().is_some() && crate::project_help::question(question).is_none() {
+    if chat.task().is_some()
+        && crate::project_help::question(question).is_none()
+        && !crate::support::handles(chat, question)
+    {
         if let Err(error) = crate::task::prepare_input(store, chat, question) {
             return writeln!(output, "{error}");
         }
@@ -276,7 +290,12 @@ async fn ask<W: Write>(
             .with_invariants(invariants)
             .with_mcp(mcp_servers),
     );
-    let retrieval = if request.settings.rag_enabled()
+    request = match crate::support::attach(request, store) {
+        Ok(request) => request,
+        Err(error) => return writeln!(output, "Поддержка: {error}"),
+    };
+    let retrieval = if request.support.is_none()
+        && request.settings.rag_enabled()
         && (request.project_help || !request.settings.rag_chat_enabled())
     {
         match crate::rag_pipeline::context_with_profile(
@@ -297,13 +316,17 @@ async fn ask<W: Write>(
         request = request.with_retrieval(result);
     }
     let mut live_answer = ui.begin_answer(output);
-    let result = client
-        .respond_streaming(request, |event| live_answer.agent_event(event))
-        .await;
+    let result = tokio::select! {
+        result = client.respond_streaming(request, |event| live_answer.agent_event(event)) => result,
+        _ = tokio::signal::ctrl_c() => Err(crate::agent::AgentError::InvalidRequest("Запрос отменён".into())),
+    };
 
     match result {
         Ok(answer) => {
             live_answer.finish(&answer.content)?;
+            if crate::support::is_context(question) {
+                return Ok(());
+            }
             let truncated = answer.truncated;
             if let Err(error) =
                 crate::rag_chat::commit_answer(store, chat, question.to_owned(), answer, prices)
@@ -924,6 +947,10 @@ fn print_help<W: Write>(output: &mut W) -> io::Result<()> {
         "  /clear, /очистить        начать новый чат без предыдущего контекста"
     )?;
     writeln!(output, "  /help, /помощь           показать эту справку")?;
+    writeln!(
+        output,
+        "  /support                 поддержка: setup, on, ticket ID, context, off"
+    )?;
     writeln!(
         output,
         "  /help <вопрос>           спросить о проекте; RAG согласно /rag on|off"

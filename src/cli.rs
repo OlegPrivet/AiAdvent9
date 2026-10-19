@@ -42,6 +42,11 @@ pub(crate) enum RootCommand {
         #[command(subcommand)]
         command: crate::review::ReviewCommand,
     },
+    /// MCP-сервер поддержки пользователей: чтение users.json и tickets.json.
+    SupportServer {
+        #[arg(long, value_name = "DIRECTORY")]
+        data: PathBuf,
+    },
     /// Общие подключения LLM.
     Llm {
         #[command(subcommand)]

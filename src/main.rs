@@ -39,6 +39,8 @@ mod review_ui;
 mod review_watch;
 mod settings;
 mod summary;
+mod support;
+mod support_server;
 mod task;
 #[cfg(test)]
 mod test_http;
@@ -77,6 +79,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     if let Some(command) = cli.command {
         match command {
+            cli::RootCommand::SupportServer { data } => {
+                return support_server::run(data).await;
+            }
             cli::RootCommand::Llm { command } => {
                 let store = ChatStore::open()?;
                 if let llm::LlmCommand::Ask { question, profile } = command {

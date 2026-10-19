@@ -283,6 +283,7 @@ impl Chat {
             || !self.working_memory.is_empty()
             || self.memory_selection != MemorySelection::default()
             || self.settings.rag_enabled()
+            || self.settings.support != crate::support::SupportState::default()
             || self.settings.rag_strategy() != crate::rag_chunk::Strategy::Structure
     }
 
@@ -361,6 +362,8 @@ impl Chat {
         }
         let remove = self.messages.len() - strategy.max_messages;
         self.messages.drain(..remove);
+        self.settings.support.history_start =
+            self.settings.support.history_start.saturating_sub(remove);
     }
 
     pub(crate) fn last_response_metrics(&self) -> Option<&ResponseMetrics> {
@@ -562,6 +565,10 @@ impl ChatStore {
     pub(crate) fn open() -> Result<Self, ChatStoreError> {
         let directory = state_directory().ok_or(ChatStoreError::MissingStateDirectory)?;
         Self::with_directory(directory)
+    }
+
+    pub(crate) fn support_demo_directory(&self) -> PathBuf {
+        self.database_path.with_file_name("support-demo")
     }
 
     pub(crate) fn with_directory(directory: PathBuf) -> Result<Self, ChatStoreError> {
@@ -1101,6 +1108,7 @@ impl ChatStore {
         summary.metrics.is_summary = true;
         let mut replacement = chat.clone();
         replacement.messages.clear();
+        replacement.settings.support.history_start = 0;
         replacement.summary = Some(summary);
         replacement.mark_changed();
         self.save(&mut replacement)?;
