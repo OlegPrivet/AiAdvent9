@@ -62,7 +62,7 @@ async fn git(path: &Path, args: &[&str], token: Option<&str>) -> Result<Vec<u8>>
     }
     Ok(output.stdout)
 }
-async fn text(path: &Path, args: &[&str]) -> Result<String> {
+pub(crate) async fn text(path: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(git(path, args, None).await?)
         .map_err(|_| ReviewError::Invalid("Git вернул путь или текст не в UTF-8".into()))
 }

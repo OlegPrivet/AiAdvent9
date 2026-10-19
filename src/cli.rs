@@ -37,6 +37,11 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum RootCommand {
+    /// Подготовка release notes по реальным изменениям Git.
+    Release {
+        #[command(subcommand)]
+        command: crate::release::ReleaseCommand,
+    },
     /// AI-ревью PR и локальных изменений. Настройка в /review.
     Review {
         #[command(subcommand)]

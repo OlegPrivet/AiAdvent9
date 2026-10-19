@@ -30,6 +30,7 @@ mod rag_day25;
 mod rag_eval;
 mod rag_extract;
 mod rag_pipeline;
+mod release;
 mod repl;
 mod review;
 mod review_git;
@@ -79,6 +80,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     if let Some(command) = cli.command {
         match command {
+            cli::RootCommand::Release { command } => {
+                return release::cli(command).await.map_err(Into::into);
+            }
             cli::RootCommand::SupportServer { data } => {
                 return support_server::run(data).await;
             }
