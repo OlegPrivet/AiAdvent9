@@ -1,0 +1,23 @@
+[
+  {
+    "id":"T-103","user_id":"U-17","subject":"Не работает подключение к локальной модели",
+    "environment":{"base_url":"http://localhost:8000","api_path":"/v1"},
+    "error":"404 при POST /chat/completions",
+    "messages":["Сервер запущен, запрос curl к /v1/models работает"],
+    "attempted_actions":["Проверила доступность сервера через curl"]
+  },
+  {
+    "id":"T-104","user_id":"U-18","subject":"Не работает подключение к NeuralDeep",
+    "environment":{"provider":"neuraldeep"},
+    "error":"Переменная NEURALDEEP_API_KEY не задана",
+    "messages":["Запускаю agi в новой вкладке терминала"],
+    "attempted_actions":["Проверил соединение с интернетом"]
+  },
+  {
+    "id":"T-105","user_id":"U-19","subject":"Не работают MCP-инструменты",
+    "environment":{"provider":"custom_http","tools":false},
+    "error":"Модель не заявлена как tools-совместимая",
+    "messages":["Обычный диалог работает, но инструменты недоступны"],
+    "attempted_actions":["Проверила MCP-сервер: соединение установлено, инструменты перечисляются"]
+  }
+]

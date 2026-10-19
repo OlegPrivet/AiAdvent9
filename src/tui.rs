@@ -62,6 +62,12 @@ const COMMAND_PALETTE: &[CommandOption] = &[
     CommandOption::argument("/llm add", "добавить локальную LLM", &[]),
     CommandOption::argument("/llm remove", "удалить профиль LLM", &[]),
     CommandOption::run("/mcp", "MCP-серверы и инструменты AI", &["/мсп"]),
+    CommandOption::run("/support", "поддержка пользователей agi", &[]),
+    CommandOption::run("/support setup", "подключить учебные тикеты через MCP", &[]),
+    CommandOption::run("/support on", "поддержка без тикета", &[]),
+    CommandOption::argument("/support ticket", "выбрать тикет поддержки", &[]),
+    CommandOption::run("/support context", "данные тикета через MCP без LLM", &[]),
+    CommandOption::run("/support off", "выключить поддержку", &[]),
     CommandOption::run("/rag", "документы и RAG", &["/раг"]),
     CommandOption::run("/rag status", "состояние RAG", &["/раг status"]),
     CommandOption::run("/rag list", "список документов", &["/раг list"]),
@@ -387,6 +393,7 @@ pub(crate) async fn run(
                     store,
                     app.chat,
                     question,
+                    app.pending_support,
                     app.request_id,
                     worker_tx.clone(),
                 ))
@@ -447,6 +454,7 @@ pub(crate) async fn run(
                         store,
                         app.chat,
                         question,
+                        app.pending_support,
                         app.request_id,
                         worker_tx.clone(),
                     ));
@@ -520,6 +528,7 @@ pub(crate) async fn run(
                         store,
                         app.chat,
                         question,
+                        app.pending_support,
                         app.request_id,
                         worker_tx.clone(),
                     ));
@@ -558,6 +567,7 @@ fn spawn_request(
     store: &ChatStore,
     chat: &mut Chat,
     question: String,
+    support_mode: bool,
     request_id: Uuid,
     worker_tx: UnboundedSender<WorkerEvent>,
 ) -> RequestTask {
@@ -586,7 +596,12 @@ fn spawn_request(
                 let invariants = store.invariants().list().map_err(|error| {
                     AgentError::InvalidRequest(format!("Ошибка инвариантов: {error}"))
                 })?;
-                Ok(request.with_memory(memory).with_invariants(invariants))
+                let request = request.with_memory(memory).with_invariants(invariants);
+                if support_mode {
+                    crate::support::attach(request, store)
+                } else {
+                    Ok(request)
+                }
             }
         });
     RequestTask(tokio::spawn(async move {
@@ -623,7 +638,8 @@ fn spawn_request(
                             rag_answer: None,
                         });
                     }
-                    let request = if request.settings.rag_enabled()
+                    let request = if request.support.is_none()
+                        && request.settings.rag_enabled()
                         && (request.project_help
                             || !request.settings.rag_chat_enabled()
                             || request.task.is_some())
@@ -757,6 +773,7 @@ struct App<'a> {
     follow_tail: bool,
     visible_from: usize,
     pending_question: Option<String>,
+    pending_support: bool,
     pending_model: Option<String>,
     streamed_answer: String,
     request_started_at: Option<Instant>,
@@ -805,6 +822,7 @@ impl<'a> App<'a> {
             follow_tail: true,
             visible_from: 0,
             pending_question: None,
+            pending_support: false,
             pending_model: None,
             streamed_answer: String::new(),
             request_started_at: None,
@@ -1424,7 +1442,7 @@ impl<'a> App<'a> {
         if crate::summary::is_command(&value) {
             return self.begin_question("/summarize".into()).map(Some);
         }
-        if crate::project_help::question(&value).is_some() {
+        if crate::project_help::question(&value).is_some() || crate::support::is_context(&value) {
             if self.pending_question.is_some() {
                 self.notice =
                     Some("Дождитесь завершения запроса или отмените его через Ctrl+C".into());
@@ -1438,7 +1456,11 @@ impl<'a> App<'a> {
             self.handle_command(command);
             return Ok(None);
         }
-        crate::task::prepare_input(self.store, self.chat, &value).map_err(io::Error::other)?;
+        if !crate::support::handles(self.chat, &value) {
+            crate::task::prepare_input(self.store, self.chat, &value).map_err(io::Error::other)?;
+        } else {
+            self.scheduled_task = false;
+        }
         self.task_budget = crate::task::RunBudget::default();
         self.begin_question(value).map(Some)
     }
@@ -1528,6 +1550,7 @@ impl<'a> App<'a> {
         self.set_input("");
         self.pending_model = Some(self.chat.settings().model().to_owned());
         self.pending_question = Some(value.clone());
+        self.pending_support = crate::support::handles(self.chat, &value);
         self.streamed_answer.clear();
         self.request_started_at = Some(Instant::now());
         self.transient_metrics = None;
@@ -1545,6 +1568,7 @@ impl<'a> App<'a> {
         };
         let unfinished_input = self.input_value();
         let result = self.begin_question(question).map(Some);
+        self.pending_support = false;
         self.set_input(&unfinished_input);
         result
     }
@@ -1565,6 +1589,13 @@ impl<'a> App<'a> {
             self.start_new_chat();
         } else if command.matches(&["/help", "/помощь"]) {
             self.modal = Some(Modal::Help);
+        } else if command.matches(&["/support"]) {
+            let result = crate::support::command(self.store, self.chat, command.argument);
+            self.scheduled_task = false;
+            self.modal = Some(Modal::Message {
+                title: "Поддержка пользователей".into(),
+                content: result.unwrap_or_else(|error| format!("Поддержка: {error}")),
+            });
         } else if command.matches(&["/settings", "/setting", "/настройки"]) {
             self.open_settings();
         } else if command.matches(&["/chat", "/chats", "/чаты"]) {
@@ -2002,6 +2033,15 @@ impl<'a> App<'a> {
                     .map(|started_at| elapsed_millis(started_at.elapsed()))
                     .unwrap_or_default();
                 match *result {
+                    Ok(answer) if crate::support::is_context(&question) => {
+                        self.trace_question = None;
+                        self.streamed_answer.clear();
+                        self.transient_metrics = None;
+                        self.modal = Some(Modal::Message {
+                            title: "Контекст поддержки · MCP".into(),
+                            content: answer.content,
+                        });
+                    }
                     Ok(_) if crate::summary::is_command(&question) => {
                         self.trace_question = None;
                         self.streamed_answer.clear();
@@ -2013,7 +2053,8 @@ impl<'a> App<'a> {
                     }
                     Ok(answer)
                         if self.chat.task().is_some()
-                            && crate::project_help::question(&question).is_none() =>
+                            && crate::project_help::question(&question).is_none()
+                            && !self.pending_support =>
                     {
                         self.trace_question = None;
                         self.streamed_answer.clear();
@@ -2065,6 +2106,7 @@ impl<'a> App<'a> {
                         self.notice = Some(format!("Ошибка запроса: {error}"));
                         if self.chat.task().is_some()
                             && crate::project_help::question(&question).is_none()
+                            && !self.pending_support
                         {
                             self.pause_task(&error.to_string());
                         }
@@ -2121,6 +2163,7 @@ impl<'a> App<'a> {
             .as_deref()
             .and_then(crate::project_help::question)
             .is_some();
+        let support = self.pending_support;
         self.scheduled_task = false;
         self.request_id = Uuid::new_v4();
         let elapsed_ms = self
@@ -2136,7 +2179,7 @@ impl<'a> App<'a> {
         self.streamed_answer.clear();
         self.transient_metrics = Some(ResponseMetrics::new(model, elapsed_ms, None, &self.prices));
         self.notice = Some("Запрос отменён".to_owned());
-        if self.chat.task().is_some() && !project_help {
+        if self.chat.task().is_some() && !project_help && !support {
             self.pause_task("Остановлено пользователем");
         }
     }
@@ -3290,6 +3333,7 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 "/agents, /агенты       глобальный каталог агентов · вызов @handle",
                 "/llm                  подключить HTTP API, выбрать общую LLM, удалить",
                 "/mcp, /мсп             MCP-серверы и инструменты AI",
+                "/support               поддержка: setup, on, ticket ID, context, off",
                 "/rag evaluate          ответы с RAG и без RAG на 10 вопросах",
                 "/rag report            открыть сохранённый отчёт",
                 "/rag evaluate day23    шесть режимов и LLM-судья",
@@ -3532,6 +3576,80 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn support_context_worker_preserves_task_on_success_error_and_cancellation() {
+        let fixture = crate::support_server::tests::Fixture::new().await;
+        let store = ChatStore::for_tests(fixture.directory.join("state")).unwrap();
+        store.mcp().save(&fixture.definition, true).unwrap();
+        let server = crate::test_http::MockServer::new(|_| panic!("Context must not call LLM"));
+        let client = Agent::new(
+            crate::api::NeuralDeepClient::new("test-key".into(), server.url.clone()).unwrap(),
+        );
+        let mut chat = Chat::new();
+        let task = crate::task::TaskState::new("Текущая задача").unwrap();
+        chat.set_task(task.clone());
+        chat.settings_mut().support.server_id = Some(fixture.definition.id);
+        crate::support::command(&store, &mut chat, Some("ticket T-103")).unwrap();
+        let mut app = App::with_history(
+            &store,
+            &mut chat,
+            EditMode::Emacs,
+            CommandHistory::default(),
+        );
+        for missing in [false, true] {
+            if missing {
+                app.set_input("/support ticket missing");
+                assert!(app.take_question().unwrap().is_none());
+                app.modal = None;
+            }
+            app.set_input("/support context");
+            let question = app.take_question().unwrap().unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let worker = spawn_request(
+                &client,
+                &store,
+                app.chat,
+                question,
+                app.pending_support,
+                app.request_id,
+                tx,
+            );
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let finished = matches!(event, WorkerEvent::Finished(_, _));
+                app.handle_worker_event(event);
+                if finished {
+                    break;
+                }
+            }
+            drop(worker);
+            assert_eq!(app.chat.task(), Some(&task));
+            assert!(app.chat.messages().is_empty());
+            assert!(!app.scheduled_task);
+            if missing {
+                assert!(app.notice.as_deref().unwrap().contains("не найден"));
+            } else {
+                assert!(
+                    matches!(app.modal.take(), Some(Modal::Message { content, .. }) if content.contains("404 при POST"))
+                );
+            }
+        }
+        app.set_input("Почему не работает?");
+        app.take_question().unwrap().unwrap();
+        let cancelled = app.request_id;
+        app.cancel_request();
+        app.handle_worker_event(WorkerEvent::Finished(
+            cancelled,
+            Box::new(Err(AgentError::InvalidRequest("Late response".into()))),
+        ));
+        assert_eq!(app.chat.task(), Some(&task));
+        assert_eq!(app.notice.as_deref(), Some("Запрос отменён"));
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn project_help_worker_preserves_task_on_success_and_service_error() {
         for fails in [false, true] {
             let server = crate::test_http::MockServer::new(move |request| {
@@ -3570,7 +3688,15 @@ mod tests {
             app.set_input("/помощь Где API?");
             let question = app.take_question().unwrap().unwrap();
             let (tx, mut rx) = mpsc::unbounded_channel();
-            let worker = spawn_request(&client, &store, app.chat, question, app.request_id, tx);
+            let worker = spawn_request(
+                &client,
+                &store,
+                app.chat,
+                question,
+                app.pending_support,
+                app.request_id,
+                tx,
+            );
             loop {
                 let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
                     .await
@@ -3908,6 +4034,7 @@ mod tests {
                 &store,
                 app.chat,
                 question,
+                app.pending_support,
                 app.request_id,
                 tx.clone(),
             );
@@ -3981,7 +4108,15 @@ mod tests {
         app.set_input("/task start Описание проекта");
         app.take_question().unwrap();
         let question = app.take_scheduled_task().unwrap().unwrap();
-        let worker = spawn_request(&client, &store, app.chat, question, app.request_id, tx);
+        let worker = spawn_request(
+            &client,
+            &store,
+            app.chat,
+            question,
+            app.pending_support,
+            app.request_id,
+            tx,
+        );
 
         loop {
             let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -4086,7 +4221,15 @@ mod tests {
         );
         let question = app.begin_question("/summarize".into()).expect("question");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _task = spawn_request(&client, &store, app.chat, question, app.request_id, tx);
+        let _task = spawn_request(
+            &client,
+            &store,
+            app.chat,
+            question,
+            app.pending_support,
+            app.request_id,
+            tx,
+        );
         let ready = loop {
             let event = rx.recv().await.expect("event");
             if matches!(event, WorkerEvent::SummaryReady(..)) {

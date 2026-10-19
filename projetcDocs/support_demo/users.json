@@ -1,0 +1,5 @@
+[
+  {"id":"U-17","name":"Анна","environment":{"os":"macOS","provider":"custom_http"}},
+  {"id":"U-18","name":"Иван","environment":{"os":"Linux","provider":"neuraldeep"}},
+  {"id":"U-19","name":"Мария","environment":{"os":"macOS","provider":"custom_http"}}
+]

@@ -111,6 +111,7 @@ pub(crate) struct Settings {
     rag_chat_enabled: bool,
     rag_strategy: crate::rag_chunk::Strategy,
     rag_options: crate::rag_pipeline::RagOptions,
+    pub(crate) support: crate::support::SupportState,
 }
 
 impl Default for Settings {
@@ -132,11 +133,23 @@ impl Default for Settings {
             rag_chat_enabled: false,
             rag_strategy: crate::rag_chunk::Strategy::Structure,
             rag_options: crate::rag_pipeline::RagOptions::default(),
+            support: crate::support::SupportState::default(),
         }
     }
 }
 
 impl Settings {
+    /// Request-scoped overrides; the stored chat settings are left intact.
+    pub(crate) fn support_options(&mut self) -> Result<(), String> {
+        self.set_rag_chat_enabled(false)?;
+        let mut options = self.rag_options.clone();
+        options.strict = false;
+        self.set_rag_options(options)?;
+        self.rag_enabled = true;
+        self.context_strategy.kind = ContextStrategyKind::SlidingWindow;
+        Ok(())
+    }
+
     pub(crate) fn for_summary(model: &str, _context_tokens: u32, max_tokens: u32) -> Self {
         Self {
             model: model.into(),

@@ -37,6 +37,11 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum RootCommand {
+    /// MCP-сервер поддержки пользователей: чтение users.json и tickets.json.
+    SupportServer {
+        #[arg(long, value_name = "DIRECTORY")]
+        data: PathBuf,
+    },
     /// Общие подключения LLM.
     Llm {
         #[command(subcommand)]
